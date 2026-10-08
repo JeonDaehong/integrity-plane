@@ -1,0 +1,12 @@
+# Architecture Decision Records
+
+One file per decision: `NNNN-short-title.md`, numbered sequentially, never renumbered.
+Use [`template.md`](template.md). Superseded ADRs stay in place with their status updated.
+
+| # | Title | Status |
+|---|---|---|
+| [0001](0001-workspace-layout-and-ci-gates.md) | Workspace layout, MSRV and CI gates | Accepted |
+
+ADRs required for 0.1 by spec §31 that are still to be written: Iceberg first; proxy gateway vs
+embedded; indexes as derived state; counts instead of locators; serial domain queues; key encoding;
+certificate format; index backend; error/status mapping.

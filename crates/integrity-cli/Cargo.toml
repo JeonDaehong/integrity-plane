@@ -1,0 +1,17 @@
+[package]
+name = "integrity-cli"
+description = "Operator CLI for the Open Integrity Plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "integrity"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

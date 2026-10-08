@@ -1,0 +1,15 @@
+[package]
+name = "integrity-reference"
+description = "In-memory relational oracle for differential tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+integrity-types.workspace = true
+integrity-core.workspace = true
+
+[lints]
+workspace = true

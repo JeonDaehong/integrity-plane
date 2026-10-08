@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+integrity-types = { path = "crates/integrity-types" }
+integrity-core = { path = "crates/integrity-core" }
+integrity-index = { path = "crates/integrity-index" }
+integrity-validator = { path = "crates/integrity-validator" }
+integrity-txn = { path = "crates/integrity-txn" }
+integrity-iceberg = { path = "crates/integrity-iceberg" }
+integrity-reference = { path = "crates/integrity-reference" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
