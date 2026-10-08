@@ -18,7 +18,7 @@ None yet.
 
 ## Building
 
-Requires Rust 1.85 or newer (edition 2024).
+Requires Rust 1.85 or newer (edition 2024). On Windows with the `x86_64-pc-windows-gnu` toolchain, a MinGW-w64 install (e.g. WinLibs) must be on `PATH`; some test dependencies need its `dlltool`. The MSVC toolchain needs no extra setup.
 
 ```sh
 cargo fmt --all --check

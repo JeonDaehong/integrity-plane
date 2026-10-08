@@ -18,6 +18,9 @@ integrity-txn = { path = "crates/integrity-txn" }
 integrity-iceberg = { path = "crates/integrity-iceberg" }
 integrity-reference = { path = "crates/integrity-reference" }
 
+# Third-party. Each addition is justified in its PR or an ADR (CONTRIBUTING.md rule 4).
+proptest = "1.11"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
