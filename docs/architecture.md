@@ -83,3 +83,12 @@ new snapshot is diffed against its parent by the live files of the manifests tha
 trusting client-written status or counts ([ADR 0008](adr/0008-manifest-diff.md)). The rows of added
 and removed Parquet files then become `CommitRows`. All file reads go through `FileIo` with an
 optional byte budget.
+
+## Certificates (spec §18)
+
+`integrity_core::certificate` implements [RFC 0002](rfc/0002-certificate-format-v1.md): a BLAKE3 digest
+chaining each certified `main` snapshot to its parent's certificate, over the table UUID, the snapshot
+ids, the digest of the constraints governing the table, and the digest of the snapshot's net key
+changes per constraint (recomputable from its data files). `integrity_iceberg::inject_certificate`
+writes it into the new snapshot's summary in the forwarded request; `snapshot_certificate` reads it
+back. Chain roots and bypass detection depend on the Plane's log (Phases 8 and 10).

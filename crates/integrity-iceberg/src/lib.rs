@@ -6,8 +6,10 @@
 //! - [`manifest`] / [`changes`]: manifest diff of a new `main` snapshot and the rows it adds and
 //!   removes (§15 data-level rows).
 //! - [`extract_rows`]: key-column extraction from Parquet data files.
+//! - [`certify`]: certificates in snapshot summaries (RFC 0002).
 //! - [`io`]: file access with the inline validation budget.
 
+pub mod certify;
 pub mod changes;
 pub mod classify;
 pub mod io;
@@ -16,9 +18,10 @@ pub mod metadata;
 mod parquet_keys;
 pub mod request;
 
+pub use certify::{inject_certificate, snapshot_certificate};
 pub use changes::{FileChanges, InspectError, check_operation, commit_rows, diff_snapshots};
 pub use classify::{
-    Classification, MainChange, Operation, Rejection, check_requirements, classify,
+    Classification, MainChange, NewSnapshot, Operation, Rejection, check_requirements, classify,
 };
 pub use io::{Budgeted, FileIo, MemoryIo, ReadError};
 pub use metadata::TableMetadata;

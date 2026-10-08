@@ -8,3 +8,4 @@ File name: `NNNN-short-title.md`. Use [`template.md`](template.md).
 | # | Title | Status |
 |---|---|---|
 | [0001](0001-key-encoding-v1.md) | Key encoding v1 | Accepted |
+| [0002](0002-certificate-format-v1.md) | Certificate format v1 | Proposed |

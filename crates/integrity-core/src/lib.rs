@@ -3,6 +3,7 @@
 //! This crate is format- and I/O-independent: it MUST NOT depend on Iceberg, object storage,
 //! HTTP or async runtimes (spec §12, checked by `ci/check-layering.sh`).
 
+pub mod certificate;
 pub mod constraint;
 pub mod delta;
 pub mod key;
@@ -11,6 +12,11 @@ pub mod nulls;
 pub mod rows;
 pub mod verdict;
 
+pub use certificate::{
+    CERT_VERSION, CertificateInput, Digest, InvalidCertificate, SUMMARY_CERT, SUMMARY_CERT_VERSION,
+    SUMMARY_CONSTRAINT_SET_VERSION, certificate, constraint_set_digest, key_delta_digest,
+    parse_table_uuid,
+};
 pub use constraint::{
     ColumnRef, Constraint, ConstraintKind, EnforcementMode, ForeignKeySpec, InvalidConstraint,
     KeySpec, MatchMode, NullsMode, ReferentialAction, RegistrationContext, UniqueSpec,

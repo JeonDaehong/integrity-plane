@@ -606,6 +606,7 @@ version = "0.0.0"
 name = "integrity-core"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "integrity-types",
  "proptest",
 ]
@@ -619,8 +620,10 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "integrity-core",
+ "integrity-index",
  "integrity-reference",
  "integrity-types",
+ "integrity-validator",
  "parquet",
  "proptest",
  "serde",

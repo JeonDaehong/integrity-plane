@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use integrity_core::{
-    CommitRows, Constraint, ConstraintKind, DeltaError, EncodedKey, EnforcementMode,
-    InvalidConstraint, KeySchema, RegistrationContext, Violation,
+    CommitRows, Constraint, ConstraintKind, DeltaError, Digest, EncodedKey, EnforcementMode,
+    InvalidCertificate, InvalidConstraint, KeySchema, NetDelta, RegistrationContext, Violation,
+    key_delta_digest,
 };
 use integrity_index::{
     IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, StagedDelta,
@@ -88,10 +89,22 @@ pub enum Decision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedDeltas {
     deltas: BTreeMap<ConstraintId, IndexDelta>,
+    key_deltas: BTreeMap<ConstraintId, NetDelta>,
     observed: BTreeMap<ConstraintId, IndexEpoch>,
 }
 
 impl ValidatedDeltas {
+    /// The net key change of every PK/UNIQUE/FK constraint on the table, empty ones included:
+    /// the input of the certificate's key delta digest (RFC 0002).
+    pub fn key_deltas(&self) -> &BTreeMap<ConstraintId, NetDelta> {
+        &self.key_deltas
+    }
+
+    /// The RFC 0002 key delta digest of this commit.
+    pub fn key_delta_digest(&self) -> Result<Digest, InvalidCertificate> {
+        key_delta_digest(&self.key_deltas)
+    }
+
     /// Non-empty index deltas, per constraint.
     pub fn deltas(&self) -> impl Iterator<Item = (ConstraintId, &IndexDelta)> {
         self.deltas.iter().map(|(id, d)| (*id, d))
@@ -200,6 +213,19 @@ impl Validator {
                 .map(|rc| (rc.constraint.id, rc))
                 .collect(),
         }
+    }
+
+    /// Every constraint governing commits to `table`: those declared on it and foreign keys that
+    /// reference it, enforced or not (the certificate's constraint set digest skips disabled ones).
+    pub fn governing(&self, table: &TableId) -> Vec<&Constraint> {
+        self.constraints
+            .values()
+            .map(|rc| &rc.constraint)
+            .filter(|c| {
+                c.table == *table
+                    || matches!(&c.kind, ConstraintKind::ForeignKey(fk) if fk.parent_table == *table)
+            })
+            .collect()
     }
 
     fn on_table<'a>(&'a self, table: &'a TableId) -> impl Iterator<Item = &'a ResolvedConstraint> {
@@ -365,21 +391,29 @@ impl Validator {
         if !plan.violations.is_empty() {
             return Ok(Decision::Rejected(plan.violations));
         }
-        let deltas = plan
+        let key_deltas: BTreeMap<ConstraintId, NetDelta> = plan
             .deltas
             .into_iter()
-            .map(|(id, d)| {
+            .map(|(id, d)| (id, d.net()))
+            .collect();
+        let deltas = key_deltas
+            .iter()
+            .filter(|(_, net)| !net.is_empty())
+            .map(|(id, net)| {
                 (
-                    id,
+                    *id,
                     IndexDelta {
                         snapshot: commit.snapshot,
-                        changes: d.net(),
+                        changes: net.clone(),
                     },
                 )
             })
-            .filter(|(_, d)| !d.changes.is_empty())
             .collect();
-        Ok(Decision::Accepted(ValidatedDeltas { deltas, observed }))
+        Ok(Decision::Accepted(ValidatedDeltas {
+            deltas,
+            key_deltas,
+            observed,
+        }))
     }
 
     fn require_enforced(&self, id: ConstraintId, by: ConstraintId) -> Result<(), ValidationError> {

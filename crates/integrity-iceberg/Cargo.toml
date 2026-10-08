@@ -20,6 +20,8 @@ serde_json.workspace = true
 apache-avro.workspace = true
 
 [dev-dependencies]
+integrity-index.workspace = true
+integrity-validator.workspace = true
 integrity-reference.workspace = true
 proptest.workspace = true
 
