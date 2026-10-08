@@ -1,0 +1,44 @@
+# Example configuration for integrity-server (spec §26). Constraints are declared here until the
+# integrity API exists; columns are Iceberg field ids.
+
+[server]
+bind = "0.0.0.0:8181"
+
+[upstream]
+catalog_uri = "http://iceberg-rest:8181"
+timeout_secs = 60
+
+[control_store]
+path = "/var/lib/integrity"
+
+[limits]
+max_inline_validation_bytes = 2147483648
+
+[storage]
+endpoint = "http://minio:9000"
+region = "us-east-1"
+allow_http = true
+# access_key_id / secret_access_key may also come from AWS_* environment variables.
+
+[[constraint]]
+id = 1
+table = "db.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 2
+table = "db.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 3
+table = "db.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "db.customer", constraint = 1 }
+match = "simple"

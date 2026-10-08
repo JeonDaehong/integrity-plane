@@ -1,0 +1,74 @@
+# Gateway configuration for the compatibility tests. Field ids follow column order of the
+# CREATE TABLE statements in the client scripts (ids are assigned 1, 2, ... by the catalog).
+
+[server]
+bind = "127.0.0.1:8181"
+
+[upstream]
+catalog_uri = "http://127.0.0.1:8182"
+
+[control_store]
+path = "target/compat-control"
+
+# Files are local (/tmp/warehouse); no [storage] section needed.
+
+# customer(customer_id long, name string); orders(order_id long, customer_id long)
+# Each client uses its own namespace so runs do not interfere.
+
+[[constraint]]
+id = 11
+table = "pyiceberg.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 12
+table = "pyiceberg.customer"
+name = "nn_customer_name"
+type = "not_null"
+columns = [2]
+
+[[constraint]]
+id = 13
+table = "pyiceberg.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 14
+table = "pyiceberg.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "pyiceberg.customer", constraint = 11 }
+
+[[constraint]]
+id = 21
+table = "spark.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 22
+table = "spark.customer"
+name = "nn_customer_name"
+type = "not_null"
+columns = [2]
+
+[[constraint]]
+id = 23
+table = "spark.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 24
+table = "spark.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "spark.customer", constraint = 21 }

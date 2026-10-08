@@ -13,6 +13,7 @@
 //! recovery can replay it.
 
 mod memory;
+mod overlay;
 mod persistent;
 
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ use integrity_core::{EncodedKey, NetDelta};
 use integrity_types::SnapshotId;
 
 pub use memory::MemoryIndex;
+pub use overlay::Overlay;
 pub use persistent::{PersistentIndex, PersistentStore};
 
 /// Monotonically increasing version of an index's contents. A new index starts at epoch 0.

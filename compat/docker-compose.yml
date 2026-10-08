@@ -1,0 +1,15 @@
+# Compatibility test environment: the Iceberg reference REST catalog as the upstream, with a
+# filesystem warehouse mounted at the same path in the container and on the host, so the catalog,
+# the clients and the integrity gateway (on the host, port 8181) all see the same file locations.
+#
+# MinIO no longer publishes community container images, so S3 is exercised separately.
+services:
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    user: root
+    environment:
+      CATALOG_WAREHOUSE: file:///tmp/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.hadoop.HadoopFileIO
+    volumes:
+      - /tmp/warehouse:/tmp/warehouse
+    ports: ["8182:8181"]

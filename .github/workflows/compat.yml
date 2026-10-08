@@ -1,0 +1,51 @@
+name: Compatibility
+
+# Phase 7: real Iceberg clients (PyIceberg, Spark) against the gateway, with the Iceberg reference
+# REST catalog as upstream (compat/docker-compose.yml).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clients:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build gateway
+        run: cargo build --release --locked -p integrity-server
+      - name: Start upstream catalog
+        run: |
+          mkdir -p /tmp/warehouse && chmod 777 /tmp/warehouse
+          docker compose -f compat/docker-compose.yml up -d
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8182/v1/config && break; sleep 2; done
+      - name: Start gateway
+        run: |
+          ./target/release/integrity-server compat/integrity.toml > gateway.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8181/v1/integrity/status && break; sleep 1; done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install clients
+        run: pip install "pyiceberg[pyarrow]==0.12.0" "pyspark==3.5.6"
+      - name: PyIceberg
+        run: python compat/pyiceberg_test.py
+      - name: Spark
+        run: python compat/spark_test.py
+      - name: Logs
+        if: always()
+        run: |
+          echo "--- gateway"; cat gateway.log || true
+          echo "--- upstream"; docker compose -f compat/docker-compose.yml logs --tail 200 || true

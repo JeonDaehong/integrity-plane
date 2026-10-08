@@ -44,3 +44,9 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # (arrow-select -> ahash -> const-random -> const-random-macro); not linked into binaries.
 crate = "tiny-keccak"
 allow = ["CC0-1.0"]
+
+[[licenses.exceptions]]
+# Mozilla's root CA certificates as data (CDLA-Permissive-2.0, a permissive data licence),
+# used by rustls-platform-verifier via reqwest to verify TLS connections (ADR 0011).
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]

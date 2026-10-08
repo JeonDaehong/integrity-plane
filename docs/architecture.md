@@ -92,3 +92,16 @@ ids, the digest of the constraints governing the table, and the digest of the sn
 changes per constraint (recomputable from its data files). `integrity_iceberg::inject_certificate`
 writes it into the new snapshot's summary in the forwarded request; `snapshot_certificate` reads it
 back. Chain roots and bypass detection depend on the Plane's log (Phases 8 and 10).
+
+## Gateway (spec §14, §22)
+
+`integrity-server` is a proxy REST catalog ([ADR 0010](adr/0010-proxy-gateway.md)). A commit to a
+table that has constraints, or is referenced by one, is handled under one lock: the tables of its
+FK-connected domain are bound to their upstream UUIDs (a table with data and no index history must
+be onboarded first), requirements are checked, the commit is classified, each new `main` snapshot is
+validated against an overlay of the persistent indexes, certificates are injected, and the request is
+forwarded. Index changes are applied only after the upstream commit succeeds; an unknown outcome is
+reconciled by reloading the table. Decisions use the status mapping of
+[RFC 0003](rfc/0003-http-status-mapping.md). Everything else, including table creation and loads, is
+forwarded unchanged; `/v1/config` is stripped of `uri` overrides and idempotency support.
+Constraints come from the configuration file (`deploy/integrity.example.toml`) until Phase 10.
