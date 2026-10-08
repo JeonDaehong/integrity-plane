@@ -36,11 +36,13 @@ pub enum ErrorCode {
     ValidationBudgetExceeded,
     /// `INT-015`: the certificate chain is broken (a writer bypassed the Plane).
     BypassDetected,
+    /// `INT-016`: a manifest or data file of the commit could not be read (RFC 0003).
+    StorageReadFailed,
 }
 
 impl ErrorCode {
     /// Every code, in numeric order.
-    pub const ALL: [ErrorCode; 15] = [
+    pub const ALL: [ErrorCode; 16] = [
         ErrorCode::InvalidConstraint,
         ErrorCode::ConstraintNotFound,
         ErrorCode::DuplicatePrimaryKey,
@@ -56,6 +58,7 @@ impl ErrorCode {
         ErrorCode::OnboardingViolations,
         ErrorCode::ValidationBudgetExceeded,
         ErrorCode::BypassDetected,
+        ErrorCode::StorageReadFailed,
     ];
 
     /// The numeric part of the code, e.g. `5` for `INT-005`.
@@ -76,6 +79,7 @@ impl ErrorCode {
             ErrorCode::OnboardingViolations => 13,
             ErrorCode::ValidationBudgetExceeded => 14,
             ErrorCode::BypassDetected => 15,
+            ErrorCode::StorageReadFailed => 16,
         }
     }
 
@@ -97,6 +101,7 @@ impl ErrorCode {
             ErrorCode::OnboardingViolations => "INT-013",
             ErrorCode::ValidationBudgetExceeded => "INT-014",
             ErrorCode::BypassDetected => "INT-015",
+            ErrorCode::StorageReadFailed => "INT-016",
         }
     }
 
@@ -118,6 +123,7 @@ impl ErrorCode {
             ErrorCode::OnboardingViolations => "ONBOARDING_VIOLATIONS",
             ErrorCode::ValidationBudgetExceeded => "VALIDATION_BUDGET_EXCEEDED",
             ErrorCode::BypassDetected => "BYPASS_DETECTED",
+            ErrorCode::StorageReadFailed => "STORAGE_READ_FAILED",
         }
     }
 
@@ -161,8 +167,9 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The spec §24 table, verbatim. Changing this test means breaking a public contract.
-    const SPEC_TABLE: [(&str, &str); 15] = [
+    /// The spec §24 table (plus INT-016 from RFC 0003), verbatim. Changing an existing row means
+    /// breaking a public contract; new codes are appended.
+    const SPEC_TABLE: [(&str, &str); 16] = [
         ("INT-001", "INVALID_CONSTRAINT"),
         ("INT-002", "CONSTRAINT_NOT_FOUND"),
         ("INT-003", "DUPLICATE_PRIMARY_KEY"),
@@ -178,6 +185,7 @@ mod tests {
         ("INT-013", "ONBOARDING_VIOLATIONS"),
         ("INT-014", "VALIDATION_BUDGET_EXCEEDED"),
         ("INT-015", "BYPASS_DETECTED"),
+        ("INT-016", "STORAGE_READ_FAILED"),
     ];
 
     #[test]
@@ -203,7 +211,7 @@ mod tests {
             assert_eq!(ErrorCode::from_code(c.code()), Ok(c));
             assert_eq!(ErrorCode::from_name(c.name()), Ok(c));
         }
-        assert_eq!(ErrorCode::from_code("INT-016"), Err(UnknownErrorCode));
+        assert_eq!(ErrorCode::from_code("INT-017"), Err(UnknownErrorCode));
         assert_eq!(ErrorCode::from_code("int-001"), Err(UnknownErrorCode));
         assert_eq!(ErrorCode::from_name("FOREIGN_KEY"), Err(UnknownErrorCode));
     }

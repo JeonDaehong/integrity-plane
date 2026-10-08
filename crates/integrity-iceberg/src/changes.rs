@@ -43,10 +43,10 @@ impl InspectError {
             InspectError::Read(ReadError::BudgetExceeded { .. }) => {
                 ErrorCode::ValidationBudgetExceeded
             }
-            InspectError::Read(ReadError::Io(_))
-            | InspectError::Manifest(_)
-            | InspectError::Extract(_)
-            | InspectError::Unsupported(_) => ErrorCode::UnsupportedCommitOperation,
+            InspectError::Read(ReadError::Io(_)) => ErrorCode::StorageReadFailed,
+            InspectError::Manifest(_) | InspectError::Extract(_) | InspectError::Unsupported(_) => {
+                ErrorCode::UnsupportedCommitOperation
+            }
         }
     }
 }

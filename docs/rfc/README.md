@@ -9,3 +9,4 @@ File name: `NNNN-short-title.md`. Use [`template.md`](template.md).
 |---|---|---|
 | [0001](0001-key-encoding-v1.md) | Key encoding v1 | Accepted |
 | [0002](0002-certificate-format-v1.md) | Certificate format v1 | Accepted |
+| [0003](0003-http-status-mapping.md) | HTTP status mapping v1 (adds INT-016) | Accepted |

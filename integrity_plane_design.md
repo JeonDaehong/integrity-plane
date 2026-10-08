@@ -406,8 +406,9 @@ Implements the subset needed for the demo: config, namespaces (list/create/load)
 |---|---|---|
 | Stale base / failed requirement | 409 | Client refreshes and retries (desired) |
 | Constraint violation, unsupported operation, budget exceeded | 400 | Client fails fast, no retry, cleans up (desired) |
-| Domain degraded / recovery required | 503 | Client fails; operator action needed |
-| Never used for integrity verdicts | 500 / 502 / 504 | Would cause `CommitStateUnknown`; never return these for a decision we actually made |
+| Transient Plane state: recovery required, storage read failure (INT-011, INT-016) | 409 | Client refreshes and retries a bounded number of times, then fails definitely (RFC 0003) |
+| Operator action needed: domain degraded, chain broken (INT-010, INT-015) | 423 | Client fails fast (RFC 0003) |
+| Never used for integrity verdicts | 500 / 502 / 503 / 504 | Java clients report `CommitStateUnknown`; never return these for a decision we actually made (RFC 0003) |
 
 The 400 body is a standard Iceberg `ErrorModel` whose `message` begins with the integrity code and whose `stack` is empty; the full structured error is available at `/v1/integrity/transactions/{txn_id}`. Phase 7 compatibility tests MUST confirm this mapping against Java (Spark), PyIceberg and iceberg-rust clients.
 
@@ -454,7 +455,7 @@ INT-004 DUPLICATE_UNIQUE_KEY          INT-012 UNSUPPORTED_COMMIT_OPERATION
 INT-005 FOREIGN_KEY_VIOLATION         INT-013 ONBOARDING_VIOLATIONS
 INT-006 REFERENCED_ROW_DELETE         INT-014 VALIDATION_BUDGET_EXCEEDED
 INT-007 NOT_NULL_VIOLATION            INT-015 BYPASS_DETECTED
-INT-008 CHECK_VIOLATION
+INT-008 CHECK_VIOLATION               INT-016 STORAGE_READ_FAILED (RFC 0003)
 ```
 
 ```json

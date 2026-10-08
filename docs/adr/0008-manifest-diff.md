@@ -49,8 +49,8 @@ claims. A client could, for example, list a new data file as EXISTING in a new m
 - A storage layer that allows overwriting an existing manifest path in place would defeat the
   "same path, same content" assumption; the threat model requires immutable (or write-once) object
   paths for metadata, as Iceberg itself does.
-- I/O failures currently map to `UNSUPPORTED_COMMIT_OPERATION`; the HTTP mapping of transient
-  storage failures is decided with the status-mapping RFC in Phase 7.
+- I/O failures map to `INT-016 STORAGE_READ_FAILED` (RFC 0003, HTTP 409: clients retry a bounded
+  number of times).
 - Tests replay a real PyIceberg table (append, copy-on-write delete, whole-file delete, two-snapshot
   overwrite, branch commit) and synthetic Avro manifests for compaction, rewrites, delete files and
   adversarial listings.
