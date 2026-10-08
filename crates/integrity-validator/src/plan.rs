@@ -49,10 +49,10 @@ impl Plan {
                         _ => None,
                     };
                     // Spec §8: multiplicities of added keys, before any index probe.
-                    if let Some(code) = duplicate {
-                        if delta.added.duplicates().next().is_some() {
-                            plan.flag(c.id, code);
-                        }
+                    if let Some(code) = duplicate
+                        && delta.added.duplicates().next().is_some()
+                    {
+                        plan.flag(c.id, code);
                     }
                     plan.deltas.insert(c.id, delta);
                 }

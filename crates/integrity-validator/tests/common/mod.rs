@@ -1,15 +1,17 @@
 //! Differential harness: the same commits go to the reference oracle and to the engine
-//! (validator + in-memory indexes); verdicts must be identical.
+//! (validator + in-memory or persistent indexes); verdicts must be identical.
 
 #![allow(dead_code, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use integrity_core::{
     CommitRows, Constraint, ConstraintKind, Datum, EnforcementMode, ForeignKeySpec, KeySpec,
     KeyValue, LogicalType, MatchMode, NullsMode, ReferentialAction, RowBatch, UniqueSpec,
 };
-use integrity_index::{IndexEpoch, IndexValue, KeyIndex, MemoryIndex};
+use integrity_index::{IndexEpoch, IndexValue, KeyIndex, MemoryIndex, PersistentStore};
 use integrity_reference::{Commit, Oracle, Row, Verdict};
 use integrity_types::{ConstraintId, ConstraintSetVersion, FieldId, SnapshotId, TableId};
 use integrity_validator::{Decision, ResolvedConstraint, ValidationError, Validator};
@@ -17,25 +19,80 @@ use proptest::prelude::*;
 
 // ---------- engine ----------
 
+/// Which index backend the engine uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Memory,
+    Persistent,
+}
+
+/// A directory under the system temp dir, removed on drop.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "oip-validator-{}-{nanos}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub struct Engine {
     pub validator: Validator,
-    pub indexes: BTreeMap<ConstraintId, MemoryIndex>,
+    pub indexes: BTreeMap<ConstraintId, Box<dyn KeyIndex>>,
     epoch: u64,
     snapshot: i64,
+    _dir: Option<TempDir>,
 }
 
 impl Engine {
-    pub fn new(constraints: Vec<ResolvedConstraint>) -> Self {
-        let indexes = constraints
+    pub fn new(constraints: Vec<ResolvedConstraint>, backend: Backend) -> Self {
+        let enforced = constraints
             .iter()
             .filter(|rc| rc.constraint.mode == EnforcementMode::Enforced)
-            .filter_map(|rc| Some((rc.constraint.id, MemoryIndex::new(rc.index_kind()?))))
-            .collect();
+            .filter_map(|rc| Some((rc.constraint.id, rc.index_kind()?)));
+        let (indexes, dir) = match backend {
+            Backend::Memory => {
+                let indexes = enforced
+                    .map(|(id, kind)| (id, Box::new(MemoryIndex::new(kind)) as Box<dyn KeyIndex>))
+                    .collect();
+                (indexes, None)
+            }
+            Backend::Persistent => {
+                let dir = TempDir::new();
+                let store = PersistentStore::open(dir.0.join("indexes.redb")).unwrap();
+                let indexes = enforced
+                    .map(|(id, kind)| {
+                        (
+                            id,
+                            Box::new(store.index(id, kind).unwrap()) as Box<dyn KeyIndex>,
+                        )
+                    })
+                    .collect();
+                (indexes, Some(dir))
+            }
+        };
         Self {
             validator: Validator::new(constraints),
             indexes,
             epoch: 0,
             snapshot: 0,
+            _dir: dir,
         }
     }
 
@@ -176,7 +233,7 @@ pub fn constraints() -> Vec<Constraint> {
 }
 
 /// A fresh oracle and engine over the fixture.
-pub fn setup() -> (Oracle, Engine) {
+pub fn setup(backend: Backend) -> (Oracle, Engine) {
     let mut oracle = Oracle::new();
     for (t, name) in TABLES.iter().enumerate() {
         let cols = table_columns(t)
@@ -191,7 +248,7 @@ pub fn setup() -> (Oracle, Engine) {
         resolved.push(ResolvedConstraint::resolve(constraint.clone(), &oracle).unwrap());
         oracle.register(constraint).unwrap();
     }
-    (oracle, Engine::new(resolved))
+    (oracle, Engine::new(resolved, backend))
 }
 
 // ---------- random operations ----------
@@ -272,8 +329,8 @@ pub fn op(oracle: &Oracle, seed: &OpSeed) -> Commit {
 
 /// Runs a sequence through both sides; returns the verdicts, or a description of the first
 /// disagreement.
-pub fn run(seeds: &[OpSeed]) -> Result<Vec<Verdict>, String> {
-    let (mut oracle, mut engine) = setup();
+pub fn run(seeds: &[OpSeed], backend: Backend) -> Result<Vec<Verdict>, String> {
+    let (mut oracle, mut engine) = setup(backend);
     let mut verdicts = Vec::new();
     for (step, seed) in seeds.iter().enumerate() {
         let commit = op(&oracle, seed);
@@ -291,7 +348,7 @@ pub fn run(seeds: &[OpSeed]) -> Result<Vec<Verdict>, String> {
 
     // Final state: the live indexes equal indexes rebuilt from the oracle's rows by loading
     // them into a fresh engine, parents first.
-    let (_, mut rebuilt) = setup();
+    let (_, mut rebuilt) = setup(Backend::Memory);
     for name in TABLES {
         let table = TableId::new(name);
         let rows = oracle.rows(&table).unwrap().to_vec();

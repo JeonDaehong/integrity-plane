@@ -13,6 +13,7 @@
 //! recovery can replay it.
 
 mod memory;
+mod persistent;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,6 +22,7 @@ use integrity_core::{EncodedKey, NetDelta};
 use integrity_types::SnapshotId;
 
 pub use memory::MemoryIndex;
+pub use persistent::{PersistentIndex, PersistentStore};
 
 /// Monotonically increasing version of an index's contents. A new index starts at epoch 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -77,6 +79,21 @@ impl StagedDelta {
     pub fn writes(&self) -> impl Iterator<Item = (&EncodedKey, Option<&IndexValue>)> {
         self.writes.iter().map(|(k, v)| (k, v.as_ref()))
     }
+
+    /// BLAKE3 digest of the canonical encoding: the identity used to recognize a replayed
+    /// `apply` (ADR 0003).
+    pub fn digest(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"oip-staged-delta-v1");
+        h.update(&self.base_epoch.0.to_be_bytes());
+        h.update(&(self.writes.len() as u64).to_be_bytes());
+        for (key, value) in &self.writes {
+            h.update(&(key.as_bytes().len() as u64).to_be_bytes());
+            h.update(key.as_bytes());
+            h.update(&encode_value(value.as_ref()));
+        }
+        *h.finalize().as_bytes()
+    }
 }
 
 /// Index failures. None of them carry key values, which may be PII.
@@ -112,6 +129,8 @@ pub enum IndexError {
     Corrupt,
     /// The backend is unusable (e.g. a writer panicked mid-update).
     Unavailable,
+    /// The storage engine failed (I/O, lock, transaction). The message never contains keys.
+    Storage(String),
 }
 
 impl fmt::Display for IndexError {
@@ -135,6 +154,7 @@ impl fmt::Display for IndexError {
             ),
             IndexError::Corrupt => f.write_str("index data is corrupt"),
             IndexError::Unavailable => f.write_str("index backend unavailable"),
+            IndexError::Storage(m) => write!(f, "index storage error: {m}"),
         }
     }
 }
@@ -163,4 +183,140 @@ pub trait KeyIndex: Send + Sync {
 
     /// The current epoch.
     fn epoch(&self) -> Result<IndexEpoch>;
+
+    /// Every entry in key order (used by rebuild comparison and verification).
+    fn entries(&self) -> Result<Vec<(EncodedKey, IndexValue)>>;
+}
+
+/// Resolves `delta` against the current values returned by `current` (spec §13.2 `stage`).
+/// Shared by every backend so that all of them stage identically.
+pub(crate) fn resolve(
+    kind: IndexKind,
+    delta: &IndexDelta,
+    base_epoch: IndexEpoch,
+    mut current: impl FnMut(&EncodedKey) -> Result<Option<IndexValue>>,
+) -> Result<StagedDelta> {
+    let mut writes = BTreeMap::new();
+    for (key, change) in delta.changes.iter() {
+        let value = current(key)?;
+        let new = match kind {
+            IndexKind::Unique => match (change, value) {
+                (1, None) => Some(IndexValue::Unique {
+                    last_snapshot: delta.snapshot,
+                }),
+                (1, Some(_)) => return Err(IndexError::KeyAlreadyPresent),
+                (-1, Some(IndexValue::Unique { .. })) => None,
+                (-1, Some(IndexValue::Reference { .. })) => return Err(IndexError::Corrupt),
+                (-1, None) => return Err(IndexError::KeyAbsent),
+                (n, _) => return Err(IndexError::InvalidMultiplicity(n)),
+            },
+            IndexKind::Reference => {
+                let count = match value {
+                    Some(IndexValue::Reference { child_count }) => child_count,
+                    None => 0,
+                    Some(IndexValue::Unique { .. }) => return Err(IndexError::Corrupt),
+                };
+                let new = i128::from(count) + change;
+                if new < 0 {
+                    return Err(IndexError::KeyAbsent);
+                }
+                let new = u64::try_from(new).map_err(|_| IndexError::CountOverflow)?;
+                (new > 0).then_some(IndexValue::Reference { child_count: new })
+            }
+        };
+        writes.insert(key.clone(), new);
+    }
+    Ok(StagedDelta { base_epoch, writes })
+}
+
+/// Decides an `apply` from the index's state; shared by every backend (ADR 0003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyAction {
+    /// Write the staged values and move to the new epoch.
+    Write,
+    /// Replay of the last apply: succeed without writing.
+    AlreadyApplied,
+}
+
+pub(crate) fn decide_apply(
+    staged: &StagedDelta,
+    epoch: IndexEpoch,
+    current: IndexEpoch,
+    last_applied: Option<(IndexEpoch, [u8; 32])>,
+) -> Result<ApplyAction> {
+    if epoch <= current {
+        return match last_applied {
+            Some((last_epoch, digest)) if last_epoch == epoch && digest == staged.digest() => {
+                Ok(ApplyAction::AlreadyApplied)
+            }
+            _ => Err(IndexError::EpochConflict {
+                requested: epoch,
+                current,
+            }),
+        };
+    }
+    if staged.base_epoch != current {
+        return Err(IndexError::StaleStage {
+            staged_at: staged.base_epoch,
+            current,
+        });
+    }
+    Ok(ApplyAction::Write)
+}
+
+const VALUE_ABSENT: u8 = 0x00;
+const VALUE_UNIQUE: u8 = 0x01;
+const VALUE_REFERENCE: u8 = 0x02;
+
+/// Canonical 1- or 9-byte encoding of an index value (`None` = absent).
+pub(crate) fn encode_value(value: Option<&IndexValue>) -> Vec<u8> {
+    match value {
+        None => vec![VALUE_ABSENT],
+        Some(IndexValue::Unique { last_snapshot }) => {
+            let mut v = vec![VALUE_UNIQUE];
+            v.extend_from_slice(&last_snapshot.0.to_be_bytes());
+            v
+        }
+        Some(IndexValue::Reference { child_count }) => {
+            let mut v = vec![VALUE_REFERENCE];
+            v.extend_from_slice(&child_count.to_be_bytes());
+            v
+        }
+    }
+}
+
+/// Decodes a stored (present) value; anything else is corruption.
+pub(crate) fn decode_value(bytes: &[u8]) -> Result<IndexValue> {
+    let (&tag, rest) = bytes.split_first().ok_or(IndexError::Corrupt)?;
+    let payload: [u8; 8] = rest.try_into().map_err(|_| IndexError::Corrupt)?;
+    match tag {
+        VALUE_UNIQUE => Ok(IndexValue::Unique {
+            last_snapshot: SnapshotId(i64::from_be_bytes(payload)),
+        }),
+        VALUE_REFERENCE => Ok(IndexValue::Reference {
+            child_count: u64::from_be_bytes(payload),
+        }),
+        _ => Err(IndexError::Corrupt),
+    }
+}
+
+impl<T: KeyIndex + ?Sized> KeyIndex for Box<T> {
+    fn kind(&self) -> IndexKind {
+        (**self).kind()
+    }
+    fn get_many(&self, keys: &[EncodedKey]) -> Result<Vec<Option<IndexValue>>> {
+        (**self).get_many(keys)
+    }
+    fn stage(&self, delta: &IndexDelta) -> Result<StagedDelta> {
+        (**self).stage(delta)
+    }
+    fn apply(&self, staged: StagedDelta, epoch: IndexEpoch) -> Result<()> {
+        (**self).apply(staged, epoch)
+    }
+    fn epoch(&self) -> Result<IndexEpoch> {
+        (**self).epoch()
+    }
+    fn entries(&self) -> Result<Vec<(EncodedKey, IndexValue)>> {
+        (**self).entries()
+    }
 }

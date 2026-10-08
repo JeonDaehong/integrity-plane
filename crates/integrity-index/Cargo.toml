@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 integrity-types.workspace = true
 integrity-core.workspace = true
+redb.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

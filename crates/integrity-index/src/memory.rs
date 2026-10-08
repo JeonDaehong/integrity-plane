@@ -6,7 +6,8 @@ use std::sync::RwLock;
 use integrity_core::EncodedKey;
 
 use crate::{
-    IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, Result, StagedDelta,
+    ApplyAction, IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, Result,
+    StagedDelta, decide_apply, resolve,
 };
 
 /// An in-memory key index.
@@ -20,7 +21,7 @@ pub struct MemoryIndex {
 struct State {
     entries: BTreeMap<EncodedKey, IndexValue>,
     epoch: IndexEpoch,
-    last_applied: Option<(IndexEpoch, StagedDelta)>,
+    last_applied: Option<(IndexEpoch, [u8; 32])>,
 }
 
 impl MemoryIndex {
@@ -34,12 +35,6 @@ impl MemoryIndex {
                 last_applied: None,
             }),
         }
-    }
-
-    /// All entries in key order.
-    pub fn entries(&self) -> Result<Vec<(EncodedKey, IndexValue)>> {
-        let state = self.state.read().map_err(|_| IndexError::Unavailable)?;
-        Ok(state.entries.iter().map(|(k, v)| (k.clone(), *v)).collect())
     }
 }
 
@@ -55,76 +50,41 @@ impl KeyIndex for MemoryIndex {
 
     fn stage(&self, delta: &IndexDelta) -> Result<StagedDelta> {
         let state = self.state.read().map_err(|_| IndexError::Unavailable)?;
-        let mut writes = BTreeMap::new();
-        for (key, change) in delta.changes.iter() {
-            let current = state.entries.get(key);
-            let new = match self.kind {
-                IndexKind::Unique => match (change, current) {
-                    (1, None) => Some(IndexValue::Unique {
-                        last_snapshot: delta.snapshot,
-                    }),
-                    (1, Some(_)) => return Err(IndexError::KeyAlreadyPresent),
-                    (-1, Some(_)) => None,
-                    (-1, None) => return Err(IndexError::KeyAbsent),
-                    (n, _) => return Err(IndexError::InvalidMultiplicity(n)),
-                },
-                IndexKind::Reference => {
-                    let count = match current {
-                        Some(IndexValue::Reference { child_count }) => *child_count,
-                        None => 0,
-                        Some(IndexValue::Unique { .. }) => return Err(IndexError::Corrupt),
-                    };
-                    let new = i128::from(count) + change;
-                    if new < 0 {
-                        return Err(IndexError::KeyAbsent);
-                    }
-                    let new = u64::try_from(new).map_err(|_| IndexError::CountOverflow)?;
-                    (new > 0).then_some(IndexValue::Reference { child_count: new })
-                }
-            };
-            writes.insert(key.clone(), new);
-        }
-        Ok(StagedDelta {
-            base_epoch: state.epoch,
-            writes,
+        resolve(self.kind, delta, state.epoch, |k| {
+            Ok(state.entries.get(k).copied())
         })
     }
 
     fn apply(&self, staged: StagedDelta, epoch: IndexEpoch) -> Result<()> {
         let mut state = self.state.write().map_err(|_| IndexError::Unavailable)?;
-        if epoch <= state.epoch {
-            return match &state.last_applied {
-                Some((last_epoch, last)) if *last_epoch == epoch && *last == staged => Ok(()),
-                _ => Err(IndexError::EpochConflict {
-                    requested: epoch,
-                    current: state.epoch,
-                }),
-            };
+        match decide_apply(&staged, epoch, state.epoch, state.last_applied)? {
+            ApplyAction::AlreadyApplied => return Ok(()),
+            ApplyAction::Write => {}
         }
-        if staged.base_epoch != state.epoch {
-            return Err(IndexError::StaleStage {
-                staged_at: staged.base_epoch,
-                current: state.epoch,
-            });
-        }
+        let digest = staged.digest();
         // Writes are infallible from here on, so the update is all-or-nothing.
-        for (key, value) in &staged.writes {
+        for (key, value) in staged.writes {
             match value {
                 Some(v) => {
-                    state.entries.insert(key.clone(), *v);
+                    state.entries.insert(key, v);
                 }
                 None => {
-                    state.entries.remove(key);
+                    state.entries.remove(&key);
                 }
             }
         }
         state.epoch = epoch;
-        state.last_applied = Some((epoch, staged));
+        state.last_applied = Some((epoch, digest));
         Ok(())
     }
 
     fn epoch(&self) -> Result<IndexEpoch> {
         let state = self.state.read().map_err(|_| IndexError::Unavailable)?;
         Ok(state.epoch)
+    }
+
+    fn entries(&self) -> Result<Vec<(EncodedKey, IndexValue)>> {
+        let state = self.state.read().map_err(|_| IndexError::Unavailable)?;
+        Ok(state.entries.iter().map(|(k, v)| (k.clone(), *v)).collect())
     }
 }

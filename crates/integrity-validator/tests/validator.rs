@@ -52,6 +52,9 @@ impl KeyIndex for Counting {
     fn epoch(&self) -> IndexResult<IndexEpoch> {
         self.inner.epoch()
     }
+    fn entries(&self) -> IndexResult<Vec<(EncodedKey, IndexValue)>> {
+        self.inner.entries()
+    }
 }
 
 // customer(1 id long) PK=1 ; orders(1 oid long, 2 cust int) PK=2, FK(cust)→customer PK = 3

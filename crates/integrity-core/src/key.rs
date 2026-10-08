@@ -157,14 +157,14 @@ impl KeySchema {
             });
         }
         for (column, (family, value)) in self.0.iter().zip(values).enumerate() {
-            if let Some(v) = value {
-                if v.family() != *family {
-                    return Err(KeyError::FamilyMismatch {
-                        column,
-                        expected: *family,
-                        actual: v.family(),
-                    });
-                }
+            if let Some(v) = value
+                && v.family() != *family
+            {
+                return Err(KeyError::FamilyMismatch {
+                    column,
+                    expected: *family,
+                    actual: v.family(),
+                });
             }
         }
         Ok(())

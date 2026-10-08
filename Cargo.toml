@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "Apache-2.0"
 publish = false
 
@@ -20,6 +20,8 @@ integrity-reference = { path = "crates/integrity-reference" }
 
 # Third-party. Each addition is justified in its PR or an ADR (CONTRIBUTING.md rule 4).
 proptest = "1.11"
+blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }
+redb = "4.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -31,3 +33,11 @@ unwrap_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+
+# The persistent index converts panics inside the storage engine into fail-closed errors
+# (ADR 0005). That requires unwinding; never switch these to "abort".
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"

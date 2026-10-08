@@ -91,10 +91,10 @@ fn predicted_key_verdict(role: KeyRole, s: &KeySchema, a: &Tuple, b: &Tuple) -> 
             out.insert((KEY, *code));
         }
     }
-    if let (KeyDisposition::Key(x), KeyDisposition::Key(y)) = (&da, &db) {
-        if x == y {
-            out.insert((KEY, duplicate));
-        }
+    if let (KeyDisposition::Key(x), KeyDisposition::Key(y)) = (&da, &db)
+        && x == y
+    {
+        out.insert((KEY, duplicate));
     }
     verdict(out)
 }

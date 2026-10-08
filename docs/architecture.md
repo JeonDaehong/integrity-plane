@@ -12,7 +12,7 @@ The ten crates of spec §12 exist. Dependency direction is strictly downward
 |---|---|
 | `integrity-types` | Ids, constraint set version, error codes (Phase 1) |
 | `integrity-core` | Constraint model, §7 NULL classification, key encoding ([RFC 0001](rfc/0001-key-encoding-v1.md)), key deltas (Phase 1) |
-| `integrity-index` | `KeyIndex` trait and in-memory `MemoryIndex` (Phase 2) |
+| `integrity-index` | `KeyIndex` trait, in-memory `MemoryIndex` (Phase 2), persistent `PersistentIndex` on redb (Phase 4) |
 | `integrity-reference` | Relational oracle and shared proptest strategies (Phase 2) |
 | `integrity-validator` | Validation planner and PK/UNIQUE/NOT NULL/FK validation (Phase 3) |
 | others | Empty skeletons |
@@ -27,8 +27,11 @@ with no visible effect; `apply(staged, epoch)` makes them visible atomically, on
 still at the staged base epoch, and is idempotent for the last `(staged, epoch)` pair. Rules and
 rationale: [ADR 0003](adr/0003-key-index-staging-and-epochs.md).
 
-`MemoryIndex` is a `BTreeMap` behind an `RwLock`. It is not durable; the persistent backend is
-Phase 4.
+`MemoryIndex` is a `BTreeMap` behind an `RwLock` and is not durable. `PersistentIndex` stores many
+indexes in one redb file; each `apply` is one two-phase-commit write transaction covering entries and
+metadata, the file is fully checksum-verified on open, and any storage-engine panic is converted into
+a fail-closed `Corrupt` error ([ADR 0005](adr/0005-persistent-index-backend.md)). Both backends share
+the staging and apply-decision code and pass the same conformance suite.
 
 ## Reference oracle (spec §28)
 

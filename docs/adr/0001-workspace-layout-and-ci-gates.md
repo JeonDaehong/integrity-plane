@@ -16,6 +16,7 @@ Phase 0 needs a Cargo workspace matching spec §12 and CI that enforces the hard
   `integrity-cli` and `integrity-bench` declare their dependencies when they get code.
 - **Edition / MSRV.** Edition 2024, `rust-version = "1.85"` (the first release supporting edition
   2024). Raising the MSRV is allowed when a dependency needs it, and is noted in the PR.
+  *Update 2026-10-08:* raised to 1.90 for `redb` 4.x (ADR 0005).
   No `rust-toolchain.toml`: it would override the MSRV job's toolchain.
 - **Lints.** Workspace-level: `unsafe_code = forbid`, `missing_docs`, `unused_must_use = deny`,
   and clippy `unwrap_used`, `dbg_macro`, `todo`, `unimplemented` (all warnings are errors in CI).

@@ -19,7 +19,7 @@ depends on `integrity-reference`.
 
 - License: MIT OR Apache-2.0.
 - Maintenance: actively maintained under the `proptest-rs` organization; widely used.
-- MSRV: builds on our MSRV (1.85), verified locally and by the CI MSRV job.
+- MSRV: builds on our MSRV, verified locally and by the CI MSRV job.
 - Native dependencies: none. Its `getrandom` dependency needs `dlltool` on the `windows-gnu` target,
   i.e. a MinGW-w64 install (see README); MSVC and Linux are unaffected.
 - Layering: dev-dependencies are excluded from `ci/check-layering.sh`, and proptest is not an I/O
