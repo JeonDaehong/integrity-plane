@@ -11,6 +11,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0004](0004-validator-verdicts-and-probes.md) | Validator: full violation sets, probe rules, errors vs verdicts | Accepted |
 | [0005](0005-persistent-index-backend.md) | Persistent index backend: redb | Accepted |
 | [0006](0006-parquet-key-extraction.md) | Parquet key extraction | Accepted |
+| [0007](0007-iceberg-commit-inspection.md) | Iceberg commit inspection: own model, update-level classification | Accepted |
 
 ADRs required for 0.1 by spec §31 that are still to be written: Iceberg first; proxy gateway vs
 embedded; indexes as derived state; counts instead of locators; serial domain queues; key encoding (specified by RFC 0001);
