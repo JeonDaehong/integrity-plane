@@ -7,6 +7,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
+repository = "https://github.com/JeonDaehong/integrity-plane"
 publish = false
 
 [workspace.dependencies]
