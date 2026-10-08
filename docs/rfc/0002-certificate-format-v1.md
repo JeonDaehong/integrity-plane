@@ -1,6 +1,6 @@
 # RFC 0002: Integrity certificate format v1
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-09
 - Affects: certificate format
 
