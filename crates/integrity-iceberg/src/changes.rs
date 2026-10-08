@@ -86,13 +86,15 @@ fn unsupported(m: impl Into<String>) -> InspectError {
     InspectError::Unsupported(m.into())
 }
 
-/// Data files a snapshot adds and removes relative to its parent.
+/// Content files a snapshot adds and removes relative to its parent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileChanges {
     /// Data files live in the new snapshot only.
     pub added: Vec<DataFile>,
     /// Data files live in the parent only.
     pub removed: Vec<DataFile>,
+    /// Equality delete files added by the snapshot, all on the same field set (ADR 0009).
+    pub equality_deletes: Vec<DataFile>,
 }
 
 fn manifests(io: &impl FileIo, list: Option<&str>) -> Result<Vec<ManifestFile>, InspectError> {
@@ -102,11 +104,12 @@ fn manifests(io: &impl FileIo, list: Option<&str>) -> Result<Vec<ManifestFile>, 
     }
 }
 
-/// Live files of `manifests`, keyed by path; a path live twice is invalid.
+/// Live files of `manifests`, keyed by path, with their explicit sequence numbers; a path live
+/// twice is invalid.
 fn live_files(
     io: &impl FileIo,
     manifests: &[&ManifestFile],
-) -> Result<BTreeMap<String, DataFile>, InspectError> {
+) -> Result<BTreeMap<String, (DataFile, Option<i64>)>, InspectError> {
     let mut out = BTreeMap::new();
     for m in manifests {
         for entry in read_manifest(&io.read(&m.path)?)? {
@@ -124,7 +127,10 @@ fn live_files(
                 ))));
             }
             let path = entry.file.path.clone();
-            if out.insert(path.clone(), entry.file).is_some() {
+            if out
+                .insert(path.clone(), (entry.file, entry.sequence_number))
+                .is_some()
+            {
                 return Err(unsupported(format!("file listed twice: {path}")));
             }
         }
@@ -134,8 +140,9 @@ fn live_files(
 
 /// Diffs the new snapshot's manifest list against its parent's (spec §15 data-level rows).
 ///
-/// Delete files are outside this step: any delete file added or removed, and any data file
-/// removed while the parent has delete manifests, is unsupported.
+/// Delete files (ADR 0008, 0009): added equality deletes are returned (one field set, inherited
+/// sequence number); added position deletes, removed delete files, and data files removed while
+/// delete files exist are unsupported.
 pub fn diff_snapshots(
     io: &impl FileIo,
     parent_list: Option<&str>,
@@ -160,22 +167,36 @@ pub fn diff_snapshots(
 
     let before = live_files(io, &dropped)?;
     let after = live_files(io, &introduced)?;
+    type Live = BTreeMap<String, (DataFile, Option<i64>)>;
+    let unchanged =
+        |path: &str, file: &DataFile, other: &Live| other.get(path).is_some_and(|(f, _)| f == file);
 
     let mut changes = FileChanges::default();
-    for (path, file) in &after {
-        if before.get(path) == Some(file) {
+    for (path, (file, sequence_number)) in &after {
+        if unchanged(path, file, &before) {
             continue;
         }
-        if file.content != FileContent::Data {
-            return Err(unsupported(match file.content {
-                FileContent::EqualityDeletes => "commit adds equality delete files",
-                _ => "commit adds position deletes or deletion vectors (merge-on-read)",
-            }));
+        match file.content {
+            FileContent::Data => changes.added.push(file.clone()),
+            FileContent::EqualityDeletes => {
+                // A new equality delete must apply to exactly the rows that existed before this
+                // commit, which an inherited sequence number guarantees (ADR 0009).
+                if sequence_number.is_some() {
+                    return Err(unsupported(
+                        "equality delete file with an explicit sequence number",
+                    ));
+                }
+                changes.equality_deletes.push(file.clone());
+            }
+            FileContent::PositionDeletes => {
+                return Err(unsupported(
+                    "commit adds position deletes or deletion vectors (merge-on-read)",
+                ));
+            }
         }
-        changes.added.push(file.clone());
     }
-    for (path, file) in &before {
-        if after.get(path) == Some(file) {
+    for (path, (file, _)) in &before {
+        if unchanged(path, file, &after) {
             continue;
         }
         if file.content != FileContent::Data {
@@ -185,12 +206,29 @@ pub fn diff_snapshots(
     }
 
     let parent_has_deletes = parent.iter().any(|m| m.content == ManifestContent::Deletes);
-    if parent_has_deletes && !changes.removed.is_empty() {
+    if (parent_has_deletes || !changes.equality_deletes.is_empty()) && !changes.removed.is_empty() {
         return Err(unsupported(
             "commit removes data files from a table with delete files",
         ));
     }
-    for f in changes.added.iter().chain(&changes.removed) {
+    let mut field_sets = changes.equality_deletes.iter().map(|f| {
+        let mut ids = f.equality_ids.clone().unwrap_or_default();
+        ids.sort_unstable();
+        ids
+    });
+    if let Some(first) = field_sets.next()
+        && (first.is_empty() || field_sets.any(|ids| ids != first))
+    {
+        return Err(unsupported(
+            "equality delete files without, or with different, equality fields",
+        ));
+    }
+    for f in changes
+        .added
+        .iter()
+        .chain(&changes.removed)
+        .chain(&changes.equality_deletes)
+    {
         if !f.format.eq_ignore_ascii_case("parquet") {
             return Err(unsupported(format!("data file format {}", f.format)));
         }
@@ -230,11 +268,51 @@ pub fn commit_rows(
         }
         Ok(batch)
     };
+    let equality_deletes = match changes.equality_deletes.first() {
+        None => None,
+        Some(first) => {
+            let fields: Vec<FieldId> = first
+                .equality_ids
+                .iter()
+                .flatten()
+                .map(|&id| FieldId(id))
+                .collect();
+            let typed: Vec<(FieldId, LogicalType)> = fields
+                .iter()
+                .map(|f| {
+                    columns
+                        .iter()
+                        .find(|(c, _)| c == f)
+                        .cloned()
+                        .ok_or_else(|| unsupported(format!("equality delete on unconstrained {f}")))
+                })
+                .collect::<Result<_, _>>()?;
+            let mut batch = RowBatch::new(fields);
+            for file in &changes.equality_deletes {
+                let rows = extract_rows(io.read(&file.path)?, &typed)?;
+                if rows.len() as i64 != file.record_count {
+                    return Err(unsupported(format!(
+                        "{} has {} rows but its manifest says {}",
+                        file.path,
+                        rows.len(),
+                        file.record_count
+                    )));
+                }
+                for row in rows.rows() {
+                    batch
+                        .push(row.clone())
+                        .map_err(|e| unsupported(e.to_string()))?;
+                }
+            }
+            Some(batch)
+        }
+    };
     Ok(CommitRows {
         table,
         snapshot,
         added: read(&changes.added)?,
         removed: read(&changes.removed)?,
+        equality_deletes,
     })
 }
 

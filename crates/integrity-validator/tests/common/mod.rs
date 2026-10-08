@@ -109,12 +109,29 @@ impl Engine {
     }
 
     pub fn commit(&mut self, commit: &Commit) -> Result<Verdict, ValidationError> {
+        self.commit_with_deletes(commit, None)
+    }
+
+    /// A commit that also carries equality deletes on `deletes.0` (ADR 0009).
+    pub fn commit_with_deletes(
+        &mut self,
+        commit: &Commit,
+        deletes: Option<(&[FieldId], &[Vec<Datum>])>,
+    ) -> Result<Verdict, ValidationError> {
         self.snapshot += 1;
+        let equality_deletes = deletes.map(|(fields, keys)| {
+            let mut batch = RowBatch::new(fields.to_vec());
+            for k in keys {
+                batch.push(k.clone()).unwrap();
+            }
+            batch
+        });
         let rows = CommitRows {
             table: commit.table.clone(),
             snapshot: SnapshotId(self.snapshot),
             added: self.rows(&commit.table, &commit.added),
             removed: self.rows(&commit.table, &commit.removed),
+            equality_deletes,
         };
         match self.validator.validate(&rows, &self.indexes)? {
             Decision::Rejected(v) => Ok(Verdict::Rejected(v)),

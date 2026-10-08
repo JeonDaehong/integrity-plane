@@ -152,6 +152,7 @@ fn commit(table: &str, added: RowBatch, removed: RowBatch) -> CommitRows {
         snapshot: SnapshotId(1),
         added,
         removed,
+        equality_deletes: None,
     }
 }
 

@@ -107,4 +107,8 @@ pub struct CommitRows {
     pub added: RowBatch,
     /// Rows removed (read from the files the commit removes or deletes from).
     pub removed: RowBatch,
+    /// Equality deletes (ADR 0009): every row that existed before the commit and whose values on
+    /// the batch's columns equal one of its rows (NULL equals NULL) is removed. Rows added by the
+    /// same commit are not affected.
+    pub equality_deletes: Option<RowBatch>,
 }

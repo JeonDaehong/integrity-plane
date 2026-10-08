@@ -30,6 +30,7 @@ const LIST_SCHEMA: &str = r#"{"type": "record", "name": "manifest_file", "fields
 const ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", "fields": [
     {"name": "status", "type": "int"},
     {"name": "snapshot_id", "type": ["null", "long"]},
+    {"name": "sequence_number", "type": ["null", "long"]},
     {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
         {"name": "content", "type": "int"},
         {"name": "file_path", "type": "string"},
@@ -71,14 +72,27 @@ impl Table {
         Bytes::from(w.into_inner().unwrap())
     }
 
-    /// A manifest; `content` 0 for data, 1 for deletes.
+    /// A manifest whose entries inherit their sequence numbers.
     fn manifest(&mut self, path: &str, entries: &[Entry]) {
+        let with_seq: Vec<_> = entries.iter().map(|&e| (e, None)).collect();
+        self.manifest_seq(path, &with_seq);
+    }
+
+    /// A manifest with an optional explicit sequence number per entry.
+    fn manifest_seq(&mut self, path: &str, entries: &[(Entry, Option<i64>)]) {
         let records = entries
             .iter()
-            .map(|&(status, content, file, format, count)| {
+            .map(|&((status, content, file, format, count), seq)| {
                 vec![
                     ("status", Avro::Int(status)),
                     ("snapshot_id", Avro::Union(1, Box::new(Avro::Long(1)))),
+                    (
+                        "sequence_number",
+                        match seq {
+                            Some(n) => Avro::Union(1, Box::new(Avro::Long(n))),
+                            None => Avro::Union(0, Box::new(Avro::Null)),
+                        },
+                    ),
                     (
                         "data_file",
                         Avro::Record(vec![
@@ -89,7 +103,8 @@ impl Table {
                             (
                                 "equality_ids".into(),
                                 if content == 2 {
-                                    Avro::Union(1, Box::new(Avro::Array(vec![Avro::Int(1)])))
+                                    let ids = if file.contains("region") { 2 } else { 1 };
+                                    Avro::Union(1, Box::new(Avro::Array(vec![Avro::Int(ids)])))
                                 } else {
                                     Avro::Union(0, Box::new(Avro::Null))
                                 },
@@ -100,6 +115,24 @@ impl Table {
             })
             .collect();
         self.io.insert(path, Self::avro(ENTRY_SCHEMA, records));
+    }
+
+    /// A Parquet equality delete file on `id` (#1).
+    fn id_deletes(&mut self, path: &str, ids: &[i64]) {
+        let meta = HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(meta),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        self.io.insert(path, out);
     }
 
     /// A manifest list of `(manifest path, content)`.
@@ -292,48 +325,100 @@ fn relisting_a_live_file_counts_as_adding_it_again() {
 }
 
 #[test]
-fn delete_files_are_outside_this_step() {
+fn position_deletes_and_removed_delete_files_are_unsupported() {
     let mut t = parent();
     t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
     t.list("pos.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
     assert!(unsupported(t.diff(Some("parent.avro"), "pos.avro")).contains("merge-on-read"));
 
     t.manifest("d2.avro", &[(1, 2, "eq.parquet", "PARQUET", 1)]);
-    t.list("eq.avro", &[("m1.avro", 0), ("d2.avro", 1)]);
-    assert!(unsupported(t.diff(Some("parent.avro"), "eq.avro")).contains("equality"));
-
-    // A parent with delete files: removing data files is unsupported, appending is fine.
     t.list(
         "parent-with-deletes.avro",
         &[("m1.avro", 0), ("d2.avro", 1)],
     );
+    // Removing a data file while delete files exist.
     t.manifest("m2.avro", &[(1, 0, "a.parquet", "PARQUET", 2)]);
     t.list("drop-b.avro", &[("m2.avro", 0), ("d2.avro", 1)]);
     assert!(
         unsupported(t.diff(Some("parent-with-deletes.avro"), "drop-b.avro"))
             .contains("delete files")
     );
-    t.data("c.parquet", &[(4, "eu")]);
-    t.manifest("m3.avro", &[(1, 0, "c.parquet", "PARQUET", 1)]);
-    t.list(
-        "append.avro",
-        &[("m1.avro", 0), ("d2.avro", 1), ("m3.avro", 0)],
-    );
-    assert_eq!(
-        paths(
-            &t.diff(Some("parent-with-deletes.avro"), "append.avro")
-                .unwrap()
-                .added
-        ),
-        ["c.parquet"]
-    );
-
     // Removing a delete file.
     t.list("no-deletes.avro", &[("m1.avro", 0)]);
     assert!(
         unsupported(t.diff(Some("parent-with-deletes.avro"), "no-deletes.avro"))
             .contains("removes delete files")
     );
+    // Appending to a table with delete files is fine.
+    t.data("c.parquet", &[(4, "eu")]);
+    t.manifest("m3.avro", &[(1, 0, "c.parquet", "PARQUET", 1)]);
+    t.list(
+        "append.avro",
+        &[("m1.avro", 0), ("d2.avro", 1), ("m3.avro", 0)],
+    );
+    let changes = t
+        .diff(Some("parent-with-deletes.avro"), "append.avro")
+        .unwrap();
+    assert_eq!(paths(&changes.added), ["c.parquet"]);
+    assert!(changes.equality_deletes.is_empty());
+}
+
+#[test]
+fn equality_deletes_are_read_as_delete_keys() {
+    // Flink upsert: a data file and an equality delete file on `id` in the same snapshot.
+    let mut t = parent();
+    t.data("upsert.parquet", &[(1, "us"), (9, "eu")]);
+    t.id_deletes("eq-1.parquet", &[1, 9]);
+    t.manifest("m2.avro", &[(1, 0, "upsert.parquet", "PARQUET", 2)]);
+    t.manifest("d1.avro", &[(1, 2, "eq-1.parquet", "PARQUET", 2)]);
+    t.list(
+        "new.avro",
+        &[("m1.avro", 0), ("m2.avro", 0), ("d1.avro", 1)],
+    );
+    let changes = t.diff(Some("parent.avro"), "new.avro").unwrap();
+    assert_eq!(paths(&changes.added), ["upsert.parquet"]);
+    assert_eq!(paths(&changes.equality_deletes), ["eq-1.parquet"]);
+    let rows = t.rows(&changes).unwrap();
+    let deletes = rows.equality_deletes.unwrap();
+    assert_eq!(deletes.columns(), [FieldId(1)]);
+    assert_eq!(
+        deletes.rows(),
+        &[
+            vec![Datum::Value(KeyValue::Integer(1))],
+            vec![Datum::Value(KeyValue::Integer(9))]
+        ]
+    );
+    assert_eq!(rows.added.len(), 2);
+}
+
+#[test]
+fn unsafe_equality_deletes_are_unsupported() {
+    let mut t = parent();
+    t.id_deletes("eq-1.parquet", &[1]);
+    // An explicit (possibly older) sequence number would change which rows it deletes.
+    t.manifest_seq(
+        "d1.avro",
+        &[((0, 2, "eq-1.parquet", "PARQUET", 1), Some(1))],
+    );
+    t.list("seq.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    assert!(unsupported(t.diff(Some("parent.avro"), "seq.avro")).contains("sequence number"));
+
+    // Different field sets in one commit.
+    t.manifest(
+        "d2.avro",
+        &[
+            (1, 2, "eq-1.parquet", "PARQUET", 1),
+            (1, 2, "eq-region.parquet", "PARQUET", 1),
+        ],
+    );
+    t.list("mixed.avro", &[("m1.avro", 0), ("d2.avro", 1)]);
+    assert!(unsupported(t.diff(Some("parent.avro"), "mixed.avro")).contains("different"));
+
+    // Equality deletes together with removed data files.
+    t.manifest("d3.avro", &[(1, 2, "eq-1.parquet", "PARQUET", 1)]);
+    t.manifest("m2.avro", &[(1, 0, "a.parquet", "PARQUET", 2)]);
+    t.list("cow.avro", &[("m2.avro", 0), ("d3.avro", 1)]);
+    assert!(unsupported(t.diff(Some("parent.avro"), "cow.avro")).contains("delete files"));
 }
 
 #[test]

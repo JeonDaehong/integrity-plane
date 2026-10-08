@@ -13,6 +13,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0006](0006-parquet-key-extraction.md) | Parquet key extraction | Accepted |
 | [0007](0007-iceberg-commit-inspection.md) | Iceberg commit inspection: own model, update-level classification | Accepted |
 | [0008](0008-manifest-diff.md) | Manifest diff without trusting client-written metadata | Accepted |
+| [0009](0009-equality-deletes.md) | Equality deletes on a PK/UNIQUE key (Flink upsert) | Accepted |
 
 ADRs required for 0.1 by spec §31 that are still to be written: Iceberg first; proxy gateway vs
 embedded; indexes as derived state; counts instead of locators; serial domain queues; key encoding (specified by RFC 0001);

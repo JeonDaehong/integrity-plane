@@ -77,6 +77,8 @@ pub struct DataFile {
 pub struct ManifestEntry {
     /// Status.
     pub status: EntryStatus,
+    /// Explicit data sequence number; `None` when inherited from the manifest (v2+).
+    pub sequence_number: Option<i64>,
     /// The file.
     pub file: DataFile,
 }
@@ -193,6 +195,7 @@ pub fn read_manifest(bytes: &Bytes) -> Result<Vec<ManifestEntry>, ManifestError>
             };
             Ok(ManifestEntry {
                 status,
+                sequence_number: int(r, "sequence_number")?,
                 file: DataFile {
                     content,
                     path: string(df, "file_path")?,

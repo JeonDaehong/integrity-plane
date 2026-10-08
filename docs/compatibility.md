@@ -12,8 +12,8 @@
 | `replace` (compaction, manifest rewrite) | Supported only if projected rows are unchanged | Phase 6 |
 | `delete` dropping whole files | Supported | Phase 6 |
 | Several new snapshots on `main` in one commit | Supported; each validated in order | Phase 6 (classification, diff) |
-| Equality deletes on exactly a PK/UNIQUE key | Supported | Phase 6d (pending) |
-| Equality deletes on other fields | Rejected | Rejected today (all delete files) |
+| Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) | Phase 6 |
+| Equality deletes on other fields, with explicit sequence numbers, or mixed with data-file removal | Rejected | Phase 6 |
 | Position deletes / deletion vectors | Rejected (0.2) | Rejected |
 | Removing delete files; removing data files while delete files exist | Rejected in 0.1 | Rejected (ADR 0008) |
 | Schema change touching a constrained field | Rejected unless `int→long`, decimal precision widening (and `float→double` for NOT NULL columns) | Phase 6 |

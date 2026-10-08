@@ -149,6 +149,17 @@ impl Oracle {
 
     /// Evaluates a commit and applies it if every enforced constraint holds afterwards.
     pub fn commit(&mut self, commit: &Commit) -> Result<Verdict, OracleError> {
+        self.commit_with_deletes(commit, None)
+    }
+
+    /// Like [`Oracle::commit`], with Iceberg equality deletes: before the commit's rows are added,
+    /// every existing row whose values on `deletes.0` equal one of `deletes.1` (NULL equals NULL)
+    /// is removed.
+    pub fn commit_with_deletes(
+        &mut self,
+        commit: &Commit,
+        deletes: Option<(&[FieldId], &[Vec<Datum>])>,
+    ) -> Result<Verdict, OracleError> {
         let table = self
             .tables
             .get(&commit.table)
@@ -164,6 +175,18 @@ impl Oracle {
                 .position(|r| r == removed)
                 .ok_or(OracleError::RemovedRowMissing)?;
             rows.remove(at);
+        }
+        if let Some((fields, keys)) = deletes {
+            if keys.iter().any(|k| k.len() != fields.len())
+                || fields.iter().any(|f| !table.columns.contains_key(f))
+            {
+                return Err(OracleError::MalformedRow { field: None });
+            }
+            rows.retain(|row| {
+                !keys
+                    .iter()
+                    .any(|key| fields.iter().zip(key).all(|(f, v)| row.get(f) == Some(v)))
+            });
         }
         rows.extend(commit.added.iter().cloned());
 

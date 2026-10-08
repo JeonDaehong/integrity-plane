@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use integrity_core::{
-    CommitRows, Constraint, ConstraintKind, DeltaError, Digest, EncodedKey, EnforcementMode,
-    InvalidCertificate, InvalidConstraint, KeySchema, NetDelta, RegistrationContext, Violation,
-    key_delta_digest,
+    CommitRows, Constraint, ConstraintKind, Datum, DeltaError, Digest, EncodedKey, EnforcementMode,
+    InvalidCertificate, InvalidConstraint, KeyDisposition, KeySchema, KeyValue, NetDelta,
+    RegistrationContext, RowBatch, UniqueSpec, Violation, classify, key_delta_digest,
 };
 use integrity_index::{
     IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, StagedDelta,
@@ -160,6 +160,8 @@ pub enum ValidationError {
     Delta(DeltaError),
     /// An index changed between validation and staging.
     StaleValidation,
+    /// The commit is valid Iceberg but outside what 0.1 can prove (e.g. ADR 0009 shapes).
+    Unsupported(&'static str),
 }
 
 /// Evidence that the pre-commit state or an index is not what the invariants require.
@@ -180,7 +182,8 @@ impl ValidationError {
         match self {
             ValidationError::MissingColumn(_)
             | ValidationError::MalformedValue { .. }
-            | ValidationError::Unprovable(_) => ErrorCode::UnsupportedCommitOperation,
+            | ValidationError::Unprovable(_)
+            | ValidationError::Unsupported(_) => ErrorCode::UnsupportedCommitOperation,
             ValidationError::MissingIndex(_)
             | ValidationError::Inconsistent(_)
             | ValidationError::Index(_)
@@ -305,6 +308,9 @@ impl Validator {
         }
 
         let mut plan = Plan::build(commit, own.iter().copied())?;
+        if let Some(deletes) = &commit.equality_deletes {
+            self.apply_equality_deletes(commit, deletes, &own, &referencing, &mut plan, indexes)?;
+        }
 
         for rc in &own {
             let id = rc.constraint.id;
@@ -414,6 +420,109 @@ impl Validator {
             key_deltas,
             observed,
         }))
+    }
+
+    /// Turns equality deletes into removed keys of the one PK/UNIQUE constraint whose columns they
+    /// match (ADR 0009): delete keys present in its index are removed.
+    fn apply_equality_deletes(
+        &self,
+        commit: &CommitRows,
+        deletes: &RowBatch,
+        own: &[&ResolvedConstraint],
+        referencing: &[(&ResolvedConstraint, ConstraintId)],
+        plan: &mut Plan,
+        indexes: &impl IndexSet,
+    ) -> Result<(), ValidationError> {
+        if !commit.removed.is_empty() {
+            return Err(ValidationError::Unsupported(
+                "equality deletes together with removed data files",
+            ));
+        }
+        let fields: BTreeSet<FieldId> = deletes.columns().iter().copied().collect();
+        if fields.len() != deletes.columns().len() {
+            return Err(ValidationError::MalformedValue { field: None });
+        }
+        let mut target = None;
+        for rc in own {
+            match &rc.constraint.kind {
+                ConstraintKind::PrimaryKey(key)
+                | ConstraintKind::Unique(UniqueSpec { key, .. }) => {
+                    let cols: BTreeSet<FieldId> = key.columns.iter().copied().collect();
+                    if cols == fields && target.is_none() {
+                        target = Some(*rc);
+                    } else {
+                        return Err(ValidationError::Unsupported(
+                            "equality deletes on a table with another PK/UNIQUE constraint",
+                        ));
+                    }
+                }
+                ConstraintKind::ForeignKey(_) => {
+                    return Err(ValidationError::Unsupported(
+                        "equality deletes on a table with a foreign key",
+                    ));
+                }
+                ConstraintKind::NotNull(_) => {}
+            }
+        }
+        let Some(target) = target else {
+            return Err(ValidationError::Unsupported(
+                "equality deletes not on exactly a PK/UNIQUE key",
+            ));
+        };
+        let k = target.constraint.id;
+        if referencing.iter().any(|(_, parent)| *parent != k) {
+            return Err(ValidationError::Unsupported(
+                "equality deletes on a table referenced through another key",
+            ));
+        }
+        let (Some(schema), Some(role), Some(key)) = (
+            &target.schema,
+            target.constraint.kind.key_role(),
+            target.constraint.kind.key(),
+        ) else {
+            return Err(ValidationError::Unprovable(k));
+        };
+
+        // Delete tuples in key order; each one that is indexable is a candidate.
+        let positions: Vec<usize> = key
+            .columns
+            .iter()
+            .map(|f| {
+                deletes
+                    .column_index(*f)
+                    .ok_or(ValidationError::MissingColumn(*f))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut candidates = BTreeSet::new();
+        for row in deletes.rows() {
+            let tuple: Vec<Option<KeyValue>> = positions
+                .iter()
+                .zip(&key.columns)
+                .map(|(&i, &field)| match &row[i] {
+                    Datum::Value(v) => Ok(Some(v.clone())),
+                    Datum::Null => Ok(None),
+                    Datum::Opaque => Err(ValidationError::MalformedValue { field: Some(field) }),
+                })
+                .collect::<Result<_, _>>()?;
+            match classify(role, schema, &tuple)
+                .map_err(|_| ValidationError::MalformedValue { field: None })?
+            {
+                KeyDisposition::Key(encoded) => {
+                    candidates.insert(encoded);
+                }
+                // Not indexable: matches no indexed row.
+                KeyDisposition::Exempt | KeyDisposition::Violation(_) => {}
+            }
+        }
+        let candidates: Vec<EncodedKey> = candidates.into_iter().collect();
+        let found = probe(indexes, k, &candidates)?;
+        let delta = plan.deltas.entry(k).or_default();
+        for (key, value) in candidates.into_iter().zip(found) {
+            if value.is_some() {
+                delta.removed.insert(key).map_err(ValidationError::Delta)?;
+            }
+        }
+        Ok(())
     }
 
     fn require_enforced(&self, id: ConstraintId, by: ConstraintId) -> Result<(), ValidationError> {
