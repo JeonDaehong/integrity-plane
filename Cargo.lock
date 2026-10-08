@@ -159,7 +159,9 @@ version = "0.0.0"
 dependencies = [
  "integrity-core",
  "integrity-index",
+ "integrity-reference",
  "integrity-types",
+ "proptest",
 ]
 
 [[package]]

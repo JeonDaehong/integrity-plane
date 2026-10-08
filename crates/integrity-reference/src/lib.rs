@@ -20,17 +20,8 @@ use integrity_core::{
 };
 use integrity_types::{ConstraintId, ErrorCode, FieldId, TableId};
 
-/// One cell of a row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Datum {
-    /// SQL NULL.
-    Null,
-    /// A value of a key-capable column type.
-    Value(KeyValue),
-    /// A non-NULL value of a type that cannot be a key (float, nested, …). Its content is
-    /// irrelevant to every constraint, so it is not represented.
-    Opaque,
-}
+/// Row cells and violations are plain data shared with the engine; no verdict logic is shared.
+pub use integrity_core::{Datum, Violation};
 
 /// A row: one datum per column of its table.
 pub type Row = BTreeMap<FieldId, Datum>;
@@ -44,15 +35,6 @@ pub struct Commit {
     pub added: Vec<Row>,
     /// Rows removed; each must match an existing row exactly.
     pub removed: Vec<Row>,
-}
-
-/// One violated constraint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Violation {
-    /// The violated constraint.
-    pub constraint: ConstraintId,
-    /// Why.
-    pub code: ErrorCode,
 }
 
 /// The oracle's decision on a commit.

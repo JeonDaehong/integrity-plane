@@ -7,10 +7,10 @@ where the implementation pins down details the spec leaves open.
 |---|---|---|---|
 | Constraint model | §6 | `integrity_core::constraint` | Model and registration checks (Phase 1) |
 | NULL semantics | §7 | `integrity_core::nulls::classify` | Implemented (Phase 1) |
-| Commit-level semantics | §8 | `integrity_core::delta` | Multisets and net deltas only; validation is Phase 3 |
+| Commit-level semantics | §8 | `integrity_core::delta`, `integrity-validator` | Implemented for single-table commits (Phase 3) |
 | Key encoding | §9 | `integrity_core::key` | Implemented per [RFC 0001](rfc/0001-key-encoding-v1.md) |
 
-Nothing here is enforced on any commit path yet.
+The validator implements these semantics, but no commit path calls it yet (the gateway is Phase 7).
 
 ## Constraint model (§6)
 
@@ -28,8 +28,9 @@ Registration rejects with `INT-001 INVALID_CONSTRAINT` when:
 - an FK's parent constraint does not exist, is on a different table than declared, is not a
   PRIMARY KEY or UNIQUE constraint, or is not `Enforced`;
 - FK child and parent keys differ in arity or in any column's family (this includes decimal scale);
-- **the FK references its own table.** Self-referencing FKs are rejected in 0.1 (fail closed) until
-  Phase 3 defines how parent and child rows added by the same commit interact.
+- **the FK references its own table.** Self-referencing FKs are rejected in 0.1 (fail closed): the
+  validator assumes a commit never writes both sides of an FK (ADR 0004). Lifting this needs an RFC
+  defining how parent and child rows added or removed by the same commit interact.
 
 NOT NULL accepts any existing column, including types that cannot be keys.
 

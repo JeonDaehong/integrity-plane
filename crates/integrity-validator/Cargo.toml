@@ -12,5 +12,9 @@ integrity-types.workspace = true
 integrity-core.workspace = true
 integrity-index.workspace = true
 
+[dev-dependencies]
+integrity-reference.workspace = true
+proptest.workspace = true
+
 [lints]
 workspace = true

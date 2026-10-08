@@ -8,6 +8,8 @@ pub mod delta;
 pub mod key;
 pub mod logical_type;
 pub mod nulls;
+pub mod rows;
+pub mod verdict;
 
 pub use constraint::{
     ColumnRef, Constraint, ConstraintKind, EnforcementMode, ForeignKeySpec, InvalidConstraint,
@@ -19,3 +21,5 @@ pub use key::{
 };
 pub use logical_type::{LogicalType, UnsupportedKeyType};
 pub use nulls::{KeyDisposition, KeyRole, classify};
+pub use rows::{ArityMismatch, CommitRows, Datum, RowBatch};
+pub use verdict::Violation;

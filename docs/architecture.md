@@ -14,6 +14,7 @@ The ten crates of spec §12 exist. Dependency direction is strictly downward
 | `integrity-core` | Constraint model, §7 NULL classification, key encoding ([RFC 0001](rfc/0001-key-encoding-v1.md)), key deltas (Phase 1) |
 | `integrity-index` | `KeyIndex` trait and in-memory `MemoryIndex` (Phase 2) |
 | `integrity-reference` | Relational oracle and shared proptest strategies (Phase 2) |
+| `integrity-validator` | Validation planner and PK/UNIQUE/NOT NULL/FK validation (Phase 3) |
 | others | Empty skeletons |
 
 ## Indexes (§13)
@@ -46,3 +47,17 @@ it reuses only the constraint model and registration checks.
 
 Agreement between the oracle and `integrity-core` on every §7 row is property-tested in
 `crates/integrity-reference/tests/oracle_vs_core.rs`.
+
+## Validator (spec §8, §13.3)
+
+`Validator::validate(CommitRows, indexes)` decides a single-table commit from the rows it adds and
+removes, projected onto `Validator::projection(table)`. It classifies tuples (§7), counts added-key
+multiplicities before probing (§8), then issues one batched lookup per index over distinct keys:
+PK/UNIQUE keys whose count changes, FK child keys whose count rises, and parent keys that disappear.
+It returns every violated `(constraint, code)` or the index deltas to stage; anything it cannot prove
+is an error and the commit is rejected. Rules and rationale:
+[ADR 0004](adr/0004-validator-verdicts-and-probes.md).
+
+The Phase 3 exit test, `crates/integrity-validator/tests/differential.rs`, runs random operation
+sequences through the validator (with in-memory indexes) and the oracle: verdicts must be identical
+at every step, and the live indexes must equal indexes rebuilt from the oracle's final rows.
