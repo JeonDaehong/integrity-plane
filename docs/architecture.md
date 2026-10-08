@@ -15,7 +15,7 @@ The ten crates of spec §12 exist. Dependency direction is strictly downward
 | `integrity-index` | `KeyIndex` trait, in-memory `MemoryIndex` (Phase 2), persistent `PersistentIndex` on redb (Phase 4) |
 | `integrity-reference` | Relational oracle and shared proptest strategies (Phase 2) |
 | `integrity-validator` | Validation planner and PK/UNIQUE/NOT NULL/FK validation (Phase 3) |
-| `integrity-iceberg` | Parquet key-column extraction by field ID (Phase 5); commit inspection is Phase 6 |
+| `integrity-iceberg` | Parquet key extraction (Phase 5); metadata model, requirement checks, §15 classification, manifest diff (Phase 6) |
 | others | Empty skeletons |
 
 ## Indexes (§13)
@@ -73,3 +73,13 @@ matched by Iceberg field ID, and returns them as a `RowBatch` typed by the table
 field IDs, duplicate IDs, nested key fields and incompatible physical types are rejected; a field the
 file does not contain reads as NULL. Rules and rationale:
 [ADR 0006](adr/0006-parquet-key-extraction.md).
+
+## Commit inspection (spec §14 steps 3–5, §15)
+
+`integrity-iceberg` turns a REST `CommitTableRequest` into work for the validator: requirements are
+checked against current metadata, updates are classified (pass-through, or `main` advancing through
+a chain of new snapshots, or rejected; [ADR 0007](adr/0007-iceberg-commit-inspection.md)), and each
+new snapshot is diffed against its parent by the live files of the manifests that differ, without
+trusting client-written status or counts ([ADR 0008](adr/0008-manifest-diff.md)). The rows of added
+and removed Parquet files then become `CommitRows`. All file reads go through `FileIo` with an
+optional byte budget.

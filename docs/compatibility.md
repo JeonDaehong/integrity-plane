@@ -1,7 +1,32 @@
 # Compatibility
 
 > **Status:** partial. Normative source: spec §15 (capability matrix) and §22 (error mapping). The
-> commit capability matrix and HTTP mapping arrive with Phases 6–7.
+> HTTP mapping arrives with Phase 7; nothing here is reachable through a gateway yet.
+
+## Commit capability matrix (spec §15)
+
+| Change | 0.1 behavior | Implemented |
+|---|---|---|
+| `append` (data files only) | Supported | Phase 6 (diff + extraction) |
+| `overwrite`, copy-on-write | Supported; net delta = added − removed rows | Phase 6 |
+| `replace` (compaction, manifest rewrite) | Supported only if projected rows are unchanged | Phase 6 |
+| `delete` dropping whole files | Supported | Phase 6 |
+| Several new snapshots on `main` in one commit | Supported; each validated in order | Phase 6 (classification, diff) |
+| Equality deletes on exactly a PK/UNIQUE key | Supported | Phase 6d (pending) |
+| Equality deletes on other fields | Rejected | Rejected today (all delete files) |
+| Position deletes / deletion vectors | Rejected (0.2) | Rejected |
+| Removing delete files; removing data files while delete files exist | Rejected in 0.1 | Rejected (ADR 0008) |
+| Schema change touching a constrained field | Rejected unless `int→long`, decimal precision widening (and `float→double` for NOT NULL columns) | Phase 6 |
+| Schema/property changes not touching constrained fields | Pass-through | Phase 6 |
+| `remove-snapshots`, properties, sort order, partition spec | Pass-through | Phase 6 |
+| Commits to refs other than `main` | Pass-through, uncertified | Phase 6 |
+| Moving `main` to an existing snapshot | Rejected | Phase 6 |
+| Multi-table commit endpoint | Rejected | Phase 7 (gateway) |
+| Unknown update action or requirement type | Rejected, naming it | Phase 6 |
+| Non-Parquet data files | Rejected | Phase 6 |
+
+Requirements in the request are checked against the metadata loaded under the domain queue; a
+failed requirement is `STALE_BASE_SNAPSHOT`.
 
 ## Parquet data files (Phase 5)
 
@@ -22,7 +47,8 @@ What key extraction accepts, per table column type (ADR 0006):
 
 Compression: uncompressed, zstd, snappy, lz4, gzip. Rejected: files without field IDs, duplicate
 field IDs, key fields nested in structs, any other type combination. Columns missing from a file read
-as NULL; tables using Iceberg v3 `initial-default` on constrained columns are not supported.
+as NULL; tables using Iceberg v3 `initial-default` on constrained columns are rejected at
+classification.
 
-Verified against files written by pyarrow 25 and arrow-rs 60. Java (parquet-mr) writers are
-verified in Phase 7.
+Verified against files written by pyarrow 25, PyIceberg 0.12 and arrow-rs 60. Java (parquet-mr)
+writers are verified in Phase 7.

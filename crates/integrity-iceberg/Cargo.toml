@@ -17,6 +17,7 @@ arrow-schema.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+apache-avro.workspace = true
 
 [dev-dependencies]
 integrity-reference.workspace = true

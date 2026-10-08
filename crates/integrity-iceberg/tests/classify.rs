@@ -76,7 +76,10 @@ fn main_change(updates: Vec<Value>) -> (Operation, i64) {
     match run(updates).unwrap() {
         Classification::MainChange(c) => {
             assert_eq!(c.parent, Some(SnapshotId(20)));
-            (c.operation, c.snapshot.0)
+            assert_eq!(c.steps.len(), 1);
+            assert_eq!(c.steps[0].parent, Some(SnapshotId(20)));
+            assert_eq!(c.steps[0].update_index, 0);
+            (c.steps[0].operation, c.steps[0].snapshot.0)
         }
         other => panic!("expected a main change, got {other:?}"),
     }
@@ -280,19 +283,66 @@ fn unknown_changes_are_rejected_by_name() {
 // ---------- further fail-closed rules ----------
 
 #[test]
-fn main_must_be_a_branch_and_move_once() {
+fn main_must_be_a_branch() {
     let tag =
         json!({"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 30, "type": "tag"});
     assert!(unsupported(vec![snapshot(30, 20, "append"), tag]).contains("branch"));
+}
+
+#[test]
+fn several_new_snapshots_on_main_are_validated_in_order() {
+    // PyIceberg's overwrite: a delete snapshot then an append snapshot, main set after each.
+    let both_moves = run(vec![
+        snapshot(30, 20, "delete"),
+        set_ref("main", 30),
+        snapshot(31, 30, "append"),
+        set_ref("main", 31),
+    ]);
+    // Only the final move, intermediate snapshot reached through the parent link.
+    let final_move = run(vec![
+        snapshot(30, 20, "delete"),
+        snapshot(31, 30, "append"),
+        set_ref("main", 31),
+    ]);
+    for r in [both_moves, final_move] {
+        let Classification::MainChange(c) = r.unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.parent, Some(SnapshotId(20)));
+        let steps: Vec<_> = c
+            .steps
+            .iter()
+            .map(|s| (s.parent.map(|p| p.0), s.snapshot.0, s.operation))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (Some(20), 30, Operation::Delete),
+                (Some(30), 31, Operation::Append)
+            ]
+        );
+    }
+}
+
+#[test]
+fn main_history_must_be_one_chain_from_the_current_main() {
+    // main → 30, then → 31 whose parent is 20, not 30: 30 is not on the final history.
     assert!(
         unsupported(vec![
             snapshot(30, 20, "append"),
             set_ref("main", 30),
-            snapshot(31, 30, "append"),
+            snapshot(31, 20, "append"),
             set_ref("main", 31),
         ])
-        .contains("more than once")
+        .contains("outside its new history")
     );
+    // The chain bottoms out at an old snapshot: stale.
+    let r = run(vec![
+        snapshot(30, 10, "append"),
+        snapshot(31, 30, "append"),
+        set_ref("main", 31),
+    ]);
+    assert!(matches!(r, Err(Rejection::Stale(_))), "{r:?}");
 }
 
 #[test]
@@ -333,7 +383,11 @@ fn first_snapshot_of_an_empty_table() {
     else {
         panic!()
     };
-    assert_eq!((c.parent, c.snapshot), (None, SnapshotId(1)));
+    assert_eq!(c.parent, None);
+    assert_eq!(
+        (c.steps[0].parent, c.steps[0].snapshot),
+        (None, SnapshotId(1))
+    );
 }
 
 // ---------- requirements (spec §14 step 3) ----------

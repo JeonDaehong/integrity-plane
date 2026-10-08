@@ -29,10 +29,12 @@ encryption crates as non-optional dependencies.
 - **Update-level classification** (`classify`):
   - `main` does not move ⇒ **pass-through** (metadata-only updates, snapshots and refs on other
     branches, expiry). Snapshots on other refs are uncertified.
-  - `main` moves to a snapshot added by the same request ⇒ **main change**, validated by manifest
-    diff. Its parent must be the current `main`, otherwise the request is stale (409).
+  - `main` moves to snapshots added by the same request ⇒ **main change**: the new snapshots from
+    the current `main` to the final target form a chain (several per commit are allowed, e.g.
+    PyIceberg overwrite), each validated by manifest diff (ADR 0008). A chain that does not start at
+    the current `main` is stale (409); a main move off that chain is unsupported.
   - `main` moves to an existing snapshot (rollback, cherry-pick, publishing a branch head) ⇒
-    unsupported in 0.1. `main` moving twice, `main` as a tag, removing `main` ⇒ unsupported.
+    unsupported in 0.1. `main` as a tag, or removing `main` ⇒ unsupported.
   - Schema becoming current: every constrained field must stay top-level, keep its type or be
     promoted `int → long`, `float → double` or decimal precision widening with the same scale, and
     must not have an `initial-default`.

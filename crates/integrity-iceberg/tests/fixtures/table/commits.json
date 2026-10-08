@@ -1,0 +1,37 @@
+[
+  {
+    "name": "create",
+    "branch": "main",
+    "metadata": "00000-0cb3da9a-508c-4f8c-aef7-ad6473eb6c3a.metadata.json"
+  },
+  {
+    "name": "append_a",
+    "branch": "main",
+    "metadata": "00001-6cb236dd-291b-49a5-a49e-b4493445d714.metadata.json"
+  },
+  {
+    "name": "append_b",
+    "branch": "main",
+    "metadata": "00002-52e6e5c8-5fd1-44d7-96d4-69b493e69405.metadata.json"
+  },
+  {
+    "name": "delete_rows_cow",
+    "branch": "main",
+    "metadata": "00003-fec4e351-ec89-4553-b198-0309c09a8020.metadata.json"
+  },
+  {
+    "name": "delete_whole_file",
+    "branch": "main",
+    "metadata": "00004-89b91acf-175c-46eb-8cf7-f68bc34e8cd0.metadata.json"
+  },
+  {
+    "name": "overwrite_all",
+    "branch": "main",
+    "metadata": "00005-1d4e1092-84f9-4fdc-b0e7-2ea9cc0fa5d4.metadata.json"
+  },
+  {
+    "name": "append_to_branch",
+    "branch": "ingest",
+    "metadata": "00007-dbd2327c-c4cb-4794-83aa-a7b622b04e52.metadata.json"
+  }
+]

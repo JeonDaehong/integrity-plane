@@ -12,7 +12,7 @@ use std::fmt;
 use integrity_core::LogicalType;
 use integrity_types::{ErrorCode, FieldId, SnapshotId};
 
-use crate::metadata::{FieldLookup, MAIN, Schema, TableMetadata, logical_type};
+use crate::metadata::{FieldLookup, MAIN, Schema, Snapshot, TableMetadata, logical_type};
 use crate::request::{CommitRequest, Requirement, Update};
 
 /// The snapshot `operation` from the summary (a hint, spec §15).
@@ -28,19 +28,32 @@ pub enum Operation {
     Delete,
 }
 
-/// `main` moves to a new child snapshot.
+/// One new snapshot that becomes part of `main`'s history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSnapshot {
+    /// Its parent (the previous step, or `main` before the commit).
+    pub parent: Option<SnapshotId>,
+    /// The snapshot.
+    pub snapshot: SnapshotId,
+    /// Declared operation (a hint).
+    pub operation: Operation,
+    /// Its manifest list.
+    pub manifest_list: String,
+    /// Index of its `add-snapshot` update (where its certificate goes).
+    pub update_index: usize,
+}
+
+/// `main` advances through one or more new snapshots, oldest first.
+///
+/// Engines may add several snapshots in one commit (PyIceberg's overwrite is a delete snapshot
+/// followed by an append snapshot). Every step is reachable by time travel, so each one is
+/// validated and certified on its own, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainChange {
     /// `main` before the commit (`None` for an empty table).
     pub parent: Option<SnapshotId>,
-    /// The new snapshot.
-    pub snapshot: SnapshotId,
-    /// Declared operation.
-    pub operation: Operation,
-    /// The new snapshot's manifest list.
-    pub manifest_list: String,
-    /// Index of its `add-snapshot` update (where the certificate goes).
-    pub update_index: usize,
+    /// The new snapshots on `main`, oldest first; never empty.
+    pub steps: Vec<NewSnapshot>,
 }
 
 /// How the commit is handled.
@@ -254,44 +267,80 @@ pub fn classify(
         }
     }
 
-    let target = match main_moves.as_slice() {
-        [] => return Ok(Classification::PassThrough),
-        [one] => *one,
-        _ => return Err(unsupported("main moves more than once in one commit")),
+    let Some(&target) = main_moves.last() else {
+        return Ok(Classification::PassThrough);
     };
     let current_main = meta.main_snapshot_id();
-    if current_main == Some(SnapshotId(target)) {
+    if main_moves.len() == 1 && current_main == Some(SnapshotId(target)) {
         return Ok(Classification::PassThrough);
     }
-    let Some(&(update_index, snapshot)) = added_snapshots
-        .iter()
-        .find(|(_, s)| s.snapshot_id == target)
-    else {
-        return Err(unsupported(
-            "main moves to an existing snapshot (rollback, cherry-pick or set-current-snapshot)",
-        ));
-    };
-    if snapshot.parent_snapshot_id.map(SnapshotId) != current_main {
-        return Err(stale(
-            "new main snapshot is not a child of the current main snapshot",
-        ));
+
+    // Walk from the final target back to the current main through snapshots added here.
+    let mut chain = Vec::new();
+    let mut cursor = Some(target);
+    while cursor.map(SnapshotId) != current_main {
+        let Some(id) = cursor else {
+            return Err(stale(
+                "new main history does not descend from the current main snapshot",
+            ));
+        };
+        match added_snapshots.iter().find(|(_, s)| s.snapshot_id == id) {
+            Some(&(update_index, snapshot)) => {
+                if chain
+                    .iter()
+                    .any(|(_, s): &(usize, &Snapshot)| s.snapshot_id == id)
+                {
+                    return Err(unsupported("snapshot parent cycle"));
+                }
+                chain.push((update_index, snapshot));
+                cursor = snapshot.parent_snapshot_id;
+            }
+            None if chain.is_empty() => {
+                return Err(unsupported(
+                    "main moves to an existing snapshot (rollback, cherry-pick or set-current-snapshot)",
+                ));
+            }
+            None => {
+                return Err(stale(
+                    "new main snapshots are not built on the current main snapshot",
+                ));
+            }
+        }
     }
-    let operation = match snapshot.summary.get("operation").map(String::as_str) {
-        Some("append") => Operation::Append,
-        Some("replace") => Operation::Replace,
-        Some("overwrite") => Operation::Overwrite,
-        Some("delete") => Operation::Delete,
-        other => return Err(unsupported(format!("snapshot operation {other:?}"))),
-    };
-    let manifest_list = snapshot
-        .manifest_list
-        .clone()
-        .ok_or_else(|| unsupported("snapshot without a manifest list (v1 embedded manifests)"))?;
+    chain.reverse();
+    // Every intermediate main move must stay on that history.
+    for id in &main_moves {
+        if !chain.iter().any(|(_, s)| s.snapshot_id == *id) {
+            return Err(unsupported(
+                "main moves to a snapshot outside its new history",
+            ));
+        }
+    }
+
+    let mut steps = Vec::with_capacity(chain.len());
+    let mut parent = current_main;
+    for (update_index, snapshot) in chain {
+        let operation = match snapshot.summary.get("operation").map(String::as_str) {
+            Some("append") => Operation::Append,
+            Some("replace") => Operation::Replace,
+            Some("overwrite") => Operation::Overwrite,
+            Some("delete") => Operation::Delete,
+            other => return Err(unsupported(format!("snapshot operation {other:?}"))),
+        };
+        let manifest_list = snapshot.manifest_list.clone().ok_or_else(|| {
+            unsupported("snapshot without a manifest list (v1 embedded manifests)")
+        })?;
+        steps.push(NewSnapshot {
+            parent,
+            snapshot: SnapshotId(snapshot.snapshot_id),
+            operation,
+            manifest_list,
+            update_index,
+        });
+        parent = Some(SnapshotId(snapshot.snapshot_id));
+    }
     Ok(Classification::MainChange(MainChange {
         parent: current_main,
-        snapshot: SnapshotId(target),
-        operation,
-        manifest_list,
-        update_index,
+        steps,
     }))
 }

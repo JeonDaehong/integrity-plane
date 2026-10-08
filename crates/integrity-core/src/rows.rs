@@ -10,7 +10,7 @@ use integrity_types::{FieldId, SnapshotId, TableId};
 use crate::key::KeyValue;
 
 /// One cell of a projected row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Datum {
     /// SQL NULL.
     Null,
