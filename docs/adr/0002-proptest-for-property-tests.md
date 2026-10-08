@@ -11,8 +11,11 @@ oracle, which benefit from shrinking to a minimal failing sequence.
 
 ## Decision
 
-Use [`proptest`](https://crates.io/crates/proptest) `1.x` as a **dev-dependency only**, declared once in
-`[workspace.dependencies]` and opted into per crate.
+Use [`proptest`](https://crates.io/crates/proptest) `1.x` as a **dev-dependency**, declared once in
+`[workspace.dependencies]` and opted into per crate. The one exception is the test-support crate
+`integrity-reference`, which depends on it normally to export shared strategies
+(`integrity_reference::strategies`) to other crates' differential tests; no production crate
+depends on `integrity-reference`.
 
 - License: MIT OR Apache-2.0.
 - Maintenance: actively maintained under the `proptest-rs` organization; widely used.
@@ -26,8 +29,9 @@ Regression files (`*.proptest-regressions`) found by real failures are committed
 
 ## Consequences
 
-Strategies are written per crate (`tests/common/mod.rs` in `integrity-core`); they become the input
-generators for the Phase 3 differential tests.
+Shared strategies live in `integrity_reference::strategies` and are the input generators for the
+Phase 3 differential tests. `integrity-core` keeps its own copy in `tests/common` because it cannot
+depend on `integrity-reference` without a cycle.
 
 ## Alternatives considered
 

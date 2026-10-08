@@ -116,6 +116,7 @@ version = "0.0.0"
 dependencies = [
  "integrity-core",
  "integrity-types",
+ "proptest",
 ]
 
 [[package]]
@@ -124,6 +125,7 @@ version = "0.0.0"
 dependencies = [
  "integrity-core",
  "integrity-types",
+ "proptest",
 ]
 
 [[package]]

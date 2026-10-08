@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 integrity-types.workspace = true
 integrity-core.workspace = true
+# Test-support crate: exposes proptest strategies to other crates' differential tests (ADR 0002).
+proptest.workspace = true
 
 [lints]
 workspace = true
