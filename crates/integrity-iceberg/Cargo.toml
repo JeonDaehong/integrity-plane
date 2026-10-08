@@ -11,6 +11,14 @@ publish.workspace = true
 [dependencies]
 integrity-types.workspace = true
 integrity-core.workspace = true
+parquet.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+integrity-reference.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

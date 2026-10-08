@@ -37,3 +37,10 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# Narrow exceptions, one crate each, with the reason.
+[[licenses.exceptions]]
+# Public-domain dedication. Reached only at compile time via a proc-macro
+# (arrow-select -> ahash -> const-random -> const-random-macro); not linked into binaries.
+crate = "tiny-keccak"
+allow = ["CC0-1.0"]

@@ -23,6 +23,11 @@ integrity-reference = { path = "crates/integrity-reference" }
 proptest = "1.11"
 blake3 = { version = "1.8", default-features = false, features = ["std", "pure"] }
 redb = "4.3"
+# Parquet/Arrow (Apache arrow-rs). Codecs = those Iceberg writers use; zstd is the Iceberg default.
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd", "snap", "lz4", "flate2-rust_backend"] }
+arrow-array = "60"
+arrow-schema = "60"
+bytes = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

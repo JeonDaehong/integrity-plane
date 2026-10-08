@@ -15,6 +15,7 @@ The ten crates of spec §12 exist. Dependency direction is strictly downward
 | `integrity-index` | `KeyIndex` trait, in-memory `MemoryIndex` (Phase 2), persistent `PersistentIndex` on redb (Phase 4) |
 | `integrity-reference` | Relational oracle and shared proptest strategies (Phase 2) |
 | `integrity-validator` | Validation planner and PK/UNIQUE/NOT NULL/FK validation (Phase 3) |
+| `integrity-iceberg` | Parquet key-column extraction by field ID (Phase 5); commit inspection is Phase 6 |
 | others | Empty skeletons |
 
 ## Indexes (§13)
@@ -64,3 +65,11 @@ is an error and the commit is rejected. Rules and rationale:
 The Phase 3 exit test, `crates/integrity-validator/tests/differential.rs`, runs random operation
 sequences through the validator (with in-memory indexes) and the oracle: verdicts must be identical
 at every step, and the live indexes must equal indexes rebuilt from the oracle's final rows.
+
+## Key extraction (spec §14 step 5)
+
+`integrity_iceberg::extract_rows` reads only the requested top-level columns of a Parquet data file,
+matched by Iceberg field ID, and returns them as a `RowBatch` typed by the table schema. Files without
+field IDs, duplicate IDs, nested key fields and incompatible physical types are rejected; a field the
+file does not contain reads as NULL. Rules and rationale:
+[ADR 0006](adr/0006-parquet-key-extraction.md).
