@@ -31,10 +31,8 @@ use tokio::sync::Mutex;
 use crate::config::ConstraintConfig;
 use crate::error::ApiError;
 use crate::pipeline::{self, Job, Outcome};
-use crate::registry::{self, Binding};
-
-/// Constraint set version until versioned registration exists (Phase 10).
-const VERSION: ConstraintSetVersion = ConstraintSetVersion(1);
+use crate::registry;
+use crate::store::{Anchor, AuditEvent, Registry, RegistryDoc, StoreError};
 
 /// A table commit route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +63,16 @@ impl TablePath {
             ns.join("%1F"),
             encode(table)
         ))
+    }
+
+    /// The REST path of `identifier` under `base` (`/v1` or `/v1/{prefix}`).
+    pub fn of(base: &str, identifier: &str) -> Option<Self> {
+        let (ns, table) = identifier.rsplit_once('.')?;
+        Some(Self {
+            base: base.to_owned(),
+            namespace: ns.split('.').map(str::to_owned).collect(),
+            table: table.to_owned(),
+        })
     }
 
     /// This table's REST path.
@@ -237,31 +245,35 @@ fn log_error(e: integrity_txn::TxnError) -> ApiError {
     ApiError::new(ErrorCode::IndexDegraded, format!("transaction log: {e}"))
 }
 
-/// One integrity domain's queue state. Holding its lock is holding the domain's commit queue
-/// (spec §11): validation, publication and index application of one commit at a time.
-#[derive(Debug, Default)]
-struct State {
-    /// Tables of this domain bound to their upstream UUIDs.
-    bindings: BTreeMap<String, Binding>,
-    degraded: Option<String>,
-}
+/// One integrity domain's commit queue (spec §11). Holding its lock is holding the queue:
+/// validation, publication and index application of one commit at a time.
+type Queue = Arc<Mutex<()>>;
 
 /// The gateway.
 pub struct Gateway {
     http: reqwest::Client,
     upstream: String,
-    io: Arc<dyn FileIo + Send + Sync>,
-    store: PersistentStore,
-    log: TxnLog,
+    pub(crate) io: Arc<dyn FileIo + Send + Sync>,
+    pub(crate) store: PersistentStore,
+    pub(crate) log: TxnLog,
     budget: u64,
-    constraints: Vec<ConstraintConfig>,
+    pub(crate) registry: Registry,
+    /// `/v1` or `/v1/{prefix}`: where the integrity API finds tables upstream.
+    pub(crate) base: String,
+    /// Bearer token required by the integrity API, if any.
+    pub(crate) admin_token: Option<String>,
+    /// Held shared by every commit request, exclusively by constraint changes and rebuilds
+    /// (ADR 0011).
+    pub(crate) admin: tokio::sync::RwLock<()>,
     /// One queue per integrity domain, keyed by the domain's smallest table identifier.
-    domains: std::sync::Mutex<BTreeMap<String, Arc<Mutex<State>>>>,
+    domains: std::sync::Mutex<BTreeMap<String, Queue>>,
+    /// Tables degraded by a failed index apply in this process (recovery completes it).
+    pub(crate) transient: std::sync::Mutex<BTreeMap<String, String>>,
     /// Commit requests received per table identifier (observability; detects retry storms).
     commit_requests: std::sync::Mutex<BTreeMap<String, u64>>,
 }
 
-enum Loaded {
+pub(crate) enum Loaded {
     Table(Box<TableMetadata>, Value),
     Missing,
 }
@@ -275,7 +287,7 @@ impl Gateway {
         store: PersistentStore,
         log: TxnLog,
         budget: u64,
-        constraints: Vec<ConstraintConfig>,
+        registry: Registry,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
@@ -284,10 +296,65 @@ impl Gateway {
             store,
             log,
             budget,
-            constraints,
+            registry,
+            base: "/v1".to_owned(),
+            admin_token: None,
+            admin: tokio::sync::RwLock::new(()),
             domains: std::sync::Mutex::new(BTreeMap::new()),
+            transient: std::sync::Mutex::new(BTreeMap::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Sets the upstream catalog prefix used by the integrity API.
+    pub fn with_prefix(mut self, prefix: Option<&str>) -> Self {
+        self.base = match prefix {
+            Some(p) if !p.is_empty() => format!("/v1/{p}"),
+            _ => "/v1".to_owned(),
+        };
+        self
+    }
+
+    /// Requires `Authorization: Bearer <token>` on the integrity API.
+    pub fn with_admin_token(mut self, token: Option<String>) -> Self {
+        self.admin_token = token;
+        self
+    }
+
+    /// Appends an audit event; a failure is logged, never turned into a decision.
+    pub(crate) fn audit(&self, event: AuditEvent) {
+        if let Err(e) = self.registry.audit(event) {
+            tracing::warn!("audit write failed: {e}");
+        }
+    }
+
+    /// Forgets every domain queue; only called under the exclusive admin lock, when no commit
+    /// holds a queue and domain membership may just have changed.
+    pub(crate) fn reset_domains(&self) {
+        match self.domains.lock() {
+            Ok(mut d) => d.clear(),
+            Err(p) => p.into_inner().clear(),
+        }
+    }
+
+    /// Why the domain of `members` refuses commits, if it does.
+    fn degraded(&self, doc: &RegistryDoc, members: &BTreeSet<String>) -> Option<String> {
+        let transient = match self.transient.lock() {
+            Ok(t) => t.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        members
+            .iter()
+            .find_map(|m| doc.degraded.get(m).or_else(|| transient.get(m)).cloned())
+    }
+
+    fn mark_transient(&self, identifier: &str, reason: &str) {
+        if let Ok(mut t) = self.transient.lock() {
+            t.insert(identifier.to_owned(), reason.to_owned());
+        }
+        let mut e = AuditEvent::new("DOMAIN_DEGRADED", Some(identifier));
+        e.detail = Some(reason.to_owned());
+        self.audit(e);
     }
 
     /// Serves one request.
@@ -312,20 +379,26 @@ impl Gateway {
                 "multi-table commits are not supported in 0.1",
             )
             .into_response(),
-            Route::Commit(table)
-                if registry::is_constrained(&self.constraints, &table.identifier()) =>
-            {
-                self.commit(&table, path_and_query, headers, body).await
+            Route::Commit(table) => {
+                // Constraints cannot change between this check and the response (ADR 0011).
+                let _shared = self.admin.read().await;
+                if self.registry.snapshot().is_constrained(&table.identifier()) {
+                    self.commit(&table, path_and_query, headers, body).await
+                } else {
+                    self.proxy(method, path_and_query, &headers, body).await
+                }
             }
-            Route::Commit(_) | Route::Proxy => {
-                self.proxy(method, path_and_query, &headers, body).await
-            }
+            Route::Proxy => self.proxy(method, path_and_query, &headers, body).await,
         }
     }
 
-    /// The queue of the domain `identifier` belongs to.
-    fn domain(&self, identifier: &str) -> (Arc<Mutex<State>>, BTreeSet<String>) {
-        let members = registry::component(&self.constraints, identifier);
+    /// The queue of the domain `identifier` belongs to, and the domain's tables.
+    fn domain(
+        &self,
+        constraints: &[ConstraintConfig],
+        identifier: &str,
+    ) -> (Queue, BTreeSet<String>) {
+        let members = registry::component(constraints, identifier);
         let key = members
             .first()
             .cloned()
@@ -341,8 +414,7 @@ impl Gateway {
     /// Resolves transactions left unfinished by a previous process (spec §16), before any request
     /// is served. Leaves them for later if upstream cannot be reached.
     pub async fn recover_on_start(&self) -> Result<(), String> {
-        let mut st = State::default();
-        self.recover(&mut st, &HeaderMap::new(), None)
+        self.recover(&HeaderMap::new(), None)
             .await
             .map_err(|e| e.message)
     }
@@ -354,26 +426,24 @@ impl Gateway {
             .lock()
             .map(|c| c.clone())
             .unwrap_or_default();
-        let queues: Vec<(String, Arc<Mutex<State>>)> = match self.domains.lock() {
-            Ok(d) => d.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
-            Err(_) => Vec::new(),
-        };
-        let mut degraded = BTreeMap::new();
-        let mut bound = BTreeMap::new();
-        for (key, queue) in queues {
-            let st = queue.lock().await;
-            if let Some(reason) = &st.degraded {
-                degraded.insert(key, reason.clone());
-            }
-            for (ident, b) in &st.bindings {
-                bound.insert(ident.clone(), b.table.to_string());
+        let doc = self.registry.snapshot();
+        let mut degraded = doc.degraded.clone();
+        if let Ok(t) = self.transient.lock() {
+            for (k, v) in t.iter() {
+                degraded.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
+        let bound: BTreeMap<&String, &String> = doc
+            .anchors
+            .iter()
+            .map(|(k, a)| (k, &a.table_uuid))
+            .collect();
         serde_json::json!({
             "commit_requests": commit_requests,
             "degraded": if degraded.is_empty() { Value::Null } else { serde_json::json!(degraded) },
             "unresolved_transactions": self.log.unresolved().map(|u| u.len()).ok(),
             "bound_tables": bound,
+            "constraint_set_versions": doc.versions,
         })
     }
 
@@ -456,7 +526,7 @@ impl Gateway {
         axum::Json(config).into_response()
     }
 
-    async fn load(&self, path: &str, headers: &HeaderMap) -> Result<Loaded, ApiError> {
+    pub(crate) async fn load(&self, path: &str, headers: &HeaderMap) -> Result<Loaded, ApiError> {
         let resp = self
             .send(Method::GET, path, headers, Bytes::new())
             .await
@@ -492,7 +562,8 @@ impl Gateway {
     }
 
     fn index_kind(&self, id: ConstraintId) -> Option<IndexKind> {
-        let c = self.constraints.iter().find(|c| c.id == id.0)?;
+        let doc = self.registry.snapshot();
+        let c = doc.constraints.get(&id.0)?;
         match c.kind.as_str() {
             "primary_key" | "unique" => Some(IndexKind::Unique),
             "foreign_key" => Some(IndexKind::Reference),
@@ -523,9 +594,8 @@ impl Gateway {
     ///
     /// `scope` limits recovery to one domain's tables: another domain may be forwarding its own
     /// transaction right now, and resolving it from here would race with its outcome.
-    async fn recover(
+    pub(crate) async fn recover(
         &self,
-        st: &mut State,
         headers: &HeaderMap,
         scope: Option<&BTreeSet<String>>,
     ) -> Result<(), ApiError> {
@@ -539,6 +609,8 @@ impl Gateway {
             if scope.is_some_and(|members| !members.contains(&u.prepared.identifier)) {
                 continue;
             }
+            let mut recovered = AuditEvent::new("TXN_RECOVERED", Some(&u.prepared.identifier));
+            recovered.txn = Some(u.txn.0);
             match u.state {
                 TxnState::Prepared => self
                     .log
@@ -572,7 +644,7 @@ impl Gateway {
                                 indexes.insert(*id, index);
                             }
                             if let Err(e) = pipeline::apply(&u.staged, &indexes, v.epoch) {
-                                st.degraded = Some(e.message.clone());
+                                self.mark_transient(&u.prepared.identifier, &e.message);
                                 return Err(e);
                             }
                             self.log
@@ -582,17 +654,85 @@ impl Gateway {
                                     TxnDecision { status: 200, body },
                                 )
                                 .map_err(log_error)?;
+                            recovered.verdict = Some("COMMITTED".into());
+                            recovered.result_snapshot = Some(v.final_snapshot);
+                            recovered.certificate = v.certificates.last().cloned();
+                            self.audit(recovered);
                         }
-                        Loaded::Table(..) | Loaded::Missing => self
-                            .log
-                            .finish(u.txn, TxnState::Aborted, interrupted("upstream"))
-                            .map_err(log_error)?,
+                        Loaded::Table(..) | Loaded::Missing => {
+                            self.log
+                                .finish(u.txn, TxnState::Aborted, interrupted("upstream"))
+                                .map_err(log_error)?;
+                            recovered.verdict = Some("ABORTED".into());
+                            self.audit(recovered);
+                        }
                     }
                 }
                 TxnState::Committed | TxnState::Aborted | TxnState::Rejected => {}
             }
         }
         Ok(())
+    }
+
+    /// Checks a domain member against its anchor (ADR 0011): an empty table is anchored on first
+    /// sight; a table with data needs onboarding; a replaced table is refused; and `main` must be
+    /// the anchor or a certified snapshot, otherwise a writer bypassed the Plane.
+    fn check_chain_head(
+        &self,
+        doc: &mut RegistryDoc,
+        identifier: &str,
+        meta: &TableMetadata,
+    ) -> Result<(), ApiError> {
+        let uuid = meta.table_uuid.to_lowercase();
+        let head = meta.main_snapshot_id();
+        match doc.anchors.get(identifier) {
+            None if head.is_none() => {
+                *doc = self
+                    .registry
+                    .update(|d| {
+                        let anchor = Anchor {
+                            table_uuid: uuid.clone(),
+                            snapshot: None,
+                            version: d.version(identifier),
+                        };
+                        d.anchors.insert(identifier.to_owned(), anchor);
+                        Ok::<_, StoreError>(d.clone())
+                    })
+                    .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
+                Ok(())
+            }
+            None => Err(ApiError::new(
+                ErrorCode::IndexDegraded,
+                format!(
+                    "{identifier} already has data; register its constraints through the integrity API to onboard it"
+                ),
+            )),
+            Some(a) if a.table_uuid != uuid => Err(ApiError::new(
+                ErrorCode::IndexDegraded,
+                format!("{identifier} was replaced by another table; rebuild its domain"),
+            )),
+            Some(a) if head.map(|h| h.0) == a.snapshot => Ok(()),
+            Some(_) => match head.map(|h| snapshot_certificate(meta, h)) {
+                Some(Ok(Some(_))) => Ok(()),
+                _ => {
+                    let reason = format!(
+                        "{identifier}: snapshot {} of main was not committed through the Plane",
+                        head.map_or_else(|| "(none)".to_owned(), |h| h.to_string())
+                    );
+                    if let Ok(d) = self.registry.update(|d| {
+                        d.degraded.insert(identifier.to_owned(), reason.clone());
+                        Ok::<_, StoreError>(d.clone())
+                    }) {
+                        *doc = d;
+                    }
+                    let mut event = AuditEvent::new("BYPASS_DETECTED", Some(identifier));
+                    event.result_snapshot = head.map(|h| h.0);
+                    event.detail = Some(reason.clone());
+                    self.audit(event);
+                    Err(ApiError::new(ErrorCode::BypassDetected, reason))
+                }
+            },
+        }
     }
 
     async fn commit(
@@ -632,17 +772,20 @@ impl Gateway {
             .map_err(|e| ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()))?;
 
         let identifier = table.identifier();
-        let (queue, members) = self.domain(&identifier);
-        let mut st = queue.lock().await;
-        self.recover(&mut st, &headers, Some(&members)).await?;
+        let mut doc = self.registry.snapshot();
+        let constraints = doc.list();
+        let (queue, members) = self.domain(&constraints, &identifier);
+        let _queue = queue.lock().await;
+        self.recover(&headers, Some(&members)).await?;
         if let Some(d) = request_id.as_deref().and_then(|r| self.log.decision_for(r)) {
             return Ok(replay(&d));
         }
-        if let Some(reason) = &st.degraded {
-            return Err(ApiError::new(ErrorCode::IndexDegraded, reason.clone()));
+        if let Some(reason) = self.degraded(&doc, &members) {
+            return Err(ApiError::new(ErrorCode::IndexDegraded, reason));
         }
 
-        // Bind every table of the integrity domain.
+        // Load and bind every table of the integrity domain; check each one's chain head.
+        let mut bindings = BTreeMap::new();
         let mut target_meta = None;
         for ident in members.iter().cloned() {
             let path = if ident == identifier {
@@ -667,40 +810,9 @@ impl Gateway {
                     ));
                 }
             };
-            let binding = registry::bind(&self.constraints, &ident, &meta)?;
-            match st.bindings.get(&ident) {
-                Some(existing) if existing.table != binding.table => {
-                    return Err(ApiError::new(
-                        ErrorCode::IndexDegraded,
-                        format!("{ident} was replaced by another table"),
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    st.bindings.insert(ident.clone(), binding);
-                    let resolved = registry::resolve(&self.constraints, &st.bindings)?;
-                    let indexes = self.indexes(&resolved)?;
-                    let own_indexed = resolved
-                        .iter()
-                        .filter(|rc| {
-                            rc.constraint.table == st.bindings[&ident].table
-                                && rc.index_kind().is_some()
-                        })
-                        .count();
-                    let has_history = indexes
-                        .values()
-                        .any(|i| i.epoch().map(|e| e.0 > 0).unwrap_or(false));
-                    if meta.main_snapshot_id().is_some() && !(own_indexed > 0 && has_history) {
-                        st.bindings.remove(&ident);
-                        return Err(ApiError::new(
-                            ErrorCode::IndexDegraded,
-                            format!(
-                                "{ident} already has data; onboarding is required before enforcement"
-                            ),
-                        ));
-                    }
-                }
-            }
+            let binding = registry::bind(&constraints, &ident, &meta)?;
+            self.check_chain_head(&mut doc, &ident, &meta)?;
+            bindings.insert(ident.clone(), binding);
             if ident == identifier {
                 target_meta = Some(meta);
             }
@@ -708,11 +820,13 @@ impl Gateway {
         let meta = target_meta
             .ok_or_else(|| ApiError::new(ErrorCode::IndexDegraded, "table not loaded"))?;
 
-        let resolved = registry::resolve(&self.constraints, &st.bindings)?;
+        let resolved = registry::resolve(&constraints, &bindings)?;
         let indexes = self.indexes(&resolved)?;
         let validator = Validator::new(resolved);
-        let table_id = st.bindings[&identifier].table.clone();
-        let binding_columns = st.bindings[&identifier].columns.clone();
+        let table_id = bindings[&identifier].table.clone();
+        let binding_columns = bindings[&identifier].columns.clone();
+        let version = ConstraintSetVersion(doc.version(&identifier));
+        let anchor = doc.anchors.get(&identifier).and_then(|a| a.snapshot);
 
         check_requirements(&meta, &request).map_err(rejection)?;
         let constrained = validator.projection(&table_id).into_iter().collect();
@@ -735,10 +849,22 @@ impl Gateway {
             })
             .map_err(log_error)?;
         fault::hit(FaultPoint::AfterPreparedLog);
+        let base_snapshot = change.parent.map(|s| s.0);
         let abort = |e: ApiError, state: TxnState| -> ApiError {
             if self.log.finish(txn, state, error_decision(&e)).is_err() {
                 return ApiError::new(ErrorCode::IndexDegraded, "transaction log write failed");
             }
+            let kind = if state == TxnState::Rejected {
+                "COMMIT_REJECTED"
+            } else {
+                "COMMIT_ABORTED"
+            };
+            let mut event = AuditEvent::new(kind, Some(&identifier));
+            event.txn = Some(txn.0);
+            event.base_snapshot = base_snapshot;
+            event.verdict = Some(e.code.code().to_owned());
+            event.detail = Some(e.message.clone());
+            self.audit(event);
             e
         };
 
@@ -757,7 +883,7 @@ impl Gateway {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| abort(e, TxnState::Aborted))?;
         let set_digest =
-            constraint_set_digest(VERSION, &validator.governing(&table_id)).map_err(|e| {
+            constraint_set_digest(version, &validator.governing(&table_id)).map_err(|e| {
                 abort(
                     ApiError::new(ErrorCode::IndexDegraded, e.to_string()),
                     TxnState::Aborted,
@@ -776,8 +902,17 @@ impl Gateway {
             None => Digest::ZERO,
             Some(parent) => match snapshot_certificate(&meta, parent) {
                 Ok(Some(cert)) => cert,
-                // Chain root until onboarding records exist (Phase 10).
-                Ok(None) => Digest::ZERO,
+                // The anchor starts the chain (RFC 0002 chain root, ADR 0011).
+                Ok(None) if anchor == Some(parent.0) => Digest::ZERO,
+                Ok(None) => {
+                    return Err(abort(
+                        ApiError::new(
+                            ErrorCode::BypassDetected,
+                            format!("parent snapshot {parent} was not committed through the Plane"),
+                        ),
+                        TxnState::Aborted,
+                    ));
+                }
                 Err(_) => {
                     return Err(abort(
                         ApiError::new(
@@ -796,6 +931,11 @@ impl Gateway {
             .max()
             .unwrap_or(0);
 
+        let governing_ids: Vec<u64> = validator
+            .governing(&table_id)
+            .iter()
+            .map(|c| c.id.0)
+            .collect();
         let job = Job {
             io: Arc::clone(&self.io),
             budget: self.budget,
@@ -819,7 +959,7 @@ impl Gateway {
         let (plans, staged) = match outcome {
             Outcome::Rejected(violations) => {
                 return Err(abort(
-                    violation_error(&violations, &self.constraints),
+                    violation_error(&violations, &constraints),
                     TxnState::Rejected,
                 ));
             }
@@ -842,7 +982,7 @@ impl Gateway {
                 key_delta,
                 previous,
             });
-            inject_certificate(&mut request, &plan.step, cert, VERSION).map_err(|e| {
+            inject_certificate(&mut request, &plan.step, cert, version).map_err(|e| {
                 abort(
                     ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()),
                     TxnState::Aborted,
@@ -869,12 +1009,12 @@ impl Gateway {
             .validated(
                 txn,
                 Validated {
-                    base_snapshot: change.parent.map(|s| s.0),
+                    base_snapshot,
                     snapshots,
                     final_snapshot,
-                    constraint_set_version: VERSION.0,
+                    constraint_set_version: version.0,
                     epoch,
-                    certificates,
+                    certificates: certificates.clone(),
                 },
                 &staged,
             )
@@ -895,24 +1035,37 @@ impl Gateway {
                 fault::hit(FaultPoint::AfterUpstreamBeforeLog);
                 if let Err(e) = pipeline::apply(&staged, &indexes, epoch) {
                     // The commit happened; recovery re-applies, and nothing else commits meanwhile.
-                    st.degraded = Some(e.message);
+                    self.mark_transient(&identifier, &e.message);
                     return Ok(c.response());
                 }
                 fault::hit(FaultPoint::BeforeCommittedLog);
                 self.log
                     .finish(txn, TxnState::Committed, c.decision())
                     .map_err(log_error)?;
+                let mut event = AuditEvent::new("COMMIT_ACCEPTED", Some(&identifier));
+                event.txn = Some(txn.0);
+                event.base_snapshot = base_snapshot;
+                event.result_snapshot = Some(final_snapshot);
+                event.verdict = Some("ACCEPTED".into());
+                event.certificate = certificates.last().cloned();
+                event.constraints = governing_ids;
+                self.audit(event);
                 Ok(c.response())
             }
             Some(c) if (400..500).contains(&c.status) => {
                 self.log
                     .finish(txn, TxnState::Aborted, c.decision())
                     .map_err(log_error)?;
+                let mut event = AuditEvent::new("COMMIT_ABORTED", Some(&identifier));
+                event.txn = Some(txn.0);
+                event.base_snapshot = base_snapshot;
+                event.verdict = Some(format!("upstream {}", c.status));
+                self.audit(event);
                 Ok(c.response())
             }
             unknown => {
                 fault::hit(FaultPoint::AfterUpstreamUnknown);
-                match self.recover(&mut st, &headers, Some(&members)).await {
+                match self.recover(&headers, Some(&members)).await {
                     Ok(()) => Ok(self.log.decision(txn).map_or_else(
                         || StatusCode::GATEWAY_TIMEOUT.into_response(),
                         |d| replay(&d),

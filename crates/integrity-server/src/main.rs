@@ -9,6 +9,7 @@ use std::time::Duration;
 use integrity_index::PersistentStore;
 use integrity_server::config::Config;
 use integrity_server::fileio::ObjectStoreIo;
+use integrity_server::store::Registry;
 use integrity_server::{Gateway, router};
 use integrity_txn::TxnLog;
 
@@ -35,6 +36,10 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.control_store.path)?;
     let store = PersistentStore::open(config.control_store.path.join("indexes.redb"))?;
     let log = TxnLog::open(config.control_store.path.join("txn.redb"))?;
+    let registry = Registry::open(
+        config.control_store.path.join("registry.redb"),
+        &config.constraints,
+    )?;
     let io = Arc::new(ObjectStoreIo::new(
         config.storage.clone(),
         tokio::runtime::Handle::current(),
@@ -46,8 +51,10 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         store,
         log,
         config.limits.max_inline_validation_bytes,
-        config.constraints.clone(),
-    )?;
+        registry,
+    )?
+    .with_prefix(config.upstream.prefix.as_deref())
+    .with_admin_token(config.server.admin_token.clone());
     if let Err(e) = gateway.recover_on_start().await {
         tracing::warn!("recovery pending until upstream answers: {e}");
     }

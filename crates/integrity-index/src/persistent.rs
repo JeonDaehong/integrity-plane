@@ -225,6 +225,49 @@ impl PersistentIndex {
         }
     }
 
+    /// Replaces the whole contents with `entries` and moves to `epoch`, in one durable transaction
+    /// (spec §19 rebuild: readers see either the old or the new index, never a mix). Clears the
+    /// replay identity: the next apply must be a new epoch.
+    pub fn replace_all(
+        &self,
+        entries: &[(EncodedKey, IndexValue)],
+        epoch: IndexEpoch,
+    ) -> Result<()> {
+        self.shared.guard(|db| {
+            let mut txn = db.begin_write().map_err(storage)?;
+            txn.set_two_phase_commit(true);
+            {
+                let mut meta_table = txn.open_table(META).map_err(storage)?;
+                let meta = self.read_meta(&meta_table)?;
+                if epoch <= meta.epoch {
+                    return Err(IndexError::EpochConflict {
+                        requested: epoch,
+                        current: meta.epoch,
+                    });
+                }
+                txn.delete_table(self.table()).map_err(storage)?;
+                let mut table = txn.open_table(self.table()).map_err(storage)?;
+                for (key, value) in entries {
+                    if value.kind() != Some(self.kind) {
+                        return Err(IndexError::Corrupt);
+                    }
+                    table
+                        .insert(key.as_bytes(), encode_value(Some(value)).as_slice())
+                        .map_err(storage)?;
+                }
+                let updated = Meta {
+                    kind: self.kind,
+                    epoch,
+                    last_applied: None,
+                };
+                meta_table
+                    .insert(self.id, updated.encode().as_slice())
+                    .map_err(storage)?;
+            }
+            txn.commit().map_err(storage)
+        })
+    }
+
     fn apply_in(&self, db: &Database, staged: &StagedDelta, epoch: IndexEpoch) -> Result<()> {
         let mut txn = db.begin_write().map_err(storage)?;
         txn.set_two_phase_commit(true);

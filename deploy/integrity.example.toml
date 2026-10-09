@@ -1,12 +1,19 @@
-# Example configuration for integrity-server (spec §26). Constraints are declared here until the
-# integrity API exists; columns are Iceberg field ids.
+# Example configuration for integrity-server (spec §26).
+#
+# Constraints are normally registered through the integrity API (POST /v1/integrity/constraints).
+# Those declared below are imported only when the registry is first created; columns are Iceberg
+# field ids.
 
 [server]
 bind = "0.0.0.0:8181"
+# Require "Authorization: Bearer <token>" on /v1/integrity/* (except status).
+# admin_token = "change-me"
 
 [upstream]
 catalog_uri = "http://iceberg-rest:8181"
 timeout_secs = 60
+# Catalog prefix used by the integrity API to reach tables (/v1/{prefix}/namespaces/...), if any.
+# prefix = "warehouse"
 
 [control_store]
 path = "/var/lib/integrity"

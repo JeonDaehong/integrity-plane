@@ -15,6 +15,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0008](0008-manifest-diff.md) | Manifest diff without trusting client-written metadata | Accepted |
 | [0009](0009-equality-deletes.md) | Equality deletes on a PK/UNIQUE key (Flink upsert) | Accepted |
 | [0010](0010-proxy-gateway.md) | Proxy gateway first; embedded mode later | Accepted |
+| [0011](0011-registry-anchors-and-rebuild.md) | Constraint registry, chain anchors, onboarding and rebuild | Accepted |
 
 ADRs required for 0.1 by spec §31 that are still to be written: Iceberg first; proxy gateway vs
 embedded; indexes as derived state; counts instead of locators; serial domain queues; key encoding (specified by RFC 0001);

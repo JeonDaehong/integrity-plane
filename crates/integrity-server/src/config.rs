@@ -1,11 +1,11 @@
 //! Server configuration (spec §26), read from TOML.
 //!
-//! Until the integrity API exists (Phase 10), constraints are declared here, bound to table
-//! identifiers and Iceberg field ids.
+//! Constraints declared here are imported into the registry when it is first created (ADR 0011);
+//! afterwards they are managed through the integrity API.
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -23,7 +23,7 @@ pub struct Config {
     /// Object storage access for reading manifests and data files.
     #[serde(default)]
     pub storage: StorageConfig,
-    /// Declared constraints.
+    /// Constraints imported into the registry on first start.
     #[serde(default, rename = "constraint")]
     pub constraints: Vec<ConstraintConfig>,
 }
@@ -34,6 +34,10 @@ pub struct Config {
 pub struct ServerConfig {
     /// e.g. `0.0.0.0:8181`.
     pub bind: String,
+    /// If set, `/v1/integrity/*` requests other than `GET status` must send
+    /// `Authorization: Bearer <admin_token>`.
+    #[serde(default)]
+    pub admin_token: Option<String>,
 }
 
 /// `[upstream]`.
@@ -45,6 +49,10 @@ pub struct UpstreamConfig {
     /// Request timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Catalog prefix (`/v1/{prefix}/…`) used by the integrity API to reach tables, if the
+    /// upstream uses one.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -97,8 +105,8 @@ pub struct StorageConfig {
     pub allow_http: bool,
 }
 
-/// One `[[constraint]]` entry.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One `[[constraint]]` entry (also the registry's stored form).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConstraintConfig {
     /// Unique, never reused.
@@ -121,10 +129,13 @@ pub struct ConstraintConfig {
     /// FK: `simple` (default) or `full`.
     #[serde(default, rename = "match")]
     pub match_mode: Option<String>,
+    /// Column names at registration (informational; the Plane matches by field id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_names: Option<Vec<String>>,
 }
 
 /// FK target.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceConfig {
     /// Parent table identifier.

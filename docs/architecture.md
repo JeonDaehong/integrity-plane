@@ -93,21 +93,34 @@ chaining each certified `main` snapshot to its parent's certificate, over the ta
 ids, the digest of the constraints governing the table, and the digest of the snapshot's net key
 changes per constraint (recomputable from its data files). `integrity_iceberg::inject_certificate`
 writes it into the new snapshot's summary in the forwarded request; `snapshot_certificate` reads it
-back. Chain roots and bypass detection depend on the Plane's log (Phases 8 and 10).
+back. A chain starts at the table's anchor, recorded by the registry when the table was first bound
+empty or when its domain was onboarded or rebuilt ([ADR 0011](adr/0011-registry-anchors-and-rebuild.md)).
 
 ## Gateway (spec §14, §22)
 
 `integrity-server` is a proxy REST catalog ([ADR 0010](adr/0010-proxy-gateway.md)). A commit to a
-table that has constraints, or is referenced by one, is handled under one lock: the tables of its
-FK-connected domain are bound to their upstream UUIDs (a table with data and no index history must
-be onboarded first), requirements are checked, the commit is classified, each new `main` snapshot is
+table that has constraints, or is referenced by one, is handled in its domain's queue: every table of
+its FK-connected domain is loaded and checked against its anchor (a table with data and no anchor
+must be onboarded; a `main` head that is neither the anchor nor certified means a writer bypassed the
+Plane, which refuses with `BYPASS_DETECTED` and degrades the domain), requirements are checked, the commit is classified, each new `main` snapshot is
 validated against an overlay of the persistent indexes, certificates are injected, and the request is
 forwarded. Every step is recorded in the transaction log (RFC 0004, `docs/recovery.md`): index changes are
 applied only after the upstream commit succeeds, a crash at any point is resolved on restart, and a
 repeated `Idempotency-Key` gets the recorded answer. Decisions use the status mapping of
 [RFC 0003](rfc/0003-http-status-mapping.md). Everything else, including table creation and loads, is
 forwarded unchanged; `/v1/config` is stripped of `uri` overrides and idempotency support.
-Constraints come from the configuration file (`deploy/integrity.example.toml`) until Phase 10.
+
+## Registry, onboarding and rebuild (spec §19, §20, §23)
+
+Constraints live in `registry.redb` in the control store, with per-table constraint set versions, the
+constraint set of every version, anchors, degraded domains and the audit log
+([ADR 0011](adr/0011-registry-anchors-and-rebuild.md)). Constraints in the configuration file are imported
+once, when the registry is created. `POST /v1/integrity/constraints` resolves column names to field ids,
+scans the whole domain at its current snapshots (FK parents first) and either installs the resulting
+index contents and anchors or refuses with `ONBOARDING_VIOLATIONS` and a report. `DELETE` drops a
+constraint (not a key an FK still references); `POST /v1/integrity/indexes/{id}/rebuild` rescans the
+domain of a constraint and re-anchors it, clearing a degraded state if the data is valid. These
+operations take a lock that every commit holds shared, so they never interleave with commits.
 
 ## Integrity domains and concurrency (spec §11)
 

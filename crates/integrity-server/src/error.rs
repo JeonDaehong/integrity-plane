@@ -13,6 +13,8 @@ pub struct ApiError {
     pub code: ErrorCode,
     /// Human-readable detail (never key values unless the redaction policy allows).
     pub message: String,
+    /// Structured detail returned by the integrity API (violation reports).
+    pub report: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -21,7 +23,14 @@ impl ApiError {
         Self {
             code,
             message: message.into(),
+            report: None,
         }
+    }
+
+    /// Attaches a structured report.
+    pub fn with_report(mut self, report: serde_json::Value) -> Self {
+        self.report = Some(report);
+        self
     }
 
     /// The HTTP status of RFC 0003. Never 5xx: these are decisions the Plane made.
@@ -50,7 +59,7 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let body = json!({
+        let mut body = json!({
             "error": {
                 "message": format!("{} {}: {}", self.code.code(), self.code.name(), self.message),
                 "type": self.error_type(),
@@ -58,6 +67,9 @@ impl IntoResponse for ApiError {
                 "stack": [],
             }
         });
+        if let Some(report) = self.report {
+            body["integrity"] = report;
+        }
         (status, Json(body)).into_response()
     }
 }

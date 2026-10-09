@@ -1,7 +1,7 @@
 # Recovery
 
-> Normative source: spec §16 and §19, [RFC 0004](rfc/0004-transaction-log-v1.md). Rebuild (§19) is
-> Phase 10.
+> Normative source: spec §16 and §19, [RFC 0004](rfc/0004-transaction-log-v1.md),
+> [ADR 0011](adr/0011-registry-anchors-and-rebuild.md) for rebuild.
 
 ## Transaction log
 
@@ -58,4 +58,22 @@ fail: upstream holds the snapshot while the indexes miss its keys.
   replayable (ADR 0003, ADR 0005).
 - On open, the index store is fully checksum-verified; failure, a repair, or a storage-engine panic
   yields `Corrupt`, and the domain must be rebuilt (§19), never trusted.
+
+## Degraded domains and rebuild
+
+A domain refuses commits with `INDEX_DEGRADED` (423) when an index apply failed in this process
+(until recovery completes it) or, persistently in the registry, after `BYPASS_DETECTED` or a rebuild
+that found violations. `POST /v1/integrity/indexes/{id}/rebuild`:
+
+1. resolves the unfinished transactions of every domain;
+2. loads every table of the domain of constraint `id` and pins its `main`;
+3. validates all data, FK parents first, against in-memory indexes;
+4. on violations, leaves the domain degraded and returns `ONBOARDING_VIOLATIONS` with a report;
+5. otherwise replaces each index's contents at a new epoch (`replace_all`, one atomic transaction
+   per index), then records the new anchors and clears the degraded state in one registry
+   transaction, and audits `INDEX_REBUILT` with the previous and new anchors.
+
+A crash between steps 5's index replacements leaves indexes whose contents already match the pinned
+data (no commit runs during a rebuild) and the registry unchanged; running the rebuild again is safe.
+Onboarding (registering a constraint) runs the same scan.
 - Not tested: power loss (a process kill keeps the OS page cache).

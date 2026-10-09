@@ -110,3 +110,48 @@ fn corrupted_file_is_never_served_silently() {
         }
     }
 }
+
+#[test]
+fn replace_all_swaps_contents_atomically_and_survives_reopen() {
+    let dir = TempDir::new("replace");
+    let path = dir.path().join("index.redb");
+    {
+        let store = PersistentStore::open(&path).unwrap();
+        let index = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
+        commit(&index, &delta(1, &[(1, 2), (2, 1)])).unwrap();
+        let fresh = vec![(k(7), IndexValue::Reference { child_count: 4 })];
+        // Older or equal epochs are refused.
+        assert!(index.replace_all(&fresh, IndexEpoch(1)).is_err());
+        // Values of the wrong kind are refused, and nothing changes.
+        assert_eq!(
+            index.replace_all(
+                &[(
+                    k(7),
+                    IndexValue::Unique {
+                        last_snapshot: SnapshotId(1)
+                    }
+                )],
+                IndexEpoch(5)
+            ),
+            Err(IndexError::Corrupt)
+        );
+        assert_eq!(index.entries().unwrap().len(), 2);
+        index.replace_all(&fresh, IndexEpoch(5)).unwrap();
+    }
+    let store = PersistentStore::open(&path).unwrap();
+    let index = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
+    assert_eq!(index.epoch().unwrap(), IndexEpoch(5));
+    assert_eq!(
+        index.entries().unwrap(),
+        vec![(k(7), IndexValue::Reference { child_count: 4 })]
+    );
+    // Normal applies continue after the swap.
+    commit(&index, &delta(6, &[(7, -1), (8, 1)])).unwrap();
+    assert_eq!(
+        index.get_many(&[k(7), k(8)]).unwrap(),
+        vec![
+            Some(IndexValue::Reference { child_count: 3 }),
+            Some(IndexValue::Reference { child_count: 1 })
+        ]
+    );
+}

@@ -26,6 +26,8 @@ object_store = { version = "0.14", default-features = false, features = ["aws"] 
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+redb.workspace = true
+blake3.workspace = true
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

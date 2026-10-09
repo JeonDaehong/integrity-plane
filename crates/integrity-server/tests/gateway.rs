@@ -20,6 +20,7 @@ use integrity_iceberg::manifest::{read_manifest, read_manifest_list};
 use integrity_iceberg::{FileIo, MemoryIo, ReadError};
 use integrity_index::PersistentStore;
 use integrity_server::config::ConstraintConfig;
+use integrity_server::store::Registry;
 use integrity_server::{Gateway, router};
 use serde_json::{Value, json};
 
@@ -163,6 +164,7 @@ fn constraints() -> Vec<ConstraintConfig> {
         nulls: None,
         references: None,
         match_mode: None,
+        column_names: None,
     };
     vec![
         c(1, "pk_orders", "primary_key", vec![1]),
@@ -230,7 +232,7 @@ async fn harness(extra: MemoryIo) -> Harness {
         store,
         log,
         1 << 30,
-        constraints(),
+        Registry::open(dir.0.join("registry.redb"), &constraints()).unwrap(),
     )
     .unwrap();
     let gw_addr = serve(router(Arc::new(gateway))).await;

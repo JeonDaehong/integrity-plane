@@ -54,6 +54,16 @@ pub enum IndexValue {
     },
 }
 
+impl IndexValue {
+    /// The kind of index this value belongs to.
+    pub fn kind(&self) -> Option<IndexKind> {
+        Some(match self {
+            IndexValue::Unique { .. } => IndexKind::Unique,
+            IndexValue::Reference { .. } => IndexKind::Reference,
+        })
+    }
+}
+
 /// A commit's net key change for one index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDelta {
