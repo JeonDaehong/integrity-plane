@@ -25,6 +25,9 @@ jobs:
       - name: Start upstream catalog
         run: |
           mkdir -p /tmp/warehouse && chmod 777 /tmp/warehouse
+          # The catalog creates table directories; run it as the runner's user so clients can
+          # write data files into them.
+          export HOST_UID_GID="$(id -u):$(id -g)"
           docker compose -f compat/docker-compose.yml up -d
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:8182/v1/config && break; sleep 2; done
       - name: Start gateway

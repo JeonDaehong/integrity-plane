@@ -6,7 +6,7 @@
 services:
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.10.1
-    user: root
+    user: "${HOST_UID_GID:-0:0}"
     environment:
       CATALOG_WAREHOUSE: file:///tmp/warehouse
       CATALOG_IO__IMPL: org.apache.iceberg.hadoop.HadoopFileIO
