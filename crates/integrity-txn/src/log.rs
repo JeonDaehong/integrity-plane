@@ -1,6 +1,6 @@
 //! The durable transaction log (spec §16, RFC 0004).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Mutex;
@@ -98,6 +98,15 @@ struct Index {
     next_txn: u64,
     txns: BTreeMap<u64, Txn>,
     by_request: BTreeMap<String, u64>,
+    /// Transactions not in a terminal state (what recovery must resolve).
+    open: BTreeSet<u64>,
+}
+
+fn is_terminal(state: TxnState) -> bool {
+    matches!(
+        state,
+        TxnState::Committed | TxnState::Aborted | TxnState::Rejected
+    )
 }
 
 /// The transaction log. All writes are durable two-phase commits.
@@ -258,6 +267,11 @@ impl TxnLog {
                     return Err(TxnError::Corrupt);
                 }
                 t.state = Some(state);
+                if is_terminal(state) {
+                    index.open.remove(&id.0);
+                } else {
+                    index.open.insert(id.0);
+                }
                 match state {
                     TxnState::Prepared => {
                         let p: Prepared =
@@ -293,24 +307,40 @@ impl TxnLog {
         payload: &[u8],
         staged: Option<&[(ConstraintId, StagedDelta)]>,
     ) -> Result<(), TxnError> {
+        self.append_all(txn, &[(state, payload)], staged)
+    }
+
+    /// Appends consecutive records of one transaction in a single durable write.
+    fn append_all(
+        &self,
+        txn: TxnId,
+        records: &[(TxnState, &[u8])],
+        staged: Option<&[(ConstraintId, StagedDelta)]>,
+    ) -> Result<(), TxnError> {
         let mut index = self
             .index
             .lock()
             .map_err(|_| TxnError::Storage("log lock poisoned".into()))?;
-        let current = index.txns.get(&txn.0).and_then(|t| t.state);
-        if !allowed(current, state) {
-            return Err(TxnError::IllegalTransition {
-                from: current,
-                to: state,
-            });
+        let mut current = index.txns.get(&txn.0).and_then(|t| t.state);
+        for &(state, _) in records {
+            if !allowed(current, state) {
+                return Err(TxnError::IllegalTransition {
+                    from: current,
+                    to: state,
+                });
+            }
+            current = Some(state);
         }
-        let seq = index.next_seq;
-        let record = encode_record(state, txn, payload);
+        let first_seq = index.next_seq;
         let mut w = self.db.begin_write().map_err(storage)?;
         w.set_two_phase_commit(true);
         {
             let mut log = w.open_table(LOG).map_err(storage)?;
-            log.insert(seq, record.as_slice()).map_err(storage)?;
+            for (n, &(state, payload)) in records.iter().enumerate() {
+                let record = encode_record(state, txn, payload);
+                log.insert(first_seq + n as u64, record.as_slice())
+                    .map_err(storage)?;
+            }
             if let Some(staged) = staged {
                 let mut table = w.open_table(STAGED).map_err(storage)?;
                 table
@@ -319,8 +349,15 @@ impl TxnLog {
             }
         }
         w.commit().map_err(storage)?;
-        index.next_seq = seq + 1;
-        index.txns.entry(txn.0).or_default().state = Some(state);
+        index.next_seq = first_seq + records.len() as u64;
+        if let Some(state) = current {
+            index.txns.entry(txn.0).or_default().state = Some(state);
+            if is_terminal(state) {
+                index.open.remove(&txn.0);
+            } else {
+                index.open.insert(txn.0);
+            }
+        }
         Ok(())
     }
 
@@ -359,6 +396,31 @@ impl TxnLog {
         let payload =
             serde_json::to_vec(&validated).map_err(|e| TxnError::Storage(e.to_string()))?;
         self.append(txn, TxnState::Validated, &payload, Some(staged))?;
+        if let Ok(mut index) = self.index.lock() {
+            index.txns.entry(txn.0).or_default().validated = Some(validated);
+        }
+        Ok(())
+    }
+
+    /// Records `VALIDATED` (with the staged deltas) and `COMMITTING` in one durable write, for a
+    /// commit about to be forwarded. Same records as [`TxnLog::validated`] then
+    /// [`TxnLog::committing`].
+    pub fn validated_and_committing(
+        &self,
+        txn: TxnId,
+        validated: Validated,
+        staged: &[(ConstraintId, StagedDelta)],
+    ) -> Result<(), TxnError> {
+        let payload =
+            serde_json::to_vec(&validated).map_err(|e| TxnError::Storage(e.to_string()))?;
+        self.append_all(
+            txn,
+            &[
+                (TxnState::Validated, payload.as_slice()),
+                (TxnState::Committing, b"{}".as_slice()),
+            ],
+            Some(staged),
+        )?;
         if let Ok(mut index) = self.index.lock() {
             index.txns.entry(txn.0).or_default().validated = Some(validated);
         }
@@ -417,6 +479,13 @@ impl TxnLog {
         self.index.lock().ok()?.txns.get(&txn.0)?.decision.clone()
     }
 
+    /// Whether a transaction with this request id was ever started (finished or not).
+    pub fn knows_request(&self, request_id: &str) -> bool {
+        self.index
+            .lock()
+            .is_ok_and(|i| i.by_request.contains_key(request_id))
+    }
+
     /// The recorded decision for a request id, if its transaction finished.
     pub fn decision_for(&self, request_id: &str) -> Option<Decision> {
         let index = self.index.lock().ok()?;
@@ -432,15 +501,9 @@ impl TxnLog {
                 .lock()
                 .map_err(|_| TxnError::Storage("log lock poisoned".into()))?;
             index
-                .txns
+                .open
                 .iter()
-                .filter(|(_, t)| {
-                    matches!(
-                        t.state,
-                        Some(TxnState::Prepared | TxnState::Validated | TxnState::Committing)
-                    )
-                })
-                .map(|(id, t)| (*id, t.clone()))
+                .filter_map(|id| index.txns.get(id).map(|t| (*id, t.clone())))
                 .collect()
         };
         let read = self.db.begin_read().map_err(storage)?;

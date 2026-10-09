@@ -19,8 +19,10 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
   write) before anything is forwarded.
 - `COMMITTING` is written immediately before the request goes upstream. A transaction in
   `VALIDATED` was therefore never forwarded.
-- After the upstream answer: success ⇒ indexes applied at the transaction's epoch, then
-  `COMMITTED`; a 4xx ⇒ `ABORTED`; a 5xx or no answer ⇒ resolved as below.
+- `VALIDATED` and `COMMITTING` of a commit about to be forwarded are written in one durable write
+  (the same two records).
+- After the upstream answer: success ⇒ indexes applied at the transaction's epoch, all indexes in
+  one atomic transaction, then `COMMITTED`; a 4xx ⇒ `ABORTED`; a 5xx or no answer ⇒ resolved as below.
 - Terminal records store the response, returned again for a repeated `Idempotency-Key`.
 
 ## Resolution (on start and before every commit)
@@ -31,9 +33,9 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
 | `VALIDATED` | `ABORTED` (never forwarded) |
 | `COMMITTING` | reload the table: final snapshot present ⇒ re-apply the staged deltas (idempotent) and `COMMITTED`; absent ⇒ `ABORTED`; upstream unreachable ⇒ commits answer `RECOVERY_REQUIRED` (409) until it answers |
 
-Re-applying is safe because an index accepts the same `(staged delta, epoch)` twice (ADR 0003): a
-crash between two index applies leaves one index updated and one not, and recovery completes the
-second without touching the first.
+Re-applying is safe because an index accepts the same `(staged delta, epoch)` twice (ADR 0003). The
+indexes of one commit are applied in one atomic transaction, so a crash leaves all of them updated
+or none.
 
 ## Verified by fault injection
 

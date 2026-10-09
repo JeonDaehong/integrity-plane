@@ -18,8 +18,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Commits to branches other than `main` pass through uncertified.
 - The Plane reads whole data files, not only the key column chunks, so bytes read per commit grow
   with file size (reported by `integrity_bytes_read_total`).
-- One domain commits about 9–12 times per second on the benchmark machine (`benchmarks.md`): each
-  commit makes several durable writes.
+- One domain commits about 80 times per second with one writer on the benchmark machine, and about
+  25 times per second when 16 writers race on one table (about a third of the same race without
+  the Plane; `benchmarks.md`).
 
 ## Constraints, onboarding and rebuild
 
@@ -51,6 +52,7 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   self-declared (`X-Integrity-Actor` or `User-Agent`), not authenticated.
 - A disabled domain (spec §19) accepts anything, uncertified, until it is rebuilt.
 - Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg 0.12, iceberg-rust 0.10, against the
-  Iceberg REST fixture catalog. Polaris, Lakekeeper and Nessie as upstream are untested. S3 is tested
+  Iceberg REST fixture catalog; Spark and PyIceberg also against Apache Polaris 1.7 (OAuth2,
+  catalog prefix). Lakekeeper and Nessie as upstream are untested. S3 is tested
   against SeaweedFS (MinIO no longer publishes container images), not against AWS S3.
 - Not tested: power loss (only process kills), Linux and Windows only.

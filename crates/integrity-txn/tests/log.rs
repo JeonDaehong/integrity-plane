@@ -283,3 +283,48 @@ proptest::proptest! {
         proptest::prop_assert!(decode_record(&record).is_err());
     }
 }
+
+#[test]
+fn validated_and_committing_is_one_write_of_both_records() {
+    let dir = Dir::new();
+    let txn = {
+        let log = TxnLog::open(dir.log()).unwrap();
+        let txn = log.begin(prepared(None)).unwrap();
+        log.validated_and_committing(txn, validated(), &staged())
+            .unwrap();
+        assert_eq!(log.state(txn), Some(TxnState::Committing));
+        // Same records as validated() then committing().
+        let kinds: Vec<TxnState> = log
+            .records()
+            .unwrap()
+            .iter()
+            .map(|(_, r)| decode_record(r).unwrap().0)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                TxnState::Prepared,
+                TxnState::Validated,
+                TxnState::Committing
+            ]
+        );
+        txn
+    };
+    // After a crash, recovery sees it with everything it needs; once finished it is gone.
+    let log = TxnLog::open(dir.log()).unwrap();
+    let u = log.unresolved().unwrap();
+    assert_eq!(u.len(), 1);
+    assert_eq!((u[0].txn, u[0].state), (txn, TxnState::Committing));
+    assert_eq!(u[0].staged, staged());
+    log.finish(txn, TxnState::Committed, ok(200)).unwrap();
+    assert!(log.unresolved().unwrap().is_empty());
+    drop(log);
+    let reopened = TxnLog::open(dir.log()).unwrap();
+    assert!(reopened.unresolved().unwrap().is_empty());
+    // Illegal from here.
+    assert!(
+        reopened
+            .validated_and_committing(txn, validated(), &staged())
+            .is_err()
+    );
+}

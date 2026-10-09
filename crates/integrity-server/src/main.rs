@@ -55,7 +55,8 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     )?
     .with_prefix(config.upstream.prefix.as_deref())
     .with_admin_token(config.server.admin_token.clone())
-    .with_redact_keys(config.errors.redact_keys);
+    .with_redact_keys(config.errors.redact_keys)
+    .with_upstream_auth(config.upstream.auth.clone());
     if let Err(e) = gateway.recover_on_start().await {
         tracing::warn!("recovery pending until upstream answers: {e}");
     }

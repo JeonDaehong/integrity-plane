@@ -12,7 +12,9 @@ use integrity_iceberg::{
     Budgeted, FileIo, MainChange, NewSnapshot, TableMetadata, check_operation, commit_rows,
     diff_snapshots,
 };
-use integrity_index::{IndexEpoch, KeyIndex, Overlay, PersistentIndex, StagedDelta};
+use integrity_index::{
+    IndexEpoch, KeyIndex, Overlay, PersistentIndex, PersistentStore, StagedDelta,
+};
 use integrity_txn::{FaultPoint, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, TableId};
 use integrity_validator::{Decision, ValidatedDeltas, Validator, ViolationDetail};
@@ -220,23 +222,25 @@ fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Ou
     Ok(Outcome::Accepted { plans, staged })
 }
 
-/// Applies a commit's staged deltas at `epoch`. Idempotent: re-applying after a crash is a no-op
-/// for indexes that were already updated (ADR 0003).
+/// Applies a commit's staged deltas at `epoch`, atomically across its indexes. Idempotent:
+/// re-applying after a crash is a no-op (ADR 0003).
 pub fn apply(
+    store: &PersistentStore,
     staged: &[(ConstraintId, StagedDelta)],
     indexes: &BTreeMap<ConstraintId, PersistentIndex>,
     epoch: u64,
 ) -> Result<(), ApiError> {
-    for (n, (id, delta)) in staged.iter().enumerate() {
-        if n > 0 {
-            fault::hit(FaultPoint::DuringIndexApply);
-        }
-        let index = indexes
-            .get(id)
-            .ok_or_else(|| ApiError::new(ErrorCode::IndexDegraded, format!("no index for {id}")))?;
-        index
-            .apply(delta.clone(), IndexEpoch(epoch))
-            .map_err(|e| api(e, ErrorCode::IndexDegraded))?;
-    }
-    Ok(())
+    let batch = staged
+        .iter()
+        .map(|(id, delta)| {
+            indexes.get(id).map(|index| (index, delta)).ok_or_else(|| {
+                ApiError::new(ErrorCode::IndexDegraded, format!("no index for {id}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    fault::hit(FaultPoint::DuringIndexApply);
+    // One atomic transaction for every index of the commit.
+    store
+        .apply_all(&batch, IndexEpoch(epoch))
+        .map_err(|e| api(e, ErrorCode::IndexDegraded))
 }

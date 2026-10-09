@@ -15,6 +15,15 @@ timeout_secs = 60
 # Catalog prefix used by the integrity API to reach tables (/v1/{prefix}/namespaces/...), if any.
 # prefix = "warehouse"
 
+# Credentials for the Plane's own requests to the catalog (validation reads, onboarding, rebuild,
+# verify, recovery). Writers' commits are forwarded with the writers' own credentials.
+# [upstream.auth]
+# type = "oauth2"                 # or: type = "bearer", token = "..."
+# client_id = "integrity-plane"
+# client_secret = "..."
+# scope = "PRINCIPAL_ROLE:ALL"
+# token_uri = "/v1/oauth/tokens"   # default; relative to catalog_uri, or an absolute URL
+
 [control_store]
 path = "/var/lib/integrity"
 

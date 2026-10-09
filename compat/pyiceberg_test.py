@@ -5,6 +5,7 @@ after exactly one commit attempt (no retry storm).
 """
 
 import json
+import os
 import sys
 import urllib.request
 
@@ -15,6 +16,8 @@ from pyiceberg.types import LongType, NestedField, StringType
 
 GATEWAY = "http://127.0.0.1:8181"
 NS = "pyiceberg"
+# Extra catalog properties for upstreams that need them (e.g. Polaris: credential, warehouse).
+EXTRA = json.loads(os.environ.get("CATALOG_PROPS", "{}"))
 
 CUSTOMER = Schema(
     NestedField(1, "customer_id", LongType(), required=False),
@@ -52,7 +55,7 @@ def expect_rejection(code, table, action):
 
 
 def main():
-    catalog = load_catalog("gw", type="rest", uri=GATEWAY)
+    catalog = load_catalog("gw", type="rest", uri=GATEWAY, **EXTRA)
     catalog.create_namespace_if_not_exists(NS)
     customer = catalog.create_table(f"{NS}.customer", CUSTOMER)
     orders = catalog.create_table(f"{NS}.orders", ORDERS)

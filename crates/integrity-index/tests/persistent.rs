@@ -155,3 +155,47 @@ fn replace_all_swaps_contents_atomically_and_survives_reopen() {
         ]
     );
 }
+
+#[test]
+fn apply_all_is_atomic_across_indexes_and_replayable() {
+    let dir = TempDir::new("apply-all");
+    let path = dir.path().join("index.redb");
+    let store = PersistentStore::open(&path).unwrap();
+    let a = store.index(ConstraintId(1), IndexKind::Unique).unwrap();
+    let b = store.index(ConstraintId(2), IndexKind::Reference).unwrap();
+    let sa = a.stage(&delta(1, &[(1, 1), (2, 1)])).unwrap();
+    let sb = b.stage(&delta(1, &[(1, 3)])).unwrap();
+    store
+        .apply_all(&[(&a, &sa), (&b, &sb)], IndexEpoch(5))
+        .unwrap();
+    assert_eq!(a.epoch().unwrap(), IndexEpoch(5));
+    assert_eq!(b.epoch().unwrap(), IndexEpoch(5));
+    // Replaying the same batch (recovery) changes nothing and succeeds.
+    store
+        .apply_all(&[(&a, &sa), (&b, &sb)], IndexEpoch(5))
+        .unwrap();
+    assert_eq!(
+        b.get_many(&[k(1)]).unwrap(),
+        vec![Some(IndexValue::Reference { child_count: 3 })]
+    );
+
+    // One conflicting index aborts the whole batch: the other one is not written either.
+    let sa2 = a.stage(&delta(2, &[(9, 1)])).unwrap();
+    let stale = b.stage(&delta(2, &[(8, 1)])).unwrap();
+    b.apply(stale.clone(), IndexEpoch(7)).unwrap();
+    let sb_old = stale;
+    assert!(
+        store
+            .apply_all(&[(&a, &sa2), (&b, &sb_old)], IndexEpoch(6))
+            .is_err()
+    );
+    assert_eq!(a.epoch().unwrap(), IndexEpoch(5), "nothing applied");
+    assert_eq!(a.get_many(&[k(9)]).unwrap(), vec![None]);
+
+    // Indexes of another store are refused.
+    let other_dir = TempDir::new("apply-all-other");
+    let other = PersistentStore::open(other_dir.path().join("o.redb")).unwrap();
+    let foreign = other.index(ConstraintId(1), IndexKind::Unique).unwrap();
+    let sf = foreign.stage(&delta(1, &[(1, 1)])).unwrap();
+    assert!(store.apply_all(&[(&foreign, &sf)], IndexEpoch(9)).is_err());
+}

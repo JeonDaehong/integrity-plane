@@ -446,6 +446,8 @@ async fn main() -> Result<(), BoxError> {
     for (name, uuid) in [
         ("customer", "11111111-1111-1111-1111-111111111111"),
         ("orders", "22222222-2222-2222-2222-222222222222"),
+        ("hot", "44444444-4444-4444-4444-444444444444"),
+        ("baseline", "33333333-3333-3333-3333-333333333333"),
     ] {
         shared.lock().map_err(|_| "lock")?.tables.insert(
             format!("/v1/namespaces/bench/tables/{name}"),
@@ -599,64 +601,118 @@ async fn main() -> Result<(), BoxError> {
         mib(after.get("integrity_bytes_read_total") - before.get("integrity_bytes_read_total")),
     ));
 
-    // 4. Hot key: concurrent writers appending one order each for parent key 0, retrying on 409.
+    // 4. One writer, sequential single-row FK appends: the per-commit cost without contention.
     let before = b.metrics().await?;
-    let b = Arc::new(b);
-    let next = Arc::new(AtomicI64::new(next_order));
-    let t = Instant::now();
-    let mut tasks = Vec::new();
-    for _ in 0..o.writers {
-        let b = Arc::clone(&b);
-        let next = Arc::clone(&next);
-        let commits = o.hot_commits;
-        tasks.push(tokio::spawn(async move {
-            let mut latencies = Vec::new();
-            let mut attempts = 0usize;
-            for _ in 0..commits {
-                let id = next.fetch_add(1, Ordering::SeqCst);
-                let t = Instant::now();
-                loop {
-                    attempts += 1;
-                    let status = b
-                        .commit(
-                            &b.gateway,
-                            "orders",
-                            &Change::Append(vec![id], vec![Some(0)]),
-                        )
-                        .await?;
-                    match status {
-                        200 => break,
-                        409 => continue,
-                        other => return Err::<_, BoxError>(format!("hot key: {other}").into()),
-                    }
-                }
-                latencies.push(t.elapsed());
-            }
-            Ok((latencies, attempts))
-        }));
-    }
     let mut latencies = Vec::new();
-    let mut attempts = 0;
-    for task in tasks {
-        let (l, a) = task.await??;
-        latencies.extend(l);
-        attempts += a;
+    let t = Instant::now();
+    let sequential = 100;
+    for _ in 0..sequential {
+        let id = next_order;
+        next_order += 1;
+        let start = Instant::now();
+        let status = b
+            .commit(
+                &b.gateway,
+                "orders",
+                &Change::Append(vec![id], vec![Some(0)]),
+            )
+            .await?;
+        assert_eq!(status, 200, "sequential append");
+        latencies.push(start.elapsed());
     }
     let elapsed = t.elapsed();
     latencies.sort();
     let after = b.metrics().await?;
-    let commits = latencies.len();
     line(format!(
-        "| Hot parent key: {} writers × {} single-row FK appends to one table | queue wait p50 {} / p99 {}; end-to-end incl. retries p50 {} / p99 {} | {:.0} commits/s | {} attempts for {} commits (409 retries) |",
+        "| One writer: {sequential} sequential single-row FK appends | end-to-end p50 {} / p99 {}; server validation p50 {} | {:.0} commits/s | |",
+        seconds(percentile(&latencies, 0.5).as_secs_f64()),
+        seconds(percentile(&latencies, 0.99).as_secs_f64()),
+        after.quantile_bound(&before, "integrity_validation_seconds", 0.5),
+        sequential as f64 / elapsed.as_secs_f64(),
+    ));
+
+    // 5. Hot key: concurrent writers appending one order each for parent key 0, retrying on 409;
+    //    and the same workload sent straight to the catalog (no Plane, no constraints) as baseline.
+    let b = Arc::new(b);
+    let hot = |base: String, table: &'static str, first_id: i64| {
+        let b = Arc::clone(&b);
+        let writers = o.writers;
+        let commits = o.hot_commits;
+        async move {
+            let next = Arc::new(AtomicI64::new(first_id));
+            let t = Instant::now();
+            let mut tasks = Vec::new();
+            for _ in 0..writers {
+                let b = Arc::clone(&b);
+                let next = Arc::clone(&next);
+                let base = base.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut latencies = Vec::new();
+                    let mut attempts = 0usize;
+                    for _ in 0..commits {
+                        let id = next.fetch_add(1, Ordering::SeqCst);
+                        let t = Instant::now();
+                        loop {
+                            attempts += 1;
+                            let status = b
+                                .commit(&base, table, &Change::Append(vec![id], vec![Some(0)]))
+                                .await?;
+                            match status {
+                                200 => break,
+                                409 => continue,
+                                other => {
+                                    return Err::<_, BoxError>(format!("hot key: {other}").into());
+                                }
+                            }
+                        }
+                        latencies.push(t.elapsed());
+                    }
+                    Ok((latencies, attempts))
+                }));
+            }
+            let mut latencies = Vec::new();
+            let mut attempts = 0;
+            for task in tasks {
+                let (l, a) = task.await??;
+                latencies.extend(l);
+                attempts += a;
+            }
+            let elapsed = t.elapsed();
+            latencies.sort();
+            Ok::<_, BoxError>((latencies, attempts, elapsed))
+        }
+    };
+    // Both runs start from an empty table: metadata grows with every snapshot.
+    b.register(
+        json!({"table": "bench.hot", "name": "pk_hot", "type": "PRIMARY_KEY", "columns": ["id"]}),
+    )
+    .await?;
+    b.register(json!({"table": "bench.hot", "name": "fk_hot_customer", "type": "FOREIGN_KEY",
+                      "columns": ["ref"], "references": {"table": "bench.customer", "constraint": "pk_customer"}}))
+        .await?;
+    let before = b.metrics().await?;
+    let (latencies, attempts, elapsed) = hot(b.gateway.clone(), "hot", 0).await?;
+    let after = b.metrics().await?;
+    line(format!(
+        "| Hot parent key: {} writers × {} single-row FK appends to one new table | queue wait p50 {} / p99 {}; end-to-end incl. retries p50 {} / p99 {} | {:.0} commits/s | {} attempts for {} commits (409 retries) |",
         o.writers,
         o.hot_commits,
         after.quantile_bound(&before, "integrity_domain_queue_wait_seconds", 0.5),
         after.quantile_bound(&before, "integrity_domain_queue_wait_seconds", 0.99),
         seconds(percentile(&latencies, 0.5).as_secs_f64()),
         seconds(percentile(&latencies, 0.99).as_secs_f64()),
-        commits as f64 / elapsed.as_secs_f64(),
+        latencies.len() as f64 / elapsed.as_secs_f64(),
         attempts,
-        commits,
+        latencies.len(),
+    ));
+    let (latencies, attempts, elapsed) = hot(b.upstream.clone(), "baseline", 0).await?;
+    line(format!(
+        "| Baseline: the same writers straight to the catalog (no Plane) | end-to-end incl. retries p50 {} / p99 {} | {:.0} commits/s | {} attempts for {} commits |",
+        seconds(percentile(&latencies, 0.5).as_secs_f64()),
+        seconds(percentile(&latencies, 0.99).as_secs_f64()),
+        latencies.len() as f64 / elapsed.as_secs_f64(),
+        attempts,
+        latencies.len(),
     ));
     line(format!(
         "| Control store after the run | indexes {} / txn log {} / registry {} | | |",

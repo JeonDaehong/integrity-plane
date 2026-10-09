@@ -1,0 +1,99 @@
+# Gateway configuration for the compatibility tests against Apache Polaris (compat/polaris_setup.sh):
+# the Plane authenticates to Polaris with OAuth2 client credentials, and Polaris serves the catalog
+# under the prefix "compat". Constraints as in integrity.toml.
+
+[server]
+bind = "127.0.0.1:8181"
+
+[upstream]
+catalog_uri = "http://127.0.0.1:8183/api/catalog"
+prefix = "compat"
+
+[upstream.auth]
+type = "oauth2"
+client_id = "root"
+client_secret = "s3cr3t"
+scope = "PRINCIPAL_ROLE:ALL"
+
+[control_store]
+path = "target/compat-polaris-control"
+
+[[constraint]]
+id = 11
+table = "pyiceberg.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 12
+table = "pyiceberg.customer"
+name = "nn_customer_name"
+type = "not_null"
+columns = [2]
+
+[[constraint]]
+id = 13
+table = "pyiceberg.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 14
+table = "pyiceberg.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "pyiceberg.customer", constraint = 11 }
+
+[[constraint]]
+id = 21
+table = "spark.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 22
+table = "spark.customer"
+name = "nn_customer_name"
+type = "not_null"
+columns = [2]
+
+[[constraint]]
+id = 23
+table = "spark.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 24
+table = "spark.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "spark.customer", constraint = 21 }
+
+[[constraint]]
+id = 25
+table = "spark.region"
+name = "pk_region"
+type = "primary_key"
+columns = [1, 2]
+
+[[constraint]]
+id = 26
+table = "spark.store"
+name = "pk_store"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 27
+table = "spark.store"
+name = "fk_store_region"
+type = "foreign_key"
+columns = [2, 3]
+references = { table = "spark.region", constraint = 25 }

@@ -77,6 +77,14 @@ overrides or idempotency-key support.
 | iceberg-rust | 0.10.1 | fast append, INT-005, INT-003, INT-007 |
 | Spark + `integrity` CLI (Appendix A demo, `compat/demo_test.py`) | as above | constraints registered via CLI, INT-005, INT-006, compaction (`rewrite_data_files`) certified, restart after kill -9, a write straight to the upstream catalog pinpointed by `verify`, INT-010 until `rebuild` |
 
+### Apache Polaris (CI job `polaris`)
+
+Polaris 1.7.0 with a filesystem catalog (`compat/polaris_setup.sh`): clients authenticate with
+OAuth2 client credentials through the gateway (the token endpoint is proxied), the catalog prefix
+comes from `/v1/config?warehouse=…`, and the Plane uses its own client credentials
+(`[upstream.auth]`) to read tables for validation, onboarding and `verify`. PyIceberg and Spark run
+the same scenarios as above, then `integrity verify` succeeds on their tables.
+
 For every client each violation reaches the gateway exactly once (no retry storm), the statement
 fails with the integrity code in its message, and every snapshot on `main` carries a certificate.
 Upstream: Iceberg REST fixture 1.10.1 with a filesystem warehouse. The CI job `compose-s3` also runs

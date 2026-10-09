@@ -155,7 +155,7 @@ async fn verify(
         )
             .into_response();
     };
-    reply(g.verify(table, &headers).await)
+    reply(g.verify(table).await)
 }
 
 fn not_found(what: &str) -> Response {

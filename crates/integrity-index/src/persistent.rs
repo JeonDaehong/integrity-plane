@@ -100,6 +100,34 @@ impl PersistentStore {
         &self.shared.id
     }
 
+    /// Applies the staged deltas of several indexes of this store at `epoch` in one atomic,
+    /// durable transaction: either every index changes or none does. Each index is idempotent as
+    /// with [`KeyIndex::apply`] (one already applied at `epoch` with the same delta is skipped).
+    pub fn apply_all(
+        &self,
+        batch: &[(&PersistentIndex, &StagedDelta)],
+        epoch: IndexEpoch,
+    ) -> Result<()> {
+        if batch
+            .iter()
+            .any(|(index, _)| !Arc::ptr_eq(&index.shared, &self.shared))
+        {
+            return Err(IndexError::Storage("index of another store".into()));
+        }
+        self.shared.guard(|db| {
+            let mut txn = db.begin_write().map_err(storage)?;
+            txn.set_two_phase_commit(true);
+            let mut wrote = false;
+            for (index, staged) in batch {
+                wrote |= index.write_in(&txn, staged, epoch)?;
+            }
+            if wrote {
+                txn.commit().map_err(storage)?;
+            }
+            Ok(())
+        })
+    }
+
     /// The index of constraint `id`, created empty at epoch 0 if it does not exist yet.
     /// Fails with [`IndexError::Corrupt`] if it exists with a different kind.
     pub fn index(&self, id: ConstraintId, kind: IndexKind) -> Result<PersistentIndex> {
@@ -218,6 +246,22 @@ impl PersistentIndex {
 
     /// Registers the index in the metadata table if needed, checking its kind.
     fn create(&self, db: &Database) -> Result<()> {
+        // Usually the index exists: check without a (durable) write transaction.
+        {
+            let read = db.begin_read().map_err(storage)?;
+            if let Ok(meta) = read.open_table(META) {
+                let existing = meta
+                    .get(self.id)
+                    .map_err(storage)?
+                    .map(|g| Meta::decode(g.value()))
+                    .transpose()?;
+                match existing {
+                    Some(m) if m.kind != self.kind => return Err(IndexError::Corrupt),
+                    Some(_) if read.open_table(self.table()).is_ok() => return Ok(()),
+                    _ => {}
+                }
+            }
+        }
         let mut txn = db.begin_write().map_err(storage)?;
         txn.set_two_phase_commit(true);
         {
@@ -315,12 +359,24 @@ impl PersistentIndex {
     fn apply_in(&self, db: &Database, staged: &StagedDelta, epoch: IndexEpoch) -> Result<()> {
         let mut txn = db.begin_write().map_err(storage)?;
         txn.set_two_phase_commit(true);
+        if self.write_in(&txn, staged, epoch)? {
+            txn.commit().map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `staged` within `txn`; `false` if it was already applied (nothing written).
+    fn write_in(
+        &self,
+        txn: &redb::WriteTransaction,
+        staged: &StagedDelta,
+        epoch: IndexEpoch,
+    ) -> Result<bool> {
         {
             let mut meta_table = txn.open_table(META).map_err(storage)?;
             let meta = self.read_meta(&meta_table)?;
             match decide_apply(staged, epoch, meta.epoch, meta.last_applied)? {
-                // Dropping the transaction aborts it.
-                ApplyAction::AlreadyApplied => return Ok(()),
+                ApplyAction::AlreadyApplied => return Ok(false),
                 ApplyAction::Write => {}
             }
             let digest = staged.digest();
@@ -346,7 +402,7 @@ impl PersistentIndex {
                 .insert(self.id, updated.encode().as_slice())
                 .map_err(storage)?;
         }
-        txn.commit().map_err(storage)
+        Ok(true)
     }
 }
 

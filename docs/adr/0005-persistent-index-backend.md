@@ -78,6 +78,14 @@ public.
 See the table and the reasons above. Storing indexes in the transaction log itself was rejected:
 indexes are derived state with a different lifecycle (rebuild, swap).
 
+## Amendment: atomic multi-index application
+
+`PersistentStore::apply_all` applies the staged deltas of several indexes of one store in a single
+two-phase-commit transaction, each with the same idempotence rules as `apply`. The gateway applies
+the indexes of a commit this way: one fsync per commit instead of one per index, and no state in
+which some indexes of a commit are updated and others not. Looking up an existing index uses a read
+transaction; a write transaction is opened only to create one.
+
 ## Amendment (Phase 11): store identity
 
 The store file holds a 32-byte identity (`oip/index-store/v1`), created once when the file is

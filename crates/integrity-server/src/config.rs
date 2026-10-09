@@ -66,6 +66,37 @@ pub struct UpstreamConfig {
     /// upstream uses one.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Credentials the Plane uses for its own upstream requests (reading table metadata for
+    /// validation, onboarding, rebuild, verify and recovery). Writers' own commits are forwarded
+    /// with their own credentials.
+    #[serde(default)]
+    pub auth: Option<UpstreamAuth>,
+}
+
+/// `[upstream.auth]`: a static bearer token, or OAuth2 client credentials (e.g. Polaris).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "type")]
+pub enum UpstreamAuth {
+    /// `Authorization: Bearer <token>`.
+    Bearer {
+        /// The token.
+        token: String,
+    },
+    /// Client-credentials grant against the catalog's token endpoint.
+    #[serde(rename = "oauth2")]
+    OAuth2 {
+        /// Client id.
+        client_id: String,
+        /// Client secret.
+        client_secret: String,
+        /// Requested scope, e.g. `PRINCIPAL_ROLE:ALL`.
+        #[serde(default)]
+        scope: Option<String>,
+        /// Token endpoint: absolute URL, or a path under the catalog URI. Default
+        /// `/v1/oauth/tokens`.
+        #[serde(default)]
+        token_uri: Option<String>,
+    },
 }
 
 fn default_timeout() -> u64 {
@@ -290,6 +321,10 @@ max_inline_validation_bytes = "2GiB"
             (
                 "compat/integrity.toml",
                 include_str!("../../../compat/integrity.toml"),
+            ),
+            (
+                "compat/integrity.polaris.toml",
+                include_str!("../../../compat/integrity.polaris.toml"),
             ),
         ] {
             if let Err(e) = Config::from_toml(text) {

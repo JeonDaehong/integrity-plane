@@ -17,7 +17,7 @@ pub enum FaultPoint {
     AfterUpstreamBeforeLog,
     /// Upstream answered with an unknown outcome (5xx or no answer).
     AfterUpstreamUnknown,
-    /// Between applying two indexes.
+    /// Upstream committed; the (single, atomic) index application is about to run.
     DuringIndexApply,
     /// Indexes applied, `COMMITTED` not yet logged.
     BeforeCommittedLog,

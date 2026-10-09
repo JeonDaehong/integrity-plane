@@ -14,6 +14,8 @@ from pyspark.sql import SparkSession
 GATEWAY = "http://127.0.0.1:8181"
 NS = "spark"
 ICEBERG = os.environ.get("ICEBERG_VERSION", "1.10.0")
+# Extra catalog properties for upstreams that need them (e.g. Polaris: credential, warehouse).
+EXTRA = json.loads(os.environ.get("CATALOG_PROPS", "{}"))
 
 
 def commits(table):
@@ -37,13 +39,18 @@ def expect_rejection(spark, code, table, sql):
 
 
 def main():
-    spark = (
+    builder = (
         SparkSession.builder.appName("integrity-compat")
         .config("spark.jars.packages", f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG}")
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.gw", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.gw.type", "rest")
         .config("spark.sql.catalog.gw.uri", GATEWAY)
+    )
+    for key, value in EXTRA.items():
+        builder = builder.config(f"spark.sql.catalog.gw.{key}", value)
+    spark = (
+        builder
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )

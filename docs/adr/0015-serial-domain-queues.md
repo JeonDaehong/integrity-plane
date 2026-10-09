@@ -23,9 +23,9 @@ publication.
 
 - The concurrent FK insert / parent delete race is impossible by construction; the concurrency tests
   check the invariant after every commit of many randomized runs.
-- The commit rate of a domain is bounded by the per-commit cost (about 9–12 commits/s on the
-  benchmark machine, `docs/benchmarks.md`), which matches lakehouse commit rates (commits per second
-  at most, each carrying many keys).
+- The commit rate of a domain is bounded by the per-commit cost (about 80 commits/s for one writer
+  on the benchmark machine, fewer when many writers race on one table; `docs/benchmarks.md`), which
+  matches lakehouse commit rates (commits per second at most, each carrying many keys).
 - Constraint changes pause commits in every domain while they run.
 
 ## Alternatives considered

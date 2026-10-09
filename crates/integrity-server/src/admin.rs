@@ -109,13 +109,10 @@ impl Gateway {
             .ok_or_else(|| invalid(format!("{identifier} is not namespace.table")))
     }
 
-    async fn load_member(
-        &self,
-        identifier: &str,
-        headers: &HeaderMap,
-    ) -> Result<TableMetadata, ApiError> {
+    async fn load_member(&self, identifier: &str) -> Result<TableMetadata, ApiError> {
         let path = self.table_path(identifier)?.path();
-        match self.load(&path, headers).await? {
+        // Never the operator's headers: they carry the integrity API token.
+        match self.load(&path, &HeaderMap::new()).await? {
             Loaded::Table(meta, _) => Ok(*meta),
             Loaded::Missing => Err(invalid(format!("table {identifier} does not exist"))),
         }
@@ -126,12 +123,11 @@ impl Gateway {
         &self,
         configs: &[ConstraintConfig],
         members: &BTreeSet<String>,
-        headers: &HeaderMap,
     ) -> Result<Result<Scanned, Value>, ApiError> {
         let mut loaded = Vec::new();
         let mut anchors = BTreeMap::new();
         for ident in members {
-            let meta = self.load_member(ident, headers).await?;
+            let meta = self.load_member(ident).await?;
             anchors.insert(
                 ident.clone(),
                 (
@@ -194,7 +190,7 @@ impl Gateway {
         headers: &HeaderMap,
     ) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
-        self.recover(headers, None).await?;
+        self.recover(&HeaderMap::new(), None).await?;
         let doc = self.registry.snapshot();
         if req.name.trim().is_empty() {
             return Err(invalid("name is empty"));
@@ -229,7 +225,7 @@ impl Gateway {
             Some(other) => return Err(invalid(format!("match = {other}"))),
         };
 
-        let meta = self.load_member(&req.table, headers).await?;
+        let meta = self.load_member(&req.table).await?;
         let schema = meta
             .current_schema()
             .ok_or_else(|| invalid(format!("{} has no current schema", req.table)))?;
@@ -303,7 +299,7 @@ impl Gateway {
         let mut candidate = doc.list();
         candidate.push(config.clone());
         let members = registry::component(&candidate, &config.table);
-        let scanned = match self.scan_domain(&candidate, &members, headers).await? {
+        let scanned = match self.scan_domain(&candidate, &members).await? {
             Ok(s) => s,
             Err(report) => {
                 let mut event = AuditEvent::new("CONSTRAINT_REJECTED", Some(&config.table));
@@ -358,7 +354,7 @@ impl Gateway {
     /// Drops a constraint. A PK/UNIQUE that a foreign key references cannot be dropped first.
     pub async fn drop_constraint(&self, id: u64, headers: &HeaderMap) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
-        self.recover(headers, None).await?;
+        self.recover(&HeaderMap::new(), None).await?;
         let doc = self.registry.snapshot();
         let config = doc.constraints.get(&id).cloned().ok_or_else(|| {
             ApiError::new(ErrorCode::ConstraintNotFound, format!("no constraint {id}"))
@@ -402,14 +398,14 @@ impl Gateway {
     /// tables (spec §19). On violations the domain stays (or becomes) degraded.
     pub async fn rebuild(&self, id: u64, headers: &HeaderMap) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
-        self.recover(headers, None).await?;
+        self.recover(&HeaderMap::new(), None).await?;
         let doc = self.registry.snapshot();
         let config = doc.constraints.get(&id).cloned().ok_or_else(|| {
             ApiError::new(ErrorCode::ConstraintNotFound, format!("no constraint {id}"))
         })?;
         let constraints = doc.list();
         let members = registry::component(&constraints, &config.table);
-        let scanned = match self.scan_domain(&constraints, &members, headers).await? {
+        let scanned = match self.scan_domain(&constraints, &members).await? {
             Ok(s) => s,
             Err(report) => {
                 let reason = "rebuild found constraint violations in the data".to_owned();
@@ -522,7 +518,7 @@ impl Gateway {
 impl Gateway {
     /// `GET /v1/integrity/verify?table=…`: recomputes the certificate chain of `main` from the
     /// data files. A broken chain is a bypass: the domain is degraded until rebuilt (spec §18).
-    pub async fn verify(&self, table: &str, headers: &HeaderMap) -> Result<Value, ApiError> {
+    pub async fn verify(&self, table: &str) -> Result<Value, ApiError> {
         let _shared = self.admin.read().await;
         let doc = self.registry.snapshot();
         let history = doc.history.get(table).cloned().unwrap_or_default();
@@ -532,7 +528,7 @@ impl Gateway {
                 format!("{table} has never had constraints"),
             ));
         }
-        let meta = self.load_member(table, headers).await?;
+        let meta = self.load_member(table).await?;
         let mut others = BTreeMap::new();
         for c in history.values().flatten() {
             let mut names = vec![c.table.clone()];
@@ -542,7 +538,7 @@ impl Gateway {
             for name in names {
                 if name != table && !others.contains_key(&name) {
                     // A table that cannot be loaded makes its versions unverifiable, not an error.
-                    if let Ok(m) = self.load_member(&name, headers).await {
+                    if let Ok(m) = self.load_member(&name).await {
                         others.insert(name, m);
                     }
                 }

@@ -64,6 +64,14 @@ policies are the preventive control.
 - Onboarding and rebuild scans are unbounded and pause all commits while they run; they require the
   integrity API, which must be restricted to operators.
 
+### Upstream credentials
+
+The Plane reads tables with its own credentials (`[upstream.auth]`) when configured, so validation
+does not depend on what each writer may read; give that principal read access to the constrained
+tables and nothing more. Writers' commits are forwarded with the writers' credentials, so the
+catalog still decides who may write. Requests to the integrity API are never forwarded upstream:
+the API token stays inside the Plane.
+
 ### The integrity API
 
 Registering, dropping and rebuilding constraints change what is enforced; `verify` and `rebuild`

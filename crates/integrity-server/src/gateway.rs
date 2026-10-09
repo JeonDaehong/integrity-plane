@@ -266,6 +266,10 @@ pub struct Gateway {
     pub(crate) base: String,
     /// Bearer token required by the integrity API, if any.
     pub(crate) admin_token: Option<String>,
+    /// Credentials for the Plane's own upstream requests.
+    upstream_auth: Option<crate::config::UpstreamAuth>,
+    /// Cached OAuth2 access token and when to refresh it.
+    upstream_token: Mutex<Option<(String, std::time::Instant)>>,
     /// Leave key values out of violation reports.
     pub(crate) redact_keys: bool,
     /// Held shared by every commit request, exclusively by constraint changes and rebuilds
@@ -307,6 +311,8 @@ impl Gateway {
             registry,
             base: "/v1".to_owned(),
             admin_token: None,
+            upstream_auth: None,
+            upstream_token: Mutex::new(None),
             redact_keys: false,
             admin: tokio::sync::RwLock::new(()),
             domains: std::sync::Mutex::new(BTreeMap::new()),
@@ -378,6 +384,112 @@ impl Gateway {
     pub fn with_admin_token(mut self, token: Option<String>) -> Self {
         self.admin_token = token;
         self
+    }
+
+    /// Credentials for the Plane's own upstream requests (`[upstream.auth]`).
+    pub fn with_upstream_auth(mut self, auth: Option<crate::config::UpstreamAuth>) -> Self {
+        self.upstream_auth = auth;
+        self
+    }
+
+    /// Headers for a request the Plane makes on its own behalf. With `[upstream.auth]`, its
+    /// credentials; otherwise the caller's headers (a writer's own, for requests made while
+    /// handling its commit), or none.
+    async fn upstream_headers(&self, caller: &HeaderMap) -> Result<HeaderMap, ApiError> {
+        use crate::config::UpstreamAuth;
+        let token = match &self.upstream_auth {
+            None => return Ok(caller.clone()),
+            Some(UpstreamAuth::Bearer { token }) => token.clone(),
+            Some(UpstreamAuth::OAuth2 {
+                client_id,
+                client_secret,
+                scope,
+                token_uri,
+            }) => {
+                let mut cached = self.upstream_token.lock().await;
+                match cached.as_ref() {
+                    Some((t, until)) if std::time::Instant::now() < *until => t.clone(),
+                    _ => {
+                        let (t, ttl) = self
+                            .fetch_token(
+                                client_id,
+                                client_secret,
+                                scope.as_deref(),
+                                token_uri.as_deref(),
+                            )
+                            .await?;
+                        let refresh = ttl.saturating_sub(60).max(30);
+                        *cached = Some((
+                            t.clone(),
+                            std::time::Instant::now() + std::time::Duration::from_secs(refresh),
+                        ));
+                        t
+                    }
+                }
+            }
+        };
+        let mut out = HeaderMap::new();
+        let value =
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                ApiError::new(
+                    ErrorCode::RecoveryRequired,
+                    "upstream token is not a valid header",
+                )
+            })?;
+        out.insert(axum::http::header::AUTHORIZATION, value);
+        Ok(out)
+    }
+
+    /// OAuth2 client-credentials grant; returns the token and its lifetime in seconds.
+    async fn fetch_token(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        scope: Option<&str>,
+        token_uri: Option<&str>,
+    ) -> Result<(String, u64), ApiError> {
+        let uri = match token_uri {
+            Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_owned(),
+            Some(path) => format!("{}{path}", self.upstream),
+            None => format!("{}/v1/oauth/tokens", self.upstream),
+        };
+        let mut form = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}",
+            encode(client_id),
+            encode(client_secret)
+        );
+        if let Some(s) = scope {
+            form.push_str(&format!("&scope={}", encode(s)));
+        }
+        let failed = |m: String| ApiError::new(ErrorCode::RecoveryRequired, m);
+        let resp = self
+            .http
+            .post(&uri)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(form)
+            .send()
+            .await
+            .map_err(|e| failed(format!("upstream token endpoint unreachable: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(failed(format!(
+                "upstream token endpoint answered {}",
+                resp.status()
+            )));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| failed(format!("bad token response: {e}")))?;
+        let token = body["access_token"]
+            .as_str()
+            .ok_or_else(|| failed("token response without access_token".into()))?;
+        Ok((
+            token.to_owned(),
+            body["expires_in"].as_u64().unwrap_or(3600),
+        ))
     }
 
     /// Leaves sample key values out of violation reports (`errors.redact_keys`).
@@ -605,8 +717,9 @@ impl Gateway {
     }
 
     pub(crate) async fn load(&self, path: &str, headers: &HeaderMap) -> Result<Loaded, ApiError> {
+        let headers = self.upstream_headers(headers).await?;
         let resp = self
-            .send(Method::GET, path, headers, Bytes::new())
+            .send(Method::GET, path, &headers, Bytes::new())
             .await
             .map_err(|e| {
                 ApiError::new(
@@ -721,7 +834,9 @@ impl Gateway {
                                 })?;
                                 indexes.insert(*id, index);
                             }
-                            if let Err(e) = pipeline::apply(&u.staged, &indexes, v.epoch) {
+                            if let Err(e) =
+                                pipeline::apply(&self.store, &u.staged, &indexes, v.epoch)
+                            {
                                 self.mark_transient(&u.prepared.identifier, &e.message);
                                 return Err(e);
                             }
@@ -866,6 +981,21 @@ impl Gateway {
         let mut doc = self.registry.snapshot();
         let constraints = doc.list();
         let (queue, members) = self.domain(&constraints, &identifier);
+
+        // A commit built on a stale base fails its requirements whatever happens in the queue:
+        // answer 409 without occupying it, so writers racing on one table do not starve the
+        // domain (the check is repeated authoritatively inside the queue). A request whose
+        // idempotency key the log knows goes to the queue to get its recorded answer.
+        let known = request_id
+            .as_deref()
+            .is_some_and(|r| self.log.knows_request(r));
+        if !known
+            && !request.requirements.is_empty()
+            && let Loaded::Table(meta, _) = self.load(&table.path(), &headers).await?
+        {
+            check_requirements(&meta, &request).map_err(rejection)?;
+        }
+
         let waiting = Instant::now();
         let _queue = queue.lock().await;
         self.metrics.queue_wait.observe(waiting.elapsed());
@@ -881,7 +1011,11 @@ impl Gateway {
         let mut bindings = BTreeMap::new();
         let mut names = report::ColumnNames::new();
         let mut target_meta = None;
-        for ident in members.iter().cloned() {
+        // The written table first: a stale commit fails its requirements before anything else
+        // is loaded, keeping the queue short while writers race.
+        let order = std::iter::once(identifier.clone())
+            .chain(members.iter().filter(|m| **m != identifier).cloned());
+        for ident in order {
             let path = if ident == identifier {
                 table.path()
             } else {
@@ -904,6 +1038,9 @@ impl Gateway {
                     ));
                 }
             };
+            if ident == identifier {
+                check_requirements(&meta, &request).map_err(rejection)?;
+            }
             let binding = registry::bind(&constraints, &ident, &meta)?;
             report::add_names(&mut names, &ident, &meta);
             self.check_chain_head(&mut doc, &ident, &meta)?;
@@ -923,7 +1060,6 @@ impl Gateway {
         let version = ConstraintSetVersion(doc.version(&identifier));
         let anchor = doc.anchors.get(&identifier).and_then(|a| a.snapshot);
 
-        check_requirements(&meta, &request).map_err(rejection)?;
         let constrained = validator.projection(&table_id).into_iter().collect();
         let change = match classify(&meta, &request, &constrained).map_err(rejection)? {
             Classification::PassThrough => {
@@ -1139,8 +1275,9 @@ impl Gateway {
             )
         })?);
 
+        // VALIDATED (with the staged deltas) and COMMITTING in one durable write (RFC 0004 records).
         self.log
-            .validated(
+            .validated_and_committing(
                 txn,
                 Validated {
                     base_snapshot,
@@ -1154,7 +1291,6 @@ impl Gateway {
             )
             .map_err(log_error)?;
         fault::hit(FaultPoint::AfterValidatedLog);
-        self.log.committing(txn).map_err(log_error)?;
         fault::hit(FaultPoint::BeforeUpstream);
 
         let captured = match self
@@ -1167,7 +1303,7 @@ impl Gateway {
         match captured {
             Some(c) if (200..300).contains(&c.status) => {
                 fault::hit(FaultPoint::AfterUpstreamBeforeLog);
-                if let Err(e) = pipeline::apply(&staged, &indexes, epoch) {
+                if let Err(e) = pipeline::apply(&self.store, &staged, &indexes, epoch) {
                     // The commit happened; recovery re-applies, and nothing else commits meanwhile.
                     self.mark_transient(&identifier, &e.message);
                     return Ok(c.response());
