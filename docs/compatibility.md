@@ -73,6 +73,7 @@ overrides or idempotency-key support.
 | PyIceberg | 0.12.0 | append, FK violation (INT-005), referenced parent delete via COW delete (INT-006), PK duplicate (INT-003), NOT NULL (INT-007), child-then-parent delete |
 | Spark (Iceberg Java REST client) | Spark 3.5.6, Iceberg 1.10.0 | same, with SQL `INSERT` / `DELETE` (copy-on-write) |
 | iceberg-rust | 0.10.1 | fast append, INT-005, INT-003, INT-007 |
+| Spark + `integrity` CLI (Appendix A demo, `compat/demo_test.py`) | as above | constraints registered via CLI, INT-005, INT-006, compaction (`rewrite_data_files`) certified, restart after kill -9, a write straight to the upstream catalog pinpointed by `verify`, INT-010 until `rebuild` |
 
 For every client each violation reaches the gateway exactly once (no retry storm), the statement
 fails with the integrity code in its message, and every snapshot on `main` carries a certificate.

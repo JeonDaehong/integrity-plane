@@ -3,18 +3,52 @@
 Commit-time PRIMARY KEY / UNIQUE / NOT NULL / FOREIGN KEY enforcement for Apache Iceberg tables,
 independent of the writing engine, with verifiable integrity certificates.
 
-> **Status: pre-alpha, under construction. Nothing is implemented yet.**
-> Do not use this for any data you care about. No feature is supported until it appears in the list below.
+> **Status: pre-alpha (0.0.0), not production-ready.** Do not use this for data you care about.
+> Only what is listed below is implemented, and only within the limits stated in the linked docs.
 
 ## Supported features
 
-None yet.
+All of these are covered by tests in this repository; none has been run in production.
+
+- **Proxy REST catalog.** Writers use the gateway (`integrity-server`) as their Iceberg REST catalog;
+  it forwards to an upstream REST catalog. Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg
+  0.12, iceberg-rust 0.10 ([`docs/compatibility.md`](docs/compatibility.md)).
+- **Constraints** on top-level columns: PRIMARY KEY, UNIQUE (NULLS DISTINCT / NOT DISTINCT),
+  NOT NULL, FOREIGN KEY (MATCH SIMPLE / FULL, ON DELETE RESTRICT), checked at commit time against
+  the committed data, before the commit reaches the upstream catalog.
+- **Commit shapes** from the capability matrix: append, copy-on-write overwrite and delete,
+  compaction (`replace` with unchanged keys), equality deletes on a key. Anything the Plane cannot
+  prove is refused (`UNSUPPORTED_COMMIT_OPERATION`), including multi-table commits and
+  merge-on-read position deletes.
+- **Certificates** chained through snapshot summaries, and `verify`, which recomputes them from the
+  data files and names the first snapshot written around the Plane or tampered with.
+- **Bypass detection** at commit time: a table whose `main` was moved without the Plane puts its
+  domain in a degraded state until an operator rebuilds it.
+- **Crash recovery** through a durable transaction log, idempotent retries (`Idempotency-Key`),
+  and per-domain commit queues ([`docs/recovery.md`](docs/recovery.md)).
+- **Integrity API and `integrity` CLI:** register constraints (with an onboarding scan of existing
+  data), list, drop, rebuild, verify, audit log, transaction and domain status; Prometheus metrics
+  at `/metrics`.
+
+Not yet: S3 storage is implemented but not exercised in CI (a local filesystem warehouse is), no
+benchmarks, no signed certificates, single-node only.
 
 ## Design
 
 - Specification: [`integrity_plane_design.md`](integrity_plane_design.md)
 - Architecture decisions: [`docs/adr/`](docs/adr/)
 - Semantic changes (RFCs): [`docs/rfc/`](docs/rfc/)
+
+## Trying it
+
+```sh
+cargo build --release -p integrity-server -p integrity-cli
+./target/release/integrity-server deploy/integrity.example.toml   # edit upstream and storage first
+./target/release/integrity constraints add --table db.customer --name pk_customer     --type primary_key --columns customer_id
+./target/release/integrity verify db.customer
+```
+
+`compat/demo_test.py` runs the full demo of the specification (Appendix A) with Spark in CI.
 
 ## Building
 

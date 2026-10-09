@@ -13,6 +13,9 @@ name = "integrity"
 path = "src/main.rs"
 
 [dependencies]
+# Same HTTP client as integrity-server; `blocking` keeps the CLI free of an async runtime API.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

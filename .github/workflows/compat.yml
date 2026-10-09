@@ -1,7 +1,8 @@
 name: Compatibility
 
-# Phase 7: real Iceberg clients (PyIceberg, Spark) against the gateway, with the Iceberg reference
-# REST catalog as upstream (compat/docker-compose.yml).
+# Phase 7: real Iceberg clients (PyIceberg, Spark, iceberg-rust) against the gateway, with the
+# Iceberg reference REST catalog as upstream (compat/docker-compose.yml).
+# Phase 10: the Appendix A demo (Spark + the integrity CLI), including a bypassing writer.
 
 on:
   push:
@@ -26,7 +27,7 @@ jobs:
             compat/iceberg-rust -> target
       - name: Build gateway and the iceberg-rust client
         run: |
-          cargo build --release --locked -p integrity-server
+          cargo build --release --locked -p integrity-server -p integrity-cli
           cargo build --release --locked --manifest-path compat/iceberg-rust/Cargo.toml
       - name: Start upstream catalog
         run: |
@@ -54,8 +55,11 @@ jobs:
         run: sudo -E env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/spark_test.py
       - name: iceberg-rust
         run: sudo ./compat/iceberg-rust/target/release/integrity-compat-iceberg-rust
+      - name: Appendix A demo
+        run: sudo -E env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/demo_test.py
       - name: Logs
         if: always()
         run: |
           echo "--- gateway"; cat gateway.log || true
+          echo "--- gateway (restarted by the demo)"; cat gateway-restarted.log || true
           echo "--- upstream"; docker compose -f compat/docker-compose.yml logs --tail 200 || true
