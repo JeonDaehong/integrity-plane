@@ -1015,7 +1015,9 @@ impl Gateway {
             columns,
             validator,
             indexes: indexes.clone(),
+            stats: Arc::new(pipeline::Stats::default()),
         };
+        let stats = Arc::clone(&job.stats);
         let validating = Instant::now();
         let outcome = tokio::task::spawn_blocking(move || pipeline::run(&job))
             .await
@@ -1026,8 +1028,14 @@ impl Gateway {
                     format!("validation task failed: {e}"),
                 )
             })
-            .and_then(|r| r)
-            .map_err(|e| abort(e, TxnState::Aborted))?;
+            .and_then(|r| r);
+        self.metrics
+            .bytes_read
+            .fetch_add(stats.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.metrics
+            .keys_validated
+            .fetch_add(stats.rows.load(Ordering::Relaxed), Ordering::Relaxed);
+        let outcome = outcome.map_err(|e| abort(e, TxnState::Aborted))?;
         let (plans, staged) = match outcome {
             Outcome::Rejected(violations) => {
                 return Err(abort(

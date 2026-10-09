@@ -64,7 +64,7 @@ jobs:
           echo "--- gateway (restarted by the demo)"; cat gateway-restarted.log || true
           echo "--- upstream"; docker compose -f compat/docker-compose.yml logs --tail 200 || true
 
-  # Spec §27 DoD 1: `docker compose up` (MinIO + upstream catalog + Plane built from the
+  # Spec §27 DoD 1: `docker compose up` (S3 storage + upstream catalog + Plane built from the
   # Dockerfile), then the Appendix A demo over S3.
   compose-s3:
     runs-on: ubuntu-latest

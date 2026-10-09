@@ -60,6 +60,17 @@ pub struct Job {
     pub validator: Validator,
     /// The domain's indexes.
     pub indexes: BTreeMap<ConstraintId, PersistentIndex>,
+    /// Where the job reports what it read.
+    pub stats: std::sync::Arc<Stats>,
+}
+
+/// What a validation read (metrics `integrity_bytes_read_total`, `integrity_keys_validated_total`).
+#[derive(Debug, Default)]
+pub struct Stats {
+    /// Bytes read from storage (manifest lists, manifests, data files).
+    pub bytes: std::sync::atomic::AtomicU64,
+    /// Rows whose keys were extracted (added, removed and equality-deleted).
+    pub rows: std::sync::atomic::AtomicU64,
 }
 
 fn api(e: impl std::fmt::Display, code: ErrorCode) -> ApiError {
@@ -69,6 +80,14 @@ fn api(e: impl std::fmt::Display, code: ErrorCode) -> ApiError {
 /// Runs the job.
 pub fn run(job: &Job) -> Result<Outcome, ApiError> {
     let io = Budgeted::new(job.io.as_ref(), job.budget);
+    let outcome = run_with(job, &io);
+    job.stats
+        .bytes
+        .fetch_add(io.used(), std::sync::atomic::Ordering::Relaxed);
+    outcome
+}
+
+fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Outcome, ApiError> {
     let overlays: BTreeMap<ConstraintId, Overlay<'_>> = job
         .indexes
         .iter()
@@ -97,16 +116,16 @@ pub fn run(job: &Job) -> Result<Outcome, ApiError> {
         } else {
             previous_list.clone()
         };
-        let changes = diff_snapshots(&io, parent_list.as_deref(), &step.manifest_list)
+        let changes = diff_snapshots(io, parent_list.as_deref(), &step.manifest_list)
             .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
-        let rows = commit_rows(
-            &io,
-            job.table.clone(),
-            step.snapshot,
-            &changes,
-            &job.columns,
-        )
-        .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+        let rows = commit_rows(io, job.table.clone(), step.snapshot, &changes, &job.columns)
+            .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+        let extracted = rows.added.len()
+            + rows.removed.len()
+            + rows.equality_deletes.as_ref().map_or(0, |d| d.len());
+        job.stats
+            .rows
+            .fetch_add(extracted as u64, std::sync::atomic::Ordering::Relaxed);
         check_operation(step.operation, &rows)
             .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
 

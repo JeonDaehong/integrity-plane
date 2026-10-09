@@ -7,7 +7,7 @@ points straight at the upstream catalog to play a writer that bypasses the Plane
 Step 8 restarts the gateway with kill -9 between commits; kills in the middle of a commit, at every
 fault point, are covered by crates/integrity-server/tests/crash.rs.
 
-With DEMO_S3=1 it runs against deploy/docker-compose.yml instead (MinIO): clients write through
+With DEMO_S3=1 it runs against deploy/docker-compose.yml instead (S3 storage): clients write through
 S3FileIO, and INTEGRITY_RESTART is the shell command that kill -9s and restarts the Plane.
 """
 

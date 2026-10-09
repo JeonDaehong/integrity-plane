@@ -49,6 +49,21 @@ async fn start_gateway(
 ) -> (String, Running) {
     let control = files.dir.0.join("control");
     std::fs::create_dir_all(&control).unwrap();
+    // After a restart the previous gateway's files can stay locked for a moment (Windows).
+    let mut opened = None;
+    for _ in 0..100 {
+        let attempt = (
+            PersistentStore::open(control.join(index_file)),
+            TxnLog::open(control.join(log_file)),
+            Registry::open(control.join("registry.redb"), &[]),
+        );
+        if let (Ok(store), Ok(log), Ok(registry)) = attempt {
+            opened = Some((store, log, registry));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (store, log, registry) = opened.expect("control-store files stay locked");
     let gateway = Gateway::new(
         &format!("http://{up}"),
         Duration::from_secs(30),
@@ -56,10 +71,10 @@ async fn start_gateway(
             Default::default(),
             tokio::runtime::Handle::current(),
         )),
-        PersistentStore::open(control.join(index_file)).unwrap(),
-        TxnLog::open(control.join(log_file)).unwrap(),
+        store,
+        log,
         1 << 30,
-        Registry::open(control.join("registry.redb"), &[]).unwrap(),
+        registry,
     )
     .unwrap()
     .with_admin_token(token.map(str::to_owned));
@@ -675,6 +690,17 @@ async fn transactions_domains_and_metrics() {
         text.contains("integrity_domain_queue_wait_seconds_count 2\n"),
         "{text}"
     );
+    assert!(
+        text.contains("integrity_keys_validated_total 2\n"),
+        "{text}"
+    );
+    let bytes: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("integrity_bytes_read_total "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(bytes > 0, "{text}");
 }
 
 async fn probe_verdicts(e: &Env) -> Vec<(u16, String)> {

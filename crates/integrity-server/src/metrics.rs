@@ -5,11 +5,18 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// A counter of durations: total and count, exported as a Prometheus summary without quantiles.
+/// Upper bounds (seconds) of the latency histogram buckets.
+pub const BUCKETS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// A latency histogram (cumulative buckets are computed when rendering).
 #[derive(Debug, Default)]
 pub struct Timer {
     micros: AtomicU64,
     count: AtomicU64,
+    /// Observations per bucket (non-cumulative); the last slot is `+Inf`.
+    buckets: [AtomicU64; BUCKETS.len() + 1],
 }
 
 impl Timer {
@@ -20,6 +27,12 @@ impl Timer {
             Ordering::Relaxed,
         );
         self.count.fetch_add(1, Ordering::Relaxed);
+        let secs = d.as_secs_f64();
+        let slot = BUCKETS
+            .iter()
+            .position(|&b| secs <= b)
+            .unwrap_or(BUCKETS.len());
+        self.buckets[slot].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -36,6 +49,10 @@ pub struct Metrics {
     pub validation: Timer,
     /// Time spent waiting for a domain's queue.
     pub queue_wait: Timer,
+    /// Bytes read from storage to validate commits.
+    pub bytes_read: AtomicU64,
+    /// Rows whose keys were extracted and validated.
+    pub keys_validated: AtomicU64,
     /// Transactions resolved by recovery as committed.
     pub recovered_committed: AtomicU64,
     /// Transactions resolved by recovery as aborted.
@@ -52,9 +69,16 @@ fn counter(out: &mut String, name: &str, help: &str, values: &[(&str, u64)]) {
     }
 }
 
-fn summary(out: &mut String, name: &str, help: &str, t: &Timer) {
+fn histogram(out: &mut String, name: &str, help: &str, t: &Timer) {
     let _ = writeln!(out, "# HELP {name} {help}");
-    let _ = writeln!(out, "# TYPE {name} summary");
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    let mut cumulative = 0;
+    for (i, bound) in BUCKETS.iter().enumerate() {
+        cumulative += t.buckets[i].load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+    }
+    cumulative += t.buckets[BUCKETS.len()].load(Ordering::Relaxed);
+    let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
     let micros = t.micros.load(Ordering::Relaxed);
     let _ = writeln!(out, "{name}_sum {}", micros as f64 / 1e6);
     let _ = writeln!(out, "{name}_count {}", t.count.load(Ordering::Relaxed));
@@ -75,17 +99,29 @@ impl Metrics {
                 ("{verdict=\"aborted\"}", get(&self.aborted)),
             ],
         );
-        summary(
+        histogram(
             &mut out,
             "integrity_validation_seconds",
             "Time spent reading files and validating commits.",
             &self.validation,
         );
-        summary(
+        histogram(
             &mut out,
             "integrity_domain_queue_wait_seconds",
             "Time commits waited for their domain's queue.",
             &self.queue_wait,
+        );
+        counter(
+            &mut out,
+            "integrity_bytes_read_total",
+            "Bytes read from storage (manifest lists, manifests, data files) to validate commits.",
+            &[("", get(&self.bytes_read))],
+        );
+        counter(
+            &mut out,
+            "integrity_keys_validated_total",
+            "Rows whose keys were extracted and validated.",
+            &[("", get(&self.keys_validated))],
         );
         counter(
             &mut out,
@@ -131,10 +167,17 @@ mod tests {
         let m = Metrics::default();
         m.accepted.fetch_add(2, Ordering::Relaxed);
         m.validation.observe(Duration::from_millis(1500));
+        m.validation.observe(Duration::from_micros(300));
+        m.validation.observe(Duration::from_secs(60));
         let text = m.render(3, 1, 0);
         assert!(text.contains("integrity_commits_total{verdict=\"accepted\"} 2\n"));
-        assert!(text.contains("integrity_validation_seconds_sum 1.5\n"));
-        assert!(text.contains("integrity_validation_seconds_count 1\n"));
+        assert!(text.contains("integrity_validation_seconds_sum 61.5003\n"));
+        assert!(text.contains("integrity_validation_seconds_count 3\n"));
+        assert!(text.contains("integrity_validation_seconds_bucket{le=\"0.0005\"} 1\n"));
+        assert!(text.contains("integrity_validation_seconds_bucket{le=\"1\"} 1\n"));
+        assert!(text.contains("integrity_validation_seconds_bucket{le=\"2.5\"} 2\n"));
+        assert!(text.contains("integrity_validation_seconds_bucket{le=\"10\"} 2\n"));
+        assert!(text.contains("integrity_validation_seconds_bucket{le=\"+Inf\"} 3\n"));
         assert!(text.contains("integrity_bypass_detected_total 0\n"));
         assert!(text.contains("integrity_domain_state{state=\"degraded\"} 1\n"));
         for line in text.lines().filter(|l| !l.starts_with('#')) {
