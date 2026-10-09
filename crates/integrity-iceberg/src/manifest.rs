@@ -99,14 +99,19 @@ fn err(m: impl Into<String>) -> ManifestError {
     ManifestError(m.into())
 }
 
+/// Decodes every record. A panic inside the Avro decoder on malformed input becomes an error: the
+/// file is client-written and must never take the process down (spec §28).
 fn records(bytes: &Bytes) -> Result<Vec<Vec<(String, Value)>>, ManifestError> {
-    let reader = apache_avro::Reader::new(&bytes[..]).map_err(|e| err(e.to_string()))?;
-    reader
-        .map(|v| match v.map_err(|e| err(e.to_string()))? {
-            Value::Record(fields) => Ok(fields),
-            other => Err(err(format!("expected a record, got {other:?}"))),
-        })
-        .collect()
+    std::panic::catch_unwind(|| {
+        let reader = apache_avro::Reader::new(&bytes[..]).map_err(|e| err(e.to_string()))?;
+        reader
+            .map(|v| match v.map_err(|e| err(e.to_string()))? {
+                Value::Record(fields) => Ok(fields),
+                other => Err(err(format!("expected a record, got {other:?}"))),
+            })
+            .collect()
+    })
+    .unwrap_or_else(|_| Err(err("malformed Avro file (decoder panicked)")))
 }
 
 /// A field by name, unwrapping `[null, T]` unions; `None` if absent or null.

@@ -20,9 +20,15 @@ pub struct ApiError {
 impl ApiError {
     /// An error with a message.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        let message = message.into();
+        // Errors from lower layers display as "<code>: detail"; the body adds the code itself.
+        let message = match message.strip_prefix(&format!("{code}: ")) {
+            Some(detail) => detail.to_owned(),
+            None => message,
+        };
         Self {
             code,
-            message: message.into(),
+            message,
             report: None,
         }
     }
@@ -109,6 +115,17 @@ mod tests {
         for code in ErrorCode::ALL {
             assert!(s(code) < 500, "{code}");
         }
+    }
+
+    #[test]
+    fn the_code_appears_once_in_the_message() {
+        let e = ApiError::new(
+            ErrorCode::StaleBaseSnapshot,
+            format!("{}: requirement failed", ErrorCode::StaleBaseSnapshot),
+        );
+        assert_eq!(e.message, "requirement failed");
+        let other = ApiError::new(ErrorCode::IndexDegraded, "INT-009 elsewhere");
+        assert_eq!(other.message, "INT-009 elsewhere");
     }
 
     #[test]

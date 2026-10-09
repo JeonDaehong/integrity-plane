@@ -576,3 +576,60 @@ async fn repeated_idempotency_keys_return_the_recorded_decision() {
     assert_eq!(again.status(), 400);
     assert_eq!(again.json::<Value>().await.unwrap(), body);
 }
+
+/// Spec §28: malformed REST payloads to a constrained table never panic the gateway or produce a
+/// 5xx; the gateway keeps serving afterwards. Mutations of a real commit request plus raw garbage.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_commit_payloads_get_4xx_and_the_gateway_survives() {
+    let h = harness(MemoryIo::new()).await;
+    let commits = main_commits();
+    let valid = serde_json::to_vec(&request(&commits[0], &commits[1])).unwrap();
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..300 {
+        let mut body = valid.clone();
+        match round % 3 {
+            0 => {
+                for _ in 0..1 + next() % 8 {
+                    let i = (next() as usize) % body.len();
+                    body[i] = (next() % 256) as u8;
+                }
+            }
+            1 => body.truncate((next() as usize) % body.len()),
+            _ => {
+                body = (0..next() % 64).map(|_| (next() % 256) as u8).collect();
+            }
+        }
+        let r = h
+            .client
+            .post(format!("{}{TABLE_PATH}", h.gateway))
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        assert!(
+            status < 500,
+            "round {round}: {status} for {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    // Some mutations are still valid commits and were accepted; the gateway must simply still be
+    // serving and healthy.
+    let status: Value = h
+        .client
+        .get(format!("{}/v1/integrity/status", h.gateway))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["degraded"], Value::Null, "{status}");
+    assert_eq!(status["unresolved_transactions"], 0);
+}

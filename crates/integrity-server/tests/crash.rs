@@ -319,6 +319,17 @@ columns = [2]
         Ok(r.status().as_u16())
     }
 
+    async fn rebuild(&self, constraint: u64) -> Result<u16, reqwest::Error> {
+        let r = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/integrity/indexes/{constraint}/rebuild",
+                self.url
+            ))
+            .send()
+            .await?;
+        Ok(r.status().as_u16())
+    }
+
     fn stop(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -473,7 +484,9 @@ async fn every_fault_point_recovers_to_the_upstream_state() {
             vec![1, 3],
         ),
     ];
-    let covered: BTreeSet<&str> = cases.iter().map(|(f, _, _)| f.name()).collect();
+    let mut covered: BTreeSet<&str> = cases.iter().map(|(f, _, _)| f.name()).collect();
+    // Exercised by `a_crash_between_index_swaps_of_a_rebuild_is_safe`.
+    covered.insert(FaultPoint::DuringRebuildSwap.name());
     assert_eq!(
         covered.len(),
         FaultPoint::ALL.len(),
@@ -488,4 +501,49 @@ async fn every_fault_point_recovers_to_the_upstream_state() {
             "{fault:?}/{answer:?}: the next commit succeeds"
         );
     }
+}
+
+/// Spec §19 step 5 under a crash: the gateway dies after replacing the first of two indexes. The
+/// replaced contents equal what the data implies and the registry is unchanged, so commits continue
+/// correctly and a second rebuild completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_between_index_swaps_of_a_rebuild_is_safe() {
+    let dir = Dir::new();
+    let shared: Shared = Arc::new(Mutex::new(Upstream {
+        meta: empty_table(),
+        answer: Answer::Normal,
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(upstream)
+        .with_state(Arc::clone(&shared));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut manifests = Vec::new();
+
+    let g = Gateway::start(&dir, addr, None).await;
+    let first = commit_request(&dir, 1, None, &mut manifests);
+    assert_eq!(g.commit(&first).await.unwrap(), 200);
+    g.stop();
+
+    let g = Gateway::start(&dir, addr, Some(FaultPoint::DuringRebuildSwap)).await;
+    let _ = g.rebuild(1).await; // the connection drops when the process aborts
+    g.expect_crash();
+
+    let g = Gateway::start(&dir, addr, None).await;
+    let second = commit_request(&dir, 2, Some(1), &mut manifests);
+    assert_eq!(g.commit(&second).await.unwrap(), 200);
+    assert_eq!(g.rebuild(1).await.unwrap(), 200);
+    let third = commit_request(&dir, 3, Some(2), &mut manifests);
+    assert_eq!(g.commit(&third).await.unwrap(), 200);
+    g.stop();
+
+    let history = main_history(&shared.lock().unwrap().meta);
+    assert_eq!(history, vec![1, 2, 3]);
+    let control = dir.0.join("control");
+    let expected = expected_keys(&history);
+    assert_eq!(index_keys(&control, 1, IndexKind::Unique), expected);
+    assert_eq!(index_keys(&control, 2, IndexKind::Unique), expected);
+    let log = TxnLog::open(control.join("txn.redb")).unwrap();
+    assert!(log.unresolved().unwrap().is_empty());
 }

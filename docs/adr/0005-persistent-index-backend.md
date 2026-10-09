@@ -77,3 +77,10 @@ public.
 
 See the table and the reasons above. Storing indexes in the transaction log itself was rejected:
 indexes are derived state with a different lifecycle (rebuild, swap).
+
+## Amendment (Phase 11): store identity
+
+The store file holds a 32-byte identity (`oip/index-store/v1`), created once when the file is
+created. The registry records the identity its anchors were built with; a gateway that opens a
+different one (the file was deleted and recreated, or swapped) marks every enforced table degraded
+until its domain is rebuilt. Without this, an empty recreated store would accept any duplicate.

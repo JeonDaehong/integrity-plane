@@ -26,6 +26,9 @@ use crate::{
 const META: TableDefinition<u64, &[u8]> = TableDefinition::new("oip/index-meta/v1");
 const META_VERSION: u8 = 1;
 const META_LEN: usize = 1 + 1 + 8 + 1 + 8 + 32;
+/// Identity of the store file, created once: lets the owner notice that the file was deleted and
+/// recreated (all indexes empty) instead of trusting it (ADR 0005).
+const STORE: TableDefinition<&str, &[u8]> = TableDefinition::new("oip/index-store/v1");
 
 /// Converts any redb error. Messages from redb describe files and pages, never key contents.
 fn storage(e: impl Into<redb::Error>) -> IndexError {
@@ -39,6 +42,7 @@ fn storage(e: impl Into<redb::Error>) -> IndexError {
 struct Shared {
     db: Database,
     poisoned: AtomicBool,
+    id: String,
 }
 
 impl Shared {
@@ -80,12 +84,20 @@ impl PersistentStore {
             }
         }));
         let db = opened.map_err(|_| IndexError::Corrupt)??;
+        let id = catch_unwind(AssertUnwindSafe(|| store_id(&db, path)))
+            .map_err(|_| IndexError::Corrupt)??;
         Ok(Self {
             shared: Arc::new(Shared {
                 db,
                 poisoned: AtomicBool::new(false),
+                id,
             }),
         })
+    }
+
+    /// The identity of this store file (hex), assigned when the file was created.
+    pub fn id(&self) -> &str {
+        &self.shared.id
     }
 
     /// The index of constraint `id`, created empty at epoch 0 if it does not exist yet.
@@ -100,6 +112,38 @@ impl PersistentStore {
         self.shared.guard(|db| index.create(db))?;
         Ok(index)
     }
+}
+
+/// Reads the store's identity, creating it on first open. Not secret, only distinct.
+fn store_id(db: &Database, path: &Path) -> Result<String> {
+    let mut txn = db.begin_write().map_err(storage)?;
+    txn.set_two_phase_commit(true);
+    let id = {
+        let mut table = txn.open_table(STORE).map_err(storage)?;
+        let existing = table
+            .get("id")
+            .map_err(storage)?
+            .map(|v| v.value().to_vec());
+        match existing {
+            Some(bytes) if bytes.len() == 32 => bytes,
+            Some(_) => return Err(IndexError::Corrupt),
+            None => {
+                let mut h = blake3::Hasher::new();
+                h.update(b"oip-index-store");
+                h.update(path.to_string_lossy().as_bytes());
+                h.update(&std::process::id().to_be_bytes());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                h.update(&now.to_be_bytes());
+                let fresh = h.finalize().as_bytes().to_vec();
+                table.insert("id", fresh.as_slice()).map_err(storage)?;
+                fresh
+            }
+        }
+    };
+    txn.commit().map_err(storage)?;
+    Ok(id.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The persistent index of one constraint.

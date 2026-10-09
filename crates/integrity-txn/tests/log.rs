@@ -264,3 +264,22 @@ fn a_tampered_log_refuses_to_open() {
     }
     assert_eq!(TxnLog::open(dir.log()).err(), Some(TxnError::Corrupt));
 }
+
+proptest::proptest! {
+    /// Spec §28: arbitrary bytes never panic the record decoder, and whatever decodes re-encodes
+    /// to the same bytes (one encoding per record).
+    #[test]
+    fn arbitrary_records_decode_canonically_or_fail(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..96)) {
+        if let Ok((state, txn, payload)) = decode_record(&bytes) {
+            proptest::prop_assert_eq!(encode_record(state, txn, &payload), bytes);
+        }
+    }
+
+    #[test]
+    fn mutated_records_are_rejected(i in proptest::prelude::any::<proptest::sample::Index>(), x in 1u8..=255) {
+        let mut record = encode_record(TxnState::Committing, TxnId(42), b"{\"k\":1}");
+        let i = i.index(record.len());
+        record[i] ^= x;
+        proptest::prop_assert!(decode_record(&record).is_err());
+    }
+}

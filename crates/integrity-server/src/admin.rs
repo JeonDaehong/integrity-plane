@@ -12,7 +12,7 @@ use integrity_core::EncodedKey;
 use integrity_iceberg::TableMetadata;
 use integrity_iceberg::metadata::FieldLookup;
 use integrity_index::{IndexEpoch, IndexKind, IndexValue, KeyIndex};
-use integrity_txn::TxnId;
+use integrity_txn::{FaultPoint, TxnId, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -170,7 +170,10 @@ impl Gateway {
             epoch = epoch.max(index.epoch().map_err(degraded)?.0);
             indexes.push((index, entries));
         }
-        for (index, entries) in indexes {
+        for (n, (index, entries)) in indexes.into_iter().enumerate() {
+            if n > 0 {
+                fault::hit(FaultPoint::DuringRebuildSwap);
+            }
             index
                 .replace_all(entries, IndexEpoch(epoch + 1))
                 .map_err(degraded)?;

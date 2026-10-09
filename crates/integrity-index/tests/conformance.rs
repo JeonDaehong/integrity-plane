@@ -336,3 +336,31 @@ fn staged_deltas_round_trip_and_reject_corruption() {
         }
     }
 }
+
+proptest! {
+    /// Spec §28: staged deltas read back from the transaction log are validated; arbitrary or
+    /// mutated bytes never panic, and what decodes re-encodes identically.
+    #[test]
+    fn staged_delta_decoding_never_panics(bytes in vec(any::<u8>(), 0..160)) {
+        if let Ok(d) = integrity_index::StagedDelta::decode(&bytes) {
+            prop_assert_eq!(d.encode(), bytes);
+        }
+    }
+
+    #[test]
+    fn mutated_staged_deltas_decode_canonically_or_fail(
+        i in any::<prop::sample::Index>(),
+        x in 1u8..=255,
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let index = make(Backend::Memory, IndexKind::Unique);
+        commit(&*index, &delta(1, &[(1, 1), (2, 1)])).unwrap();
+        let mut bytes = index.stage(&delta(2, &[(1, -1), (3, 1)])).unwrap().encode();
+        let at = i.index(bytes.len());
+        bytes[at] ^= x;
+        bytes.truncate(cut.index(bytes.len() + 1).max(1));
+        if let Ok(d) = integrity_index::StagedDelta::decode(&bytes) {
+            prop_assert_eq!(d.encode(), bytes);
+        }
+    }
+}

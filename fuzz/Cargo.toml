@@ -1,0 +1,66 @@
+# libFuzzer targets for spec §28 (run with `cargo +nightly fuzz run <target>`; CI: fuzz.yml).
+# Not part of the main workspace: cargo-fuzz needs nightly and sanitizer flags.
+[package]
+name = "integrity-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+serde_json = "1"
+integrity-core = { path = "../crates/integrity-core" }
+integrity-types = { path = "../crates/integrity-types" }
+integrity-index = { path = "../crates/integrity-index" }
+integrity-txn = { path = "../crates/integrity-txn" }
+integrity-iceberg = { path = "../crates/integrity-iceberg" }
+
+[[bin]]
+name = "key_decode"
+path = "fuzz_targets/key_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "txn_record"
+path = "fuzz_targets/txn_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "staged_delta"
+path = "fuzz_targets/staged_delta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parquet_keys"
+path = "fuzz_targets/parquet_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rest_payload"
+path = "fuzz_targets/rest_payload.rs"
+test = false
+doc = false
+bench = false

@@ -47,6 +47,10 @@ pub struct RegistryDoc {
     /// Tables whose domain is degraded until rebuilt, with the reason (spec §19).
     #[serde(default)]
     pub degraded: BTreeMap<String, String>,
+    /// Identity of the index store the anchors were built with: a different one means the index
+    /// file was lost and recreated empty.
+    #[serde(default)]
+    pub index_store: Option<String>,
     /// Next constraint id to assign.
     pub next_id: u64,
 }
@@ -332,6 +336,15 @@ impl Registry {
         w.commit().map_err(err)?;
         *seq += 1;
         Ok(())
+    }
+
+    /// The highest transaction id in the audit log, if any.
+    pub fn max_audited_txn(&self) -> Result<Option<u64>, StoreError> {
+        Ok(self
+            .audit_since(None, 0)?
+            .iter()
+            .filter_map(|e| e.txn)
+            .max())
     }
 
     /// Audit events from `since` (sequence number), optionally for one table.

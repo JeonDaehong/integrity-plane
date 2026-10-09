@@ -1,0 +1,56 @@
+name: Fuzz
+
+# Spec §28: libFuzzer targets in fuzz/ (key decoder, transaction log records, staged deltas,
+# manifests, Parquet key extraction, REST payloads). Each runs for a fixed time from seed corpora
+# built from the test fixtures; any crash fails the job and uploads the reproducer.
+# The same properties run on stable in `cargo test` (proptest) on every push.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed corpora
+        run: |
+          fx=crates/integrity-iceberg/tests/fixtures
+          mkdir -p fuzz/corpus/{manifest,parquet_keys,rest_payload,key_decode,txn_record,staged_delta}
+          cp $fx/table/warehouse/db/orders/metadata/*.avro fuzz/corpus/manifest/
+          cp $fx/*.parquet $fx/table/warehouse/db/orders/data/*.parquet fuzz/corpus/parquet_keys/
+          cp $fx/table/warehouse/db/orders/metadata/*.metadata.json fuzz/corpus/rest_payload/
+      - name: Run targets
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '60' }}
+        run: |
+          cd fuzz
+          for t in $(cargo fuzz list); do
+            echo "::group::$t"
+            cargo fuzz run "$t" "corpus/$t" -- -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

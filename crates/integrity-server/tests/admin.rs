@@ -29,6 +29,53 @@ struct Env {
     upstream: String,
     files: Arc<Files>,
     _shared: Shared,
+    up: SocketAddr,
+    token: Option<String>,
+    running: Option<Running>,
+}
+
+/// A gateway served in-process; stopping it releases its control-store files.
+struct Running {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_gateway(
+    files: &Files,
+    up: SocketAddr,
+    token: Option<&str>,
+    index_file: &str,
+    log_file: &str,
+) -> (String, Running) {
+    let control = files.dir.0.join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    let gateway = Gateway::new(
+        &format!("http://{up}"),
+        Duration::from_secs(30),
+        Arc::new(ObjectStoreIo::new(
+            Default::default(),
+            tokio::runtime::Handle::current(),
+        )),
+        PersistentStore::open(control.join(index_file)).unwrap(),
+        TxnLog::open(control.join(log_file)).unwrap(),
+        1 << 30,
+        Registry::open(control.join("registry.redb"), &[]).unwrap(),
+    )
+    .unwrap()
+    .with_admin_token(token.map(str::to_owned));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let app = router(Arc::new(gateway));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    (format!("http://{addr}"), Running { stop, task })
 }
 
 async fn serve(app: Router) -> SocketAddr {
@@ -61,33 +108,39 @@ async fn env(token: Option<&str>) -> Env {
             .with_state(Arc::clone(&shared)),
     )
     .await;
-    let control = files.dir.0.join("control");
-    std::fs::create_dir_all(&control).unwrap();
-    let gateway = Gateway::new(
-        &format!("http://{up}"),
-        Duration::from_secs(30),
-        Arc::new(ObjectStoreIo::new(
-            Default::default(),
-            tokio::runtime::Handle::current(),
-        )),
-        PersistentStore::open(control.join("indexes.redb")).unwrap(),
-        TxnLog::open(control.join("txn.redb")).unwrap(),
-        1 << 30,
-        Registry::open(control.join("registry.redb"), &[]).unwrap(),
-    )
-    .unwrap()
-    .with_admin_token(token.map(str::to_owned));
-    let gw = serve(router(Arc::new(gateway))).await;
+    let (gateway, running) = start_gateway(&files, up, token, "indexes.redb", "txn.redb").await;
     Env {
         http: reqwest::Client::new(),
-        gateway: format!("http://{gw}"),
+        gateway,
         upstream: format!("http://{up}"),
         files,
         _shared: shared,
+        up,
+        token: token.map(str::to_owned),
+        running: Some(running),
     }
 }
 
 impl Env {
+    /// Stops the gateway and starts another on the same registry, with the given index store and
+    /// transaction log files (a new name plays a file that was deleted and recreated).
+    async fn restart(&mut self, index_file: &str, log_file: &str) {
+        self.http = reqwest::Client::new(); // drop pooled connections to the old server
+        let old = self.running.take().unwrap();
+        let _ = old.stop.send(());
+        old.task.await.unwrap();
+        let (gateway, running) = start_gateway(
+            &self.files,
+            self.up,
+            self.token.as_deref(),
+            index_file,
+            log_file,
+        )
+        .await;
+        self.gateway = gateway;
+        self.running = Some(running);
+    }
+
     /// Appends `rows` to `table` through `base` (the gateway, or upstream for a bypass).
     async fn append(&self, base: &str, table: &str, rows: &[Row]) -> (u16, Value) {
         self.append_with(base, table, rows, |_| json!({"operation": "append"}))
@@ -622,4 +675,71 @@ async fn transactions_domains_and_metrics() {
         text.contains("integrity_domain_queue_wait_seconds_count 2\n"),
         "{text}"
     );
+}
+
+async fn probe_verdicts(e: &Env) -> Vec<(u16, String)> {
+    let probes: [(&str, &[Row]); 4] = [
+        ("customer", &[(1, None)]),
+        ("orders", &[(12, Some(9))]),
+        ("orders", &[(10, Some(1))]),
+        ("orders", &[(12, Some(2)), (12, Some(1))]),
+    ];
+    let mut out = Vec::new();
+    for (table, rows) in probes {
+        let (status, body) = e.through_plane(table, rows).await;
+        out.push((status, code(&body)));
+    }
+    out
+}
+
+/// Spec §27 DoD 6: delete the index store, rebuild, identical verdicts. A recreated (empty) index
+/// store must not be trusted: it would accept every duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_index_store_is_refused_until_rebuilt_with_identical_verdicts() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(
+        e.through_plane("customer", &[(1, None), (2, None)]).await.0,
+        200
+    );
+    assert_eq!(
+        e.through_plane("orders", &[(10, Some(1)), (11, Some(2))])
+            .await
+            .0,
+        200
+    );
+    let before = probe_verdicts(&e).await;
+    assert!(before.iter().all(|(s, _)| *s == 400), "{before:?}");
+
+    e.restart("indexes-recreated.redb", "txn.redb").await;
+    let (status, body) = e.through_plane("customer", &[(1, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-010"), "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("index store was replaced"),
+        "{body}"
+    );
+
+    let (status, body) = e.api("POST", "indexes/1/rebuild", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(probe_verdicts(&e).await, before);
+    assert_eq!(e.through_plane("customer", &[(3, None)]).await.0, 200);
+
+    // Restarting with the rebuilt store is fine.
+    e.restart("indexes-recreated.redb", "txn.redb").await;
+    assert_eq!(e.through_plane("customer", &[(4, None)]).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_transaction_log_is_refused_until_rebuilt() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    e.restart("indexes.redb", "txn-recreated.redb").await;
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-010"), "{body}");
+    assert_eq!(e.api("POST", "indexes/1/rebuild", None).await.0, 200);
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
 }

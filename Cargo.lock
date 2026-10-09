@@ -1196,6 +1196,7 @@ dependencies = [
  "integrity-core",
  "integrity-index",
  "integrity-types",
+ "proptest",
  "redb",
  "serde",
  "serde_json",

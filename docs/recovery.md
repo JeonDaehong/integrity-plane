@@ -75,5 +75,17 @@ that found violations. `POST /v1/integrity/indexes/{id}/rebuild`:
 
 A crash between steps 5's index replacements leaves indexes whose contents already match the pinned
 data (no commit runs during a rebuild) and the registry unchanged; running the rebuild again is safe.
-Onboarding (registering a constraint) runs the same scan.
+Onboarding (registering a constraint) runs the same scan. A kill between two index replacements
+(fault point `DuringRebuildSwap`) is covered by `tests/crash.rs`.
+
+## Lost control-store files
+
+| File lost (deleted and recreated empty) | Detected by | Effect |
+|---|---|---|
+| `indexes.redb` | store identity differs from the one the registry recorded | every enforced table degraded until its domain is rebuilt |
+| `txn.redb` | the audit log names transaction ids the new log never assigned | as above (unapplied commits may be missing from the indexes) |
+| `registry.redb` | not detectable from the other files | constraints from the configuration file are re-imported; tables with data must be onboarded again |
+
+"Delete index ⇒ rebuild ⇒ identical verdicts" (spec §27) is `a_lost_index_store_is_refused_until_rebuilt_with_identical_verdicts`
+in `tests/admin.rs`.
 - Not tested: power loss (a process kill keeps the OS page cache).

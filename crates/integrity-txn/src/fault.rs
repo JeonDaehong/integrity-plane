@@ -21,11 +21,13 @@ pub enum FaultPoint {
     DuringIndexApply,
     /// Indexes applied, `COMMITTED` not yet logged.
     BeforeCommittedLog,
+    /// Rebuild or onboarding: between replacing the contents of two indexes.
+    DuringRebuildSwap,
 }
 
 impl FaultPoint {
     /// Every point, in protocol order.
-    pub const ALL: [FaultPoint; 7] = [
+    pub const ALL: [FaultPoint; 8] = [
         FaultPoint::AfterPreparedLog,
         FaultPoint::AfterValidatedLog,
         FaultPoint::BeforeUpstream,
@@ -33,6 +35,7 @@ impl FaultPoint {
         FaultPoint::AfterUpstreamUnknown,
         FaultPoint::DuringIndexApply,
         FaultPoint::BeforeCommittedLog,
+        FaultPoint::DuringRebuildSwap,
     ];
 
     /// The `OIP_FAULT` value selecting this point.
@@ -45,6 +48,7 @@ impl FaultPoint {
             FaultPoint::AfterUpstreamUnknown => "AfterUpstreamUnknown",
             FaultPoint::DuringIndexApply => "DuringIndexApply",
             FaultPoint::BeforeCommittedLog => "BeforeCommittedLog",
+            FaultPoint::DuringRebuildSwap => "DuringRebuildSwap",
         }
     }
 }

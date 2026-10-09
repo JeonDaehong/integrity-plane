@@ -133,6 +133,13 @@ pub fn extract_rows(
     data: Bytes,
     columns: &[(FieldId, LogicalType)],
 ) -> Result<RowBatch, ExtractError> {
+    // The file is client-written: a panic in the decoder on malformed input is an error, never a
+    // crash (spec §28).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(data, columns)))
+        .unwrap_or_else(|_| Err(parquet_err("malformed Parquet file (decoder panicked)")))
+}
+
+fn extract(data: Bytes, columns: &[(FieldId, LogicalType)]) -> Result<RowBatch, ExtractError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(data).map_err(parquet_err)?;
     let locations = locate(builder.parquet_schema().root_schema())?;
 

@@ -23,6 +23,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 redb.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

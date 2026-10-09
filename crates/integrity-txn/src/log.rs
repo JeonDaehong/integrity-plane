@@ -395,6 +395,11 @@ impl TxnLog {
         self.index.lock().ok()?.txns.get(&txn.0)?.state
     }
 
+    /// The id the next transaction will get: every id below it was assigned by this log.
+    pub fn next_txn_id(&self) -> u64 {
+        self.index.lock().map_or(u64::MAX, |i| i.next_txn)
+    }
+
     /// Everything recorded about a transaction.
     pub fn summary(&self, txn: TxnId) -> Option<TxnSummary> {
         let index = self.index.lock().ok()?;

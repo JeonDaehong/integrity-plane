@@ -294,7 +294,7 @@ impl Gateway {
         budget: u64,
         registry: Registry,
     ) -> Result<Self, reqwest::Error> {
-        Ok(Self {
+        let gateway = Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
             upstream: upstream.trim_end_matches('/').to_owned(),
             io,
@@ -309,7 +309,56 @@ impl Gateway {
             transient: std::sync::Mutex::new(BTreeMap::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
             metrics: Metrics::default(),
-        })
+        };
+        gateway.check_control_store();
+        Ok(gateway)
+    }
+
+    /// Fails closed when a control-store file was lost and recreated (ADR 0011): an empty index
+    /// store would accept duplicates, and a fresh transaction log would forget commits whose
+    /// index changes were never applied. Every enforced table is degraded until rebuilt.
+    fn check_control_store(&self) {
+        let doc = self.registry.snapshot();
+        let mut reasons = Vec::new();
+        match &doc.index_store {
+            Some(id) if id != self.store.id() => reasons.push(
+                "the index store was replaced since the indexes were built; rebuild every domain",
+            ),
+            _ => {}
+        }
+        match self.registry.max_audited_txn() {
+            Ok(Some(t)) if t >= self.log.next_txn_id() => reasons.push(
+                "the transaction log is missing transactions recorded in the audit log; rebuild every domain",
+            ),
+            Ok(_) => {}
+            Err(_) => reasons.push("the audit log cannot be read"),
+        }
+        let store_id = self.store.id().to_owned();
+        let updated = self.registry.update(|d| {
+            d.index_store = Some(store_id.clone());
+            if let Some(reason) = reasons.first() {
+                let tables: Vec<String> = d.anchors.keys().cloned().collect();
+                for t in tables {
+                    d.degraded.insert(t, (*reason).to_owned());
+                }
+            }
+            Ok::<_, StoreError>(())
+        });
+        if let Some(reason) = reasons.first() {
+            tracing::error!("{reason}");
+            let mut event = AuditEvent::new("DOMAIN_DEGRADED", None);
+            event.detail = Some((*reason).to_owned());
+            self.audit(event);
+        }
+        if updated.is_err() {
+            // Cannot record it: refuse everything in this process instead.
+            let doc = self.registry.snapshot();
+            if let Ok(mut t) = self.transient.lock() {
+                for table in doc.anchors.keys() {
+                    t.insert(table.clone(), "registry unwritable at start".into());
+                }
+            }
+        }
     }
 
     /// Sets the upstream catalog prefix used by the integrity API.
