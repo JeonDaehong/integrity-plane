@@ -1098,10 +1098,17 @@ dependencies = [
 name = "integrity-bench"
 version = "0.0.0"
 dependencies = [
- "integrity-core",
+ "apache-avro",
+ "arrow-array",
+ "arrow-schema",
+ "axum",
  "integrity-index",
- "integrity-types",
- "integrity-validator",
+ "integrity-server",
+ "integrity-txn",
+ "parquet",
+ "reqwest",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

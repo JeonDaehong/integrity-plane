@@ -8,11 +8,23 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "integrity-bench"
+path = "src/main.rs"
+
+# All already in the dependency tree through integrity-server and its tests.
 [dependencies]
-integrity-types.workspace = true
-integrity-core.workspace = true
 integrity-index.workspace = true
-integrity-validator.workspace = true
+integrity-txn.workspace = true
+integrity-server = { path = "../integrity-server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde_json.workspace = true
+apache-avro.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
 
 [lints]
 workspace = true

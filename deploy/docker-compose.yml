@@ -4,17 +4,19 @@
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
 # Writers use http://127.0.0.1:8181 as their REST catalog and http://127.0.0.1:9000 as the S3
-# endpoint (path-style, region us-east-1; any credentials). The upstream catalog is published on
+# endpoint (path-style, region us-east-1, credentials admin/password). The upstream catalog is published on
 # 8182 only so the demo can play a writer that bypasses the Plane; in a real deployment writers
 # must not be able to reach it (docs/threat-model.md).
 #
 # Object storage is SeaweedFS's S3 gateway: MinIO's container images are no longer published (the
-# Docker Hub repository is gone). Authentication is off: this stack is for local use only.
+# Docker Hub repository is gone). The credentials are demo values: this stack is for local use only.
 
 services:
   s3:
     image: chrislusf/seaweedfs:4.47
-    command: server -s3 -s3.port=8333 -dir=/data
+    command: server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json -dir=/data
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
     ports: ["9000:8333"]
 
   bucket:
