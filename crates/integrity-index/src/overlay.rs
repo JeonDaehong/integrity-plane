@@ -45,6 +45,19 @@ impl<'a> Overlay<'a> {
     }
 }
 
+impl Overlay<'_> {
+    /// All pending writes as one delta staged against the base's current epoch: applying it to
+    /// the base reproduces every step applied to the overlay.
+    pub fn into_staged(self) -> Result<StagedDelta> {
+        let base_epoch = self.base.epoch()?;
+        let writes = self
+            .writes
+            .into_inner()
+            .map_err(|_| IndexError::Unavailable)?;
+        Ok(StagedDelta { base_epoch, writes })
+    }
+}
+
 impl std::fmt::Debug for dyn KeyIndex + '_ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "KeyIndex({:?})", self.kind())

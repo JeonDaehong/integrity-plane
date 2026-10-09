@@ -49,3 +49,29 @@ fn overlay_reads_through_and_never_writes_the_base() {
         assert_eq!(overlay.epoch().unwrap(), IndexEpoch(1), "{b:?}");
     }
 }
+
+#[test]
+fn overlay_writes_become_one_replayable_staged_delta() {
+    for b in BACKENDS {
+        let base = make(b, IndexKind::Unique);
+        commit(&*base, &delta(1, &[(1, 1)])).unwrap();
+        let expected = {
+            let overlay = Overlay::new(&*base);
+            for (snapshot, changes) in [(2, vec![(1, -1), (2, 1)]), (3, vec![(3, 1)])] {
+                let staged = overlay.stage(&delta(snapshot, &changes)).unwrap();
+                overlay.apply(staged, IndexEpoch(0)).unwrap();
+            }
+            let entries = overlay.entries().unwrap();
+            let staged = overlay.into_staged().unwrap();
+            base.apply(staged.clone(), IndexEpoch(2)).unwrap();
+            base.apply(staged, IndexEpoch(2)).unwrap(); // replay is a no-op
+            entries
+        };
+        assert_eq!(base.entries().unwrap(), expected, "{b:?}");
+        assert_eq!(
+            base.get_many(&[k(2), k(3)]).unwrap(),
+            vec![unique(2), unique(3)],
+            "{b:?}"
+        );
+    }
+}

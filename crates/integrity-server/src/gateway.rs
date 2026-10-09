@@ -1,9 +1,8 @@
-//! The REST gateway (spec §14, §22, ADR 0010, RFC 0003).
+//! The REST gateway (spec §14, §16, §22, ADR 0010, RFC 0003, RFC 0004).
 //!
-//! Commits to tables with constraints go through the integrity pipeline under one lock; every other
-//! request is forwarded to the upstream catalog unchanged. Phase 7 keeps one global commit queue and
-//! in-memory recovery state; the durable transaction log (Phase 8) and per-domain queues (Phase 9)
-//! replace them.
+//! Commits to tables with constraints go through the integrity pipeline under one lock, with every
+//! step recorded in the transaction log so that a crash at any point is recoverable; every other
+//! request is forwarded to the upstream catalog unchanged. Per-domain queues arrive in Phase 9.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,7 +18,10 @@ use integrity_iceberg::{
     Classification, CommitRequest, FileIo, Rejection, TableMetadata, check_requirements, classify,
     inject_certificate, snapshot_certificate,
 };
-use integrity_index::{KeyIndex, PersistentIndex, PersistentStore};
+use integrity_index::{IndexKind, KeyIndex, PersistentIndex, PersistentStore};
+use integrity_txn::{
+    Decision as TxnDecision, FaultPoint, Prepared, TxnLog, TxnState, Validated, fault,
+};
 use integrity_types::{ConstraintId, ConstraintSetVersion, ErrorCode, SnapshotId};
 use integrity_validator::Validator;
 use serde_json::Value;
@@ -27,7 +29,7 @@ use tokio::sync::Mutex;
 
 use crate::config::ConstraintConfig;
 use crate::error::ApiError;
-use crate::pipeline::{self, Job, Outcome, StepPlan};
+use crate::pipeline::{self, Job, Outcome};
 use crate::registry::{self, Binding};
 
 /// Constraint set version until versioned registration exists (Phase 10).
@@ -167,22 +169,77 @@ fn forwardable(name: &HeaderName) -> bool {
     !HOP_BY_HOP.contains(&name.as_str())
 }
 
-/// A commit whose upstream outcome is unknown.
-#[derive(Debug)]
-struct Pending {
-    load_path: String,
-    headers: HeaderMap,
-    final_snapshot: SnapshotId,
-    plans: Vec<StepPlan>,
-    indexes: BTreeMap<ConstraintId, PersistentIndex>,
+/// An upstream response, read completely so it can be both returned and recorded.
+#[derive(Debug, Clone)]
+struct Captured {
+    status: u16,
+    headers: Vec<(HeaderName, axum::http::HeaderValue)>,
+    body: Bytes,
+}
+
+impl Captured {
+    async fn read(resp: reqwest::Response) -> Result<Self, reqwest::Error> {
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .filter(|(n, _)| forwardable(n))
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        let body = resp.bytes().await?;
+        Ok(Self {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    fn response(&self) -> Response {
+        let mut out = Response::builder().status(self.status);
+        for (name, value) in &self.headers {
+            out = out.header(name, value);
+        }
+        out.body(Body::from(self.body.clone()))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+    }
+
+    fn decision(&self) -> TxnDecision {
+        TxnDecision {
+            status: self.status,
+            body: serde_json::from_slice(&self.body).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(&self.body).into_owned())
+            }),
+        }
+    }
+}
+
+fn error_decision(e: &ApiError) -> TxnDecision {
+    TxnDecision {
+        status: e.status().as_u16(),
+        body: serde_json::json!({
+            "error": {
+                "message": format!("{} {}: {}", e.code.code(), e.code.name(), e.message),
+                "type": e.error_type(),
+                "code": e.status().as_u16(),
+                "stack": [],
+            }
+        }),
+    }
+}
+
+fn replay(d: &TxnDecision) -> Response {
+    let status = StatusCode::from_u16(d.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    (status, axum::Json(d.body.clone())).into_response()
+}
+
+fn log_error(e: integrity_txn::TxnError) -> ApiError {
+    ApiError::new(ErrorCode::IndexDegraded, format!("transaction log: {e}"))
 }
 
 #[derive(Debug, Default)]
 struct State {
     bindings: BTreeMap<String, Binding>,
     degraded: Option<String>,
-    pending: Option<Pending>,
-    epoch: Option<u64>,
 }
 
 /// The gateway.
@@ -191,6 +248,7 @@ pub struct Gateway {
     upstream: String,
     io: Arc<dyn FileIo + Send + Sync>,
     store: PersistentStore,
+    log: TxnLog,
     budget: u64,
     constraints: Vec<ConstraintConfig>,
     state: Mutex<State>,
@@ -199,7 +257,7 @@ pub struct Gateway {
 }
 
 enum Loaded {
-    Table(Box<TableMetadata>),
+    Table(Box<TableMetadata>, Value),
     Missing,
 }
 
@@ -210,6 +268,7 @@ impl Gateway {
         timeout: std::time::Duration,
         io: Arc<dyn FileIo + Send + Sync>,
         store: PersistentStore,
+        log: TxnLog,
         budget: u64,
         constraints: Vec<ConstraintConfig>,
     ) -> Result<Self, reqwest::Error> {
@@ -218,6 +277,7 @@ impl Gateway {
             upstream: upstream.trim_end_matches('/').to_owned(),
             io,
             store,
+            log,
             budget,
             constraints,
             state: Mutex::new(State::default()),
@@ -258,6 +318,15 @@ impl Gateway {
         }
     }
 
+    /// Resolves transactions left unfinished by a previous process (spec §16). Leaves them for
+    /// later if upstream cannot be reached.
+    pub async fn recover_on_start(&self) -> Result<(), String> {
+        let mut st = self.state.lock().await;
+        self.recover(&mut st, &HeaderMap::new())
+            .await
+            .map_err(|e| e.message)
+    }
+
     /// Integrity status for operators.
     pub async fn status(&self) -> Value {
         let commit_requests = self
@@ -269,7 +338,7 @@ impl Gateway {
         serde_json::json!({
             "commit_requests": commit_requests,
             "degraded": st.degraded,
-            "recovery_pending": st.pending.is_some(),
+            "unresolved_transactions": self.log.unresolved().map(|u| u.len()).ok(),
             "bound_tables": st.bindings.iter().map(|(k, b)| (k.clone(), b.table.to_string())).collect::<BTreeMap<_, _>>(),
         })
     }
@@ -293,22 +362,6 @@ impl Gateway {
         req.send().await
     }
 
-    async fn into_response(resp: reqwest::Response) -> Response {
-        let status = resp.status();
-        let mut out = Response::builder().status(status.as_u16());
-        for (name, value) in resp.headers() {
-            if forwardable(name) {
-                out = out.header(name, value);
-            }
-        }
-        match resp.bytes().await {
-            Ok(body) => out
-                .body(Body::from(body))
-                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()),
-            Err(_) => StatusCode::BAD_GATEWAY.into_response(),
-        }
-    }
-
     async fn proxy(
         &self,
         method: Method,
@@ -317,7 +370,10 @@ impl Gateway {
         body: Bytes,
     ) -> Response {
         match self.send(method, path_and_query, headers, body).await {
-            Ok(resp) => Self::into_response(resp).await,
+            Ok(resp) => match Captured::read(resp).await {
+                Ok(c) => c.response(),
+                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+            },
             Err(e) => (
                 StatusCode::BAD_GATEWAY,
                 format!("upstream unreachable: {e}"),
@@ -326,8 +382,8 @@ impl Gateway {
         }
     }
 
-    /// `GET /v1/config`: forwarded, minus anything that would send clients around the Plane or
-    /// promise idempotency support the Plane does not have yet (RFC 0003).
+    /// `GET /v1/config`: forwarded, minus anything that would send clients around the Plane, and
+    /// advertising idempotency keys, which the transaction log honours (RFC 0003, RFC 0004).
     async fn config(&self, path_and_query: &str, headers: HeaderMap) -> Response {
         let resp = match self
             .send(Method::GET, path_and_query, &headers, Bytes::new())
@@ -343,7 +399,10 @@ impl Gateway {
             }
         };
         if !resp.status().is_success() {
-            return Self::into_response(resp).await;
+            return match Captured::read(resp).await {
+                Ok(c) => c.response(),
+                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+            };
         }
         let Ok(mut config) = resp.json::<Value>().await else {
             return StatusCode::BAD_GATEWAY.into_response();
@@ -355,7 +414,10 @@ impl Gateway {
             }
         }
         if let Some(map) = config.as_object_mut() {
-            map.remove("idempotency-key-lifetime");
+            map.insert(
+                "idempotency-key-lifetime".into(),
+                Value::String("PT30M".into()),
+            );
         }
         axum::Json(config).into_response()
     }
@@ -392,15 +454,24 @@ impl Gateway {
                     format!("unreadable table metadata: {e}"),
                 )
             })?;
-        Ok(Loaded::Table(Box::new(meta)))
+        Ok(Loaded::Table(Box::new(meta), body))
+    }
+
+    fn index_kind(&self, id: ConstraintId) -> Option<IndexKind> {
+        let c = self.constraints.iter().find(|c| c.id == id.0)?;
+        match c.kind.as_str() {
+            "primary_key" | "unique" => Some(IndexKind::Unique),
+            "foreign_key" => Some(IndexKind::Reference),
+            _ => None,
+        }
     }
 
     fn indexes(
         &self,
-        validator_resolved: &[integrity_validator::ResolvedConstraint],
+        resolved: &[integrity_validator::ResolvedConstraint],
     ) -> Result<BTreeMap<ConstraintId, PersistentIndex>, ApiError> {
         let mut out = BTreeMap::new();
-        for rc in validator_resolved {
+        for rc in resolved {
             if let Some(kind) = rc.index_kind() {
                 let index = self
                     .store
@@ -412,25 +483,68 @@ impl Gateway {
         Ok(out)
     }
 
-    /// Settles a commit whose upstream outcome was unknown: applied if its last snapshot exists.
-    async fn reconcile(&self, st: &mut State) -> Result<(), ApiError> {
-        let Some(pending) = st.pending.take() else {
-            return Ok(());
+    /// Resolves every unfinished transaction (spec §16, RFC 0004). `Validated` was never forwarded
+    /// and aborts without asking upstream; `Committing` is decided by whether its final snapshot is
+    /// in the table. Fails with `RECOVERY_REQUIRED` while upstream cannot answer.
+    async fn recover(&self, st: &mut State, headers: &HeaderMap) -> Result<(), ApiError> {
+        let interrupted = |what: &str| {
+            error_decision(&ApiError::new(
+                ErrorCode::RecoveryRequired,
+                format!("the commit was interrupted {what} and not applied; retry"),
+            ))
         };
-        let loaded = match self.load(&pending.load_path, &pending.headers).await {
-            Ok(l) => l,
-            Err(e) => {
-                st.pending = Some(pending);
-                return Err(ApiError::new(ErrorCode::RecoveryRequired, e.message));
-            }
-        };
-        let committed =
-            matches!(&loaded, Loaded::Table(m) if m.snapshot(pending.final_snapshot).is_some());
-        if committed {
-            let epoch = st.epoch.unwrap_or(0);
-            match pipeline::apply(&pending.plans, &pending.indexes, epoch) {
-                Ok(e) => st.epoch = Some(e),
-                Err(e) => st.degraded = Some(e.message),
+        for u in self.log.unresolved().map_err(log_error)? {
+            match u.state {
+                TxnState::Prepared => self
+                    .log
+                    .finish(u.txn, TxnState::Aborted, interrupted("during validation"))
+                    .map_err(log_error)?,
+                TxnState::Validated => self
+                    .log
+                    .finish(u.txn, TxnState::Aborted, interrupted("before publication"))
+                    .map_err(log_error)?,
+                TxnState::Committing => {
+                    let v = u
+                        .validated
+                        .clone()
+                        .ok_or_else(|| log_error(integrity_txn::TxnError::Corrupt))?;
+                    let loaded = self.load(&u.prepared.load_path, headers).await?;
+                    match loaded {
+                        Loaded::Table(meta, body)
+                            if meta.snapshot(SnapshotId(v.final_snapshot)).is_some() =>
+                        {
+                            let mut indexes = BTreeMap::new();
+                            for (id, _) in &u.staged {
+                                let kind = self.index_kind(*id).ok_or_else(|| {
+                                    ApiError::new(
+                                        ErrorCode::IndexDegraded,
+                                        format!("no configured index for {id}"),
+                                    )
+                                })?;
+                                let index = self.store.index(*id, kind).map_err(|e| {
+                                    ApiError::new(ErrorCode::IndexDegraded, e.to_string())
+                                })?;
+                                indexes.insert(*id, index);
+                            }
+                            if let Err(e) = pipeline::apply(&u.staged, &indexes, v.epoch) {
+                                st.degraded = Some(e.message.clone());
+                                return Err(e);
+                            }
+                            self.log
+                                .finish(
+                                    u.txn,
+                                    TxnState::Committed,
+                                    TxnDecision { status: 200, body },
+                                )
+                                .map_err(log_error)?;
+                        }
+                        Loaded::Table(..) | Loaded::Missing => self
+                            .log
+                            .finish(u.txn, TxnState::Aborted, interrupted("upstream"))
+                            .map_err(log_error)?,
+                    }
+                }
+                TxnState::Committed | TxnState::Aborted | TxnState::Rejected => {}
             }
         }
         Ok(())
@@ -459,6 +573,10 @@ impl Gateway {
         headers: HeaderMap,
         body: Bytes,
     ) -> Result<Response, ApiError> {
+        let request_id = headers
+            .get("idempotency-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let json: Value = serde_json::from_slice(&body).map_err(|e| {
             ApiError::new(
                 ErrorCode::UnsupportedCommitOperation,
@@ -469,10 +587,13 @@ impl Gateway {
             .map_err(|e| ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()))?;
 
         let mut st = self.state.lock().await;
+        self.recover(&mut st, &headers).await?;
+        if let Some(d) = request_id.as_deref().and_then(|r| self.log.decision_for(r)) {
+            return Ok(replay(&d));
+        }
         if let Some(reason) = &st.degraded {
             return Err(ApiError::new(ErrorCode::IndexDegraded, reason.clone()));
         }
-        self.reconcile(&mut st).await?;
 
         // Bind every table of the integrity domain.
         let identifier = table.identifier();
@@ -486,7 +607,7 @@ impl Gateway {
                 })?
             };
             let meta = match self.load(&path, &headers).await? {
-                Loaded::Table(m) => *m,
+                Loaded::Table(m, _) => *m,
                 Loaded::Missing if ident == identifier => {
                     return Err(ApiError::new(
                         ErrorCode::UnsupportedCommitOperation,
@@ -543,15 +664,6 @@ impl Gateway {
 
         let resolved = registry::resolve(&self.constraints, &st.bindings)?;
         let indexes = self.indexes(&resolved)?;
-        if st.epoch.is_none() {
-            let max = indexes
-                .values()
-                .filter_map(|i| i.epoch().ok())
-                .map(|e| e.0)
-                .max()
-                .unwrap_or(0);
-            st.epoch = Some(max);
-        }
         let validator = Validator::new(resolved);
         let table_id = st.bindings[&identifier].table.clone();
         let binding_columns = st.bindings[&identifier].columns.clone();
@@ -567,6 +679,23 @@ impl Gateway {
             Classification::MainChange(change) => change,
         };
 
+        let txn = self
+            .log
+            .begin(Prepared {
+                request_id,
+                table: table_id.to_string(),
+                identifier: identifier.clone(),
+                load_path: table.path(),
+            })
+            .map_err(log_error)?;
+        fault::hit(FaultPoint::AfterPreparedLog);
+        let abort = |e: ApiError, state: TxnState| -> ApiError {
+            if self.log.finish(txn, state, error_decision(&e)).is_err() {
+                return ApiError::new(ErrorCode::IndexDegraded, "transaction log write failed");
+            }
+            e
+        };
+
         let columns = validator
             .projection(&table_id)
             .into_iter()
@@ -579,13 +708,22 @@ impl Gateway {
                         ApiError::new(ErrorCode::IndexDegraded, format!("no type for {f}"))
                     })
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let set_digest = constraint_set_digest(VERSION, &validator.governing(&table_id))
-            .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| abort(e, TxnState::Aborted))?;
+        let set_digest =
+            constraint_set_digest(VERSION, &validator.governing(&table_id)).map_err(|e| {
+                abort(
+                    ApiError::new(ErrorCode::IndexDegraded, e.to_string()),
+                    TxnState::Aborted,
+                )
+            })?;
         let uuid = parse_table_uuid(&meta.table_uuid).map_err(|_| {
-            ApiError::new(
-                ErrorCode::UnsupportedCommitOperation,
-                "table uuid is not a UUID",
+            abort(
+                ApiError::new(
+                    ErrorCode::UnsupportedCommitOperation,
+                    "table uuid is not a UUID",
+                ),
+                TxnState::Aborted,
             )
         })?;
         let mut previous = match change.parent {
@@ -595,13 +733,22 @@ impl Gateway {
                 // Chain root until onboarding records exist (Phase 10).
                 Ok(None) => Digest::ZERO,
                 Err(_) => {
-                    return Err(ApiError::new(
-                        ErrorCode::BypassDetected,
-                        "parent snapshot has a malformed certificate",
+                    return Err(abort(
+                        ApiError::new(
+                            ErrorCode::BypassDetected,
+                            "parent snapshot has a malformed certificate",
+                        ),
+                        TxnState::Aborted,
                     ));
                 }
             },
         };
+        let epoch = 1 + indexes
+            .values()
+            .filter_map(|i| i.epoch().ok())
+            .map(|e| e.0)
+            .max()
+            .unwrap_or(0);
 
         let job = Job {
             io: Arc::clone(&self.io),
@@ -620,19 +767,27 @@ impl Gateway {
                     ErrorCode::IndexDegraded,
                     format!("validation task failed: {e}"),
                 )
-            })??;
-        let plans = match outcome {
+            })
+            .and_then(|r| r)
+            .map_err(|e| abort(e, TxnState::Aborted))?;
+        let (plans, staged) = match outcome {
             Outcome::Rejected(violations) => {
-                return Err(violation_error(&violations, &self.constraints));
+                return Err(abort(
+                    violation_error(&violations, &self.constraints),
+                    TxnState::Rejected,
+                ));
             }
-            Outcome::Accepted(plans) => plans,
+            Outcome::Accepted { plans, staged } => (plans, staged),
         };
 
+        let mut certificates = Vec::new();
         for plan in &plans {
-            let key_delta = plan
-                .validated
-                .key_delta_digest()
-                .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
+            let key_delta = plan.validated.key_delta_digest().map_err(|e| {
+                abort(
+                    ApiError::new(ErrorCode::IndexDegraded, e.to_string()),
+                    TxnState::Aborted,
+                )
+            })?;
             let cert = certificate(&CertificateInput {
                 table_uuid: uuid,
                 snapshot: plan.step.snapshot,
@@ -641,49 +796,86 @@ impl Gateway {
                 key_delta,
                 previous,
             });
-            inject_certificate(&mut request, &plan.step, cert, VERSION)
-                .map_err(|e| ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()))?;
+            inject_certificate(&mut request, &plan.step, cert, VERSION).map_err(|e| {
+                abort(
+                    ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()),
+                    TxnState::Aborted,
+                )
+            })?;
+            certificates.push(cert.to_hex());
             previous = cert;
         }
-        let final_snapshot = plans
-            .last()
-            .map(|p| p.step.snapshot)
-            .ok_or_else(|| ApiError::new(ErrorCode::IndexDegraded, "empty main change"))?;
-        let forwarded = Bytes::from(
-            serde_json::to_vec(request.json())
-                .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?,
-        );
+        let snapshots: Vec<i64> = plans.iter().map(|p| p.step.snapshot.0).collect();
+        let final_snapshot = *snapshots.last().ok_or_else(|| {
+            abort(
+                ApiError::new(ErrorCode::IndexDegraded, "empty main change"),
+                TxnState::Aborted,
+            )
+        })?;
+        let forwarded = Bytes::from(serde_json::to_vec(request.json()).map_err(|e| {
+            abort(
+                ApiError::new(ErrorCode::IndexDegraded, e.to_string()),
+                TxnState::Aborted,
+            )
+        })?);
 
-        let sent = self
-            .send(Method::POST, path_and_query, &headers, forwarded)
-            .await;
-        match sent {
-            Ok(resp) if resp.status().is_success() => {
-                match pipeline::apply(&plans, &indexes, st.epoch.unwrap_or(0)) {
-                    Ok(e) => st.epoch = Some(e),
-                    // The commit happened: report it, but refuse further commits until rebuilt.
-                    Err(e) => st.degraded = Some(e.message),
-                }
-                Ok(Self::into_response(resp).await)
-            }
-            Ok(resp) if resp.status().is_client_error() => Ok(Self::into_response(resp).await),
-            unknown => {
-                st.pending = Some(Pending {
-                    load_path: table.path(),
-                    headers: headers.clone(),
+        self.log
+            .validated(
+                txn,
+                Validated {
+                    base_snapshot: change.parent.map(|s| s.0),
+                    snapshots,
                     final_snapshot,
-                    plans,
-                    indexes,
-                });
-                let _ = self.reconcile(&mut st).await;
-                match unknown {
-                    Ok(resp) => Ok(Self::into_response(resp).await),
-                    // No answer at all: the outcome is genuinely unknown to the client too.
-                    Err(e) => Ok((
-                        StatusCode::GATEWAY_TIMEOUT,
-                        format!("upstream did not answer: {e}"),
-                    )
-                        .into_response()),
+                    constraint_set_version: VERSION.0,
+                    epoch,
+                    certificates,
+                },
+                &staged,
+            )
+            .map_err(log_error)?;
+        fault::hit(FaultPoint::AfterValidatedLog);
+        self.log.committing(txn).map_err(log_error)?;
+        fault::hit(FaultPoint::BeforeUpstream);
+
+        let captured = match self
+            .send(Method::POST, path_and_query, &headers, forwarded)
+            .await
+        {
+            Ok(resp) => Captured::read(resp).await.ok(),
+            Err(_) => None,
+        };
+        match captured {
+            Some(c) if (200..300).contains(&c.status) => {
+                fault::hit(FaultPoint::AfterUpstreamBeforeLog);
+                if let Err(e) = pipeline::apply(&staged, &indexes, epoch) {
+                    // The commit happened; recovery re-applies, and nothing else commits meanwhile.
+                    st.degraded = Some(e.message);
+                    return Ok(c.response());
+                }
+                fault::hit(FaultPoint::BeforeCommittedLog);
+                self.log
+                    .finish(txn, TxnState::Committed, c.decision())
+                    .map_err(log_error)?;
+                Ok(c.response())
+            }
+            Some(c) if (400..500).contains(&c.status) => {
+                self.log
+                    .finish(txn, TxnState::Aborted, c.decision())
+                    .map_err(log_error)?;
+                Ok(c.response())
+            }
+            unknown => {
+                fault::hit(FaultPoint::AfterUpstreamUnknown);
+                match self.recover(&mut st, &headers).await {
+                    Ok(()) => Ok(self.log.decision(txn).map_or_else(
+                        || StatusCode::GATEWAY_TIMEOUT.into_response(),
+                        |d| replay(&d),
+                    )),
+                    // Still unknown: the client cannot know either.
+                    Err(_) => Ok(unknown.map_or_else(
+                        || (StatusCode::GATEWAY_TIMEOUT, "upstream did not answer").into_response(),
+                        |c| c.response(),
+                    )),
                 }
             }
         }

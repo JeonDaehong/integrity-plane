@@ -8,12 +8,17 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only: abort at the fault point named by OIP_FAULT (crash tests).
+fault-injection = ["integrity-txn/fault-injection"]
+
 [dependencies]
 integrity-types.workspace = true
 integrity-core.workspace = true
 integrity-index.workspace = true
 integrity-validator.workspace = true
 integrity-iceberg.workspace = true
+integrity-txn.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
@@ -34,3 +39,12 @@ path = "src/main.rs"
 
 [dev-dependencies]
 apache-avro.workspace = true
+integrity-txn.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+
+[[test]]
+name = "crash"
+required-features = ["fault-injection"]
+

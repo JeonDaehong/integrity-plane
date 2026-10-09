@@ -1,8 +1,9 @@
 //! Validation of a `main` change (spec §14 steps 5–8b), run on a blocking thread.
 //!
 //! Each new snapshot is diffed against its parent, its rows extracted and validated against an
-//! overlay of the indexes that already contains the previous steps; nothing touches the real
-//! indexes until the upstream commit succeeds.
+//! overlay of the indexes that already contains the previous steps. The overlays' writes become one
+//! staged delta per index for the whole commit: recorded in the transaction log, applied after the
+//! upstream commit succeeds, and replayed identically by recovery (RFC 0004).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,13 +12,14 @@ use integrity_iceberg::{
     Budgeted, FileIo, MainChange, NewSnapshot, TableMetadata, check_operation, commit_rows,
     diff_snapshots,
 };
-use integrity_index::{IndexEpoch, KeyIndex, Overlay, PersistentIndex};
+use integrity_index::{IndexEpoch, KeyIndex, Overlay, PersistentIndex, StagedDelta};
+use integrity_txn::{FaultPoint, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, TableId};
 use integrity_validator::{Decision, ValidatedDeltas, Validator};
 
 use crate::error::ApiError;
 
-/// A validated step, ready to be certified and, after the upstream commit, applied.
+/// A validated step, ready to be certified.
 #[derive(Debug, Clone)]
 pub struct StepPlan {
     /// The snapshot.
@@ -30,7 +32,12 @@ pub struct StepPlan {
 #[derive(Debug)]
 pub enum Outcome {
     /// Every step is valid.
-    Accepted(Vec<StepPlan>),
+    Accepted {
+        /// One plan per step, oldest first.
+        plans: Vec<StepPlan>,
+        /// The whole commit's writes, one staged delta per index that changes.
+        staged: Vec<(ConstraintId, StagedDelta)>,
+    },
     /// A step violates constraints.
     Rejected(BTreeSet<Violation>),
 }
@@ -55,6 +62,10 @@ pub struct Job {
     pub indexes: BTreeMap<ConstraintId, PersistentIndex>,
 }
 
+fn api(e: impl std::fmt::Display, code: ErrorCode) -> ApiError {
+    ApiError::new(code, e.to_string())
+}
+
 /// Runs the job.
 pub fn run(job: &Job) -> Result<Outcome, ApiError> {
     let io = Budgeted::new(job.io.as_ref(), job.budget);
@@ -66,6 +77,7 @@ pub fn run(job: &Job) -> Result<Outcome, ApiError> {
 
     let mut plans = Vec::new();
     let mut previous_list: Option<String> = None;
+    let mut touched = BTreeSet::new();
     for (n, step) in job.change.steps.iter().enumerate() {
         let parent_list = if n == 0 {
             match job.change.parent {
@@ -111,7 +123,8 @@ pub fn run(job: &Job) -> Result<Outcome, ApiError> {
                 {
                     overlays[&id]
                         .apply(staged, IndexEpoch(0))
-                        .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
+                        .map_err(|e| api(e, ErrorCode::IndexDegraded))?;
+                    touched.insert(id);
                 }
                 plans.push(StepPlan {
                     step: step.clone(),
@@ -121,29 +134,37 @@ pub fn run(job: &Job) -> Result<Outcome, ApiError> {
         }
         previous_list = Some(step.manifest_list.clone());
     }
-    Ok(Outcome::Accepted(plans))
-}
-
-/// Applies validated steps to the real indexes after the upstream commit succeeded, one epoch per
-/// step and index. Returns the last epoch used.
-pub fn apply(
-    plans: &[StepPlan],
-    indexes: &BTreeMap<ConstraintId, PersistentIndex>,
-    mut epoch: u64,
-) -> Result<u64, ApiError> {
-    for plan in plans {
-        epoch += 1;
-        for (id, delta) in plan.validated.deltas() {
-            let index = indexes.get(&id).ok_or_else(|| {
-                ApiError::new(ErrorCode::IndexDegraded, format!("no index for {id}"))
-            })?;
-            let staged = index
-                .stage(delta)
-                .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
-            index
-                .apply(staged, IndexEpoch(epoch))
-                .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
+    let mut staged = Vec::new();
+    for (id, overlay) in overlays {
+        if touched.contains(&id) {
+            staged.push((
+                id,
+                overlay
+                    .into_staged()
+                    .map_err(|e| api(e, ErrorCode::IndexDegraded))?,
+            ));
         }
     }
-    Ok(epoch)
+    Ok(Outcome::Accepted { plans, staged })
+}
+
+/// Applies a commit's staged deltas at `epoch`. Idempotent: re-applying after a crash is a no-op
+/// for indexes that were already updated (ADR 0003).
+pub fn apply(
+    staged: &[(ConstraintId, StagedDelta)],
+    indexes: &BTreeMap<ConstraintId, PersistentIndex>,
+    epoch: u64,
+) -> Result<(), ApiError> {
+    for (n, (id, delta)) in staged.iter().enumerate() {
+        if n > 0 {
+            fault::hit(FaultPoint::DuringIndexApply);
+        }
+        let index = indexes
+            .get(id)
+            .ok_or_else(|| ApiError::new(ErrorCode::IndexDegraded, format!("no index for {id}")))?;
+        index
+            .apply(delta.clone(), IndexEpoch(epoch))
+            .map_err(|e| api(e, ErrorCode::IndexDegraded))?;
+    }
+    Ok(())
 }

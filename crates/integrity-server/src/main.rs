@@ -10,6 +10,7 @@ use integrity_index::PersistentStore;
 use integrity_server::config::Config;
 use integrity_server::fileio::ObjectStoreIo;
 use integrity_server::{Gateway, router};
+use integrity_txn::TxnLog;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,6 +34,7 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_toml(&std::fs::read_to_string(path)?)?;
     std::fs::create_dir_all(&config.control_store.path)?;
     let store = PersistentStore::open(config.control_store.path.join("indexes.redb"))?;
+    let log = TxnLog::open(config.control_store.path.join("txn.redb"))?;
     let io = Arc::new(ObjectStoreIo::new(
         config.storage.clone(),
         tokio::runtime::Handle::current(),
@@ -42,9 +44,13 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(config.upstream.timeout_secs),
         io,
         store,
+        log,
         config.limits.max_inline_validation_bytes,
         config.constraints.clone(),
     )?;
+    if let Err(e) = gateway.recover_on_start().await {
+        tracing::warn!("recovery pending until upstream answers: {e}");
+    }
     let listener = tokio::net::TcpListener::bind(&config.server.bind).await?;
     tracing::info!("listening on {}", config.server.bind);
     axum::serve(listener, router(Arc::new(gateway))).await?;

@@ -382,6 +382,11 @@ impl TxnLog {
         self.index.lock().ok()?.txns.get(&txn.0)?.state
     }
 
+    /// The recorded decision of a finished transaction.
+    pub fn decision(&self, txn: TxnId) -> Option<Decision> {
+        self.index.lock().ok()?.txns.get(&txn.0)?.decision.clone()
+    }
+
     /// The recorded decision for a request id, if its transaction finished.
     pub fn decision_for(&self, request_id: &str) -> Option<Decision> {
         let index = self.index.lock().ok()?;

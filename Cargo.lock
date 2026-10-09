@@ -1161,14 +1161,18 @@ name = "integrity-server"
 version = "0.0.0"
 dependencies = [
  "apache-avro",
+ "arrow-array",
+ "arrow-schema",
  "axum",
  "bytes",
  "integrity-core",
  "integrity-iceberg",
  "integrity-index",
+ "integrity-txn",
  "integrity-types",
  "integrity-validator",
  "object_store",
+ "parquet",
  "reqwest",
  "serde",
  "serde_json",

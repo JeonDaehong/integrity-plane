@@ -222,11 +222,13 @@ async fn harness(extra: MemoryIo) -> Harness {
     .await;
     let dir = tempdir::Dir::new();
     let store = PersistentStore::open(dir.0.join("indexes.redb")).unwrap();
+    let log = integrity_txn::TxnLog::open(dir.0.join("txn.redb")).unwrap();
     let gateway = Gateway::new(
         &format!("http://{up_addr}"),
         Duration::from_secs(10),
         Arc::new(TestIo { extra }),
         store,
+        log,
         1 << 30,
         constraints(),
     )
@@ -521,7 +523,10 @@ async fn unconstrained_tables_and_config_are_proxied() {
     );
     assert!(config["defaults"]["uri"].is_null());
     assert_eq!(config["overrides"]["warehouse"], "w");
-    assert!(config["idempotency-key-lifetime"].is_null());
+    assert_eq!(
+        config["idempotency-key-lifetime"], "PT30M",
+        "idempotency keys are honoured"
+    );
 
     let r = h
         .client
@@ -530,4 +535,42 @@ async fn unconstrained_tables_and_config_are_proxied() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200, "loads are proxied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_idempotency_keys_return_the_recorded_decision() {
+    let commits = main_commits();
+    let mut extra = MemoryIo::new();
+    let bad = relisting_commit(&commits[1], &mut extra);
+    let h = harness(extra).await;
+    let post = |body: &Value, key: &str| {
+        h.client
+            .post(format!("{}{TABLE_PATH}", h.gateway))
+            .header("Idempotency-Key", key)
+            .json(body)
+            .send()
+    };
+
+    let first = post(&request(&commits[0], &commits[1]), "k-1")
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let first: Value = first.json().await.unwrap();
+    let forwarded = h.upstream_commits();
+
+    // The same key again: the recorded response, not a stale-base rejection, and nothing forwarded.
+    let again = post(&request(&commits[0], &commits[1]), "k-1")
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    assert_eq!(again.json::<Value>().await.unwrap(), first);
+    assert_eq!(h.upstream_commits(), forwarded);
+
+    // Rejections are recorded too.
+    let rejected = post(&bad, "k-2").await.unwrap();
+    assert_eq!(rejected.status(), 400);
+    let body: Value = rejected.json().await.unwrap();
+    let again = post(&bad, "k-2").await.unwrap();
+    assert_eq!(again.status(), 400);
+    assert_eq!(again.json::<Value>().await.unwrap(), body);
 }

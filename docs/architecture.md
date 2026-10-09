@@ -16,6 +16,8 @@ The ten crates of spec §12 exist. Dependency direction is strictly downward
 | `integrity-reference` | Relational oracle and shared proptest strategies (Phase 2) |
 | `integrity-validator` | Validation planner and PK/UNIQUE/NOT NULL/FK validation (Phase 3) |
 | `integrity-iceberg` | Parquet key extraction (Phase 5); metadata model, requirement checks, §15 classification, manifest diff (Phase 6) |
+| `integrity-txn` | Durable transaction log, state machine, fault points (Phase 8) |
+| `integrity-server` | REST gateway (Phase 7), transaction log and recovery (Phase 8) |
 | others | Empty skeletons |
 
 ## Indexes (§13)
@@ -100,8 +102,9 @@ table that has constraints, or is referenced by one, is handled under one lock: 
 FK-connected domain are bound to their upstream UUIDs (a table with data and no index history must
 be onboarded first), requirements are checked, the commit is classified, each new `main` snapshot is
 validated against an overlay of the persistent indexes, certificates are injected, and the request is
-forwarded. Index changes are applied only after the upstream commit succeeds; an unknown outcome is
-reconciled by reloading the table. Decisions use the status mapping of
+forwarded. Every step is recorded in the transaction log (RFC 0004, `docs/recovery.md`): index changes are
+applied only after the upstream commit succeeds, a crash at any point is resolved on restart, and a
+repeated `Idempotency-Key` gets the recorded answer. Decisions use the status mapping of
 [RFC 0003](rfc/0003-http-status-mapping.md). Everything else, including table creation and loads, is
 forwarded unchanged; `/v1/config` is stripped of `uri` overrides and idempotency support.
 Constraints come from the configuration file (`deploy/integrity.example.toml`) until Phase 10.
