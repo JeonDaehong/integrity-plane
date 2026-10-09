@@ -3,7 +3,7 @@
 Commit-time PRIMARY KEY / UNIQUE / NOT NULL / FOREIGN KEY enforcement for Apache Iceberg tables,
 independent of the writing engine, with verifiable integrity certificates.
 
-> **Status: pre-alpha (0.0.0), not production-ready.** Do not use this for data you care about.
+> **Status: pre-alpha (0.0.1), not production-ready.** Do not use this for data you care about.
 > Only what is listed below is implemented, and only within the limits stated in the linked docs.
 
 ## Supported features

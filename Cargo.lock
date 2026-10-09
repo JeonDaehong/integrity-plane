@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-bench"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-iceberg"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-index"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "integrity-core",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-reference"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "integrity-core",
  "integrity-types",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-server"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-txn"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "integrity-core",
@@ -1281,11 +1281,11 @@ dependencies = [
 
 [[package]]
 name = "integrity-types"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "integrity-validator"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "integrity-core",
  "integrity-index",
