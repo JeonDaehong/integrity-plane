@@ -21,7 +21,7 @@ use crate::manifest::{
     DataFile, FileContent, ManifestContent, ManifestError, ManifestFile, read_manifest,
     read_manifest_list,
 };
-use crate::parquet_keys::{ExtractError, extract_rows};
+use crate::parquet_keys::{ExtractError, extract_rows_from};
 
 /// Why a main change could not be turned into rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +78,11 @@ impl From<ManifestError> for InspectError {
 
 impl From<ExtractError> for InspectError {
     fn from(e: ExtractError) -> Self {
-        InspectError::Extract(e)
+        match e {
+            // Storage failures and the budget keep their own codes.
+            ExtractError::Read(r) => InspectError::Read(r),
+            other => InspectError::Extract(other),
+        }
     }
 }
 
@@ -330,7 +334,7 @@ pub fn commit_rows(
 ) -> Result<CommitRows, InspectError> {
     // Rows of a data file, in file order (row position = index).
     let file_rows = |file: &DataFile| -> Result<RowBatch, InspectError> {
-        let rows = extract_rows(io.read(&file.path)?, columns)?;
+        let rows = extract_rows_from(io, &file.path, columns)?;
         if rows.len() as i64 != file.record_count {
             return Err(unsupported(format!(
                 "{} has {} rows but its manifest says {}",
@@ -377,7 +381,7 @@ pub fn commit_rows(
                 .collect::<Result<_, _>>()?;
             let mut batch = RowBatch::new(fields);
             for file in &changes.equality_deletes {
-                let rows = extract_rows(io.read(&file.path)?, &typed)?;
+                let rows = extract_rows_from(io, &file.path, &typed)?;
                 if rows.len() as i64 != file.record_count {
                     return Err(unsupported(format!(
                         "{} has {} rows but its manifest says {}",
@@ -491,7 +495,15 @@ fn position_deletes(
         file.content_offset,
         file.content_size_in_bytes,
     ) {
-        let positions = crate::deletion_vector::read(&io.read(&file.path)?, offset, size)
+        // Only the blob is read, not the whole Puffin file.
+        let (start, len) = (
+            u64::try_from(offset).map_err(|_| unsupported("negative deletion vector offset"))?,
+            u64::try_from(size).map_err(|_| unsupported("negative deletion vector size"))?,
+        );
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| unsupported("deletion vector range overflows"))?;
+        let positions = crate::deletion_vector::decode(&io.read_range(&file.path, start..end)?)
             .map_err(|e| unsupported(format!("{}: {e}", file.path)))?;
         if positions.len() as i64 != file.record_count {
             return Err(unsupported(format!(
@@ -503,8 +515,9 @@ fn position_deletes(
         }
         return Ok(BTreeMap::from([(target.clone(), positions)]));
     }
-    let rows = extract_rows(
-        io.read(&file.path)?,
+    let rows = extract_rows_from(
+        io,
+        &file.path,
         &[
             (DELETE_FILE_PATH, LogicalType::String),
             (DELETE_POS, LogicalType::Long),

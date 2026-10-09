@@ -43,12 +43,15 @@ target), multi-node anything.
 
 | Scenario | Time | Throughput | Notes |
 |---|---|---|---|
-| Onboarding scan of 1000000 parent rows (PRIMARY KEY) | 3.46 s | 288732 keys/s | parent data 7.9 MiB |
-| Child append of 10000 rows (PK + FK into 1000000 parent keys), 20 commits | validation p50 59.4 ms / max 89.8 ms; end-to-end p50 109.3 ms / p99 129.5 ms | 168492 keys/s | read per commit p50 0.2 MiB |
-| Compaction of 200000 child rows (20 files → 1, `replace`) | validation 1.04 s; end-to-end 1.06 s | 386175 keys/s | read 7.3 MiB |
-| One writer: 100 sequential single-row FK appends | end-to-end p50 13.2 ms / p99 17.0 ms; server validation p50 ≤ 5.0 ms | 76 commits/s | |
-| Hot parent key: 16 writers × 20 single-row FK appends to one new table | queue wait p50 ≤ 50.0 ms / p99 ≤ 50.0 ms; end-to-end incl. retries p50 57.8 ms / p99 6.29 s | 25 commits/s | 3765 attempts for 320 commits (409 retries) |
-| Baseline: the same writers straight to the catalog (no Plane) | end-to-end incl. retries p50 96.5 ms / p99 997.1 ms | 71 commits/s | 2140 attempts for 320 commits |
+| Onboarding scan of 1000000 parent rows (PRIMARY KEY) | 3.44 s | 290749 keys/s | parent data 7.9 MiB |
+| Child append of 10000 rows (PK + FK into 1000000 parent keys), 20 commits | validation p50 63.9 ms / max 94.2 ms; end-to-end p50 117.2 ms / p99 137.0 ms | 156433 keys/s | read per commit p50 0.2 MiB |
+| Compaction of 200000 child rows (20 files → 1, `replace`) | validation 1.06 s; end-to-end 1.09 s | 377192 keys/s | read 8.6 MiB |
+| Overhead: table load (what readers do before reading data files) | direct p50 0.1 ms; through the Plane p50 0.3 ms | +0.1 ms | data files are read from storage directly |
+| Overhead: single-row commit, client side included | straight to the catalog p50 5.2 ms; unconstrained table through the Plane p50 5.4 ms | +0.2 ms | constrained: see the next row |
+| Wide append: 10000 rows × 1024 B payload, PK on id, 5 commits | client writing the file and committing: straight to the catalog p50 71.5 ms; through the Plane p50 125.9 ms | +54.4 ms | Plane read per commit 0.2 MiB of a 9.9 MiB data file (1.6 %) |
+| One writer: 100 sequential single-row FK appends | end-to-end p50 14.9 ms / p99 22.7 ms; server validation p50 ≤ 2.5 ms | 64 commits/s | |
+| Hot parent key: 16 writers × 20 single-row FK appends to one new table | queue wait p50 ≤ 50.0 ms / p99 ≤ 100.0 ms; end-to-end incl. retries p50 189.7 ms / p99 5.95 s | 17 commits/s | 4221 attempts for 320 commits (409 retries) |
+| Baseline: the same writers straight to the catalog (no Plane) | end-to-end incl. retries p50 186.1 ms / p99 1.88 s | 41 commits/s | 2593 attempts for 320 commits |
 | Control store after the run | indexes 128.5 MiB / txn log 64.3 MiB / registry 0.5 MiB | | |
 
 ## Results: 10 M parent rows
@@ -62,6 +65,15 @@ target), multi-node anything.
 | Hot parent key: 16 writers × 20 single-row FK appends to one new table | queue wait p50 ≤ 50.0 ms / p99 ≤ 50.0 ms; end-to-end incl. retries p50 57.3 ms / p99 8.67 s | 24 commits/s | 3832 attempts for 320 commits (409 retries) |
 | Baseline: the same writers straight to the catalog (no Plane) | end-to-end incl. retries p50 133.7 ms / p99 1.14 s | 68 commits/s | 2219 attempts for 320 commits |
 | Control store after the run | indexes 1028.0 MiB / txn log 64.3 MiB / registry 0.5 MiB | | |
+
+## What the Plane adds to Iceberg
+
+| Path | Extra cost | Why |
+|---|---|---|
+| Reading tables | about 0.1 ms per table load; nothing on data | engines read data files from storage directly; the Plane only relays the metadata request |
+| Commits to tables without constraints | about 0.2–0.6 ms | forwarded unchanged |
+| Commits to constrained tables | about 5–10 ms, plus about 5 µs per changed key | validation, transaction log, index update |
+| Storage reads for validation | the key column chunks of the files a commit adds or removes (1.6 % of a 10 MB file with 1 KB rows) | footer and projected column chunks are read with ranged requests |
 
 ## Reading the numbers
 
@@ -90,5 +102,6 @@ target), multi-node anything.
 |---|---|---|
 | Phase 11 | 54–59 commits/s | 14 commits/s (p99 about 20 s) |
 | No write transaction to look up an index; one atomic apply for all indexes of a commit; VALIDATED and COMMITTING in one write; stale commits answered before the queue | 76–82 commits/s | 23–25 commits/s (p99 about 6–9 s) |
+| Only key column chunks read from data files (ranged reads); index values read during validation reused when staging | (unchanged) | (unchanged); wide 10 MB file: 100 % → 1.6 % read |
 
 Measured with alternating runs of both versions on the machine above (200 K parent rows).

@@ -19,8 +19,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - On tables with position deletes, each commit reads all manifests of both snapshots and every live
   position delete file.
 - Commits to branches other than `main` pass through uncertified.
-- The Plane reads whole data files, not only the key column chunks, so bytes read per commit grow
-  with file size (reported by `integrity_bytes_read_total`).
+- Validation reads the footer and the key column chunks of every data file a commit adds or
+  removes (ranged reads), so its cost follows the key columns, not the file size; manifests are
+  read whole. About 5 µs per changed key on the benchmark machine.
 - One domain commits about 80 times per second with one writer on the benchmark machine, and about
   25 times per second when 16 writers race on one table (about a third of the same race without
   the Plane; `benchmarks.md`).

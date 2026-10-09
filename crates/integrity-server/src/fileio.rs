@@ -61,7 +61,78 @@ impl ObjectStoreIo {
     }
 }
 
+/// Where a location lives.
+enum Target {
+    S3(Arc<AmazonS3>, Path),
+    Local(String),
+}
+
+impl ObjectStoreIo {
+    fn target(&self, location: &str) -> Result<Target, ReadError> {
+        let s3 = location
+            .strip_prefix("s3://")
+            .or_else(|| location.strip_prefix("s3a://"));
+        if let Some(rest) = s3 {
+            let (bucket, key) = rest
+                .split_once('/')
+                .ok_or_else(|| ReadError::Io(format!("no key in {location}")))?;
+            let path = Path::parse(key).map_err(|e| ReadError::Io(e.to_string()))?;
+            return Ok(Target::S3(self.bucket(bucket)?, path));
+        }
+        // `file:///tmp/x`, Hadoop's `file:/tmp/x`, or a plain path.
+        let local = location
+            .strip_prefix("file://")
+            .or_else(|| location.strip_prefix("file:"))
+            .unwrap_or(location);
+        Ok(Target::Local(local.to_owned()))
+    }
+}
+
 impl FileIo for ObjectStoreIo {
+    fn size(&self, location: &str) -> Result<u64, ReadError> {
+        match self.target(location)? {
+            Target::S3(store, path) => self
+                .runtime
+                .block_on(async move { store.head(&path).await })
+                .map(|m| m.size)
+                .map_err(|e| ReadError::Io(e.to_string())),
+            Target::Local(p) => std::fs::metadata(&p)
+                .map(|m| m.len())
+                .map_err(|e| ReadError::Io(format!("{location}: {e}"))),
+        }
+    }
+
+    fn read_range(&self, location: &str, range: std::ops::Range<u64>) -> Result<Bytes, ReadError> {
+        if range.start > range.end {
+            return Err(ReadError::Io(format!("{location}: empty range")));
+        }
+        match self.target(location)? {
+            Target::S3(store, path) => {
+                let want = range.end - range.start;
+                let bytes = self
+                    .runtime
+                    .block_on(async move { store.get_range(&path, range).await })
+                    .map_err(|e| ReadError::Io(e.to_string()))?;
+                if bytes.len() as u64 != want {
+                    return Err(ReadError::Io(format!("{location}: short read")));
+                }
+                Ok(bytes)
+            }
+            Target::Local(p) => {
+                use std::io::{Read as _, Seek as _, SeekFrom};
+                let mut file = std::fs::File::open(&p)
+                    .map_err(|e| ReadError::Io(format!("{location}: {e}")))?;
+                let len = usize::try_from(range.end - range.start)
+                    .map_err(|_| ReadError::Io(format!("{location}: range too large")))?;
+                let mut buf = vec![0u8; len];
+                file.seek(SeekFrom::Start(range.start))
+                    .and_then(|_| file.read_exact(&mut buf))
+                    .map_err(|e| ReadError::Io(format!("{location}: {e}")))?;
+                Ok(Bytes::from(buf))
+            }
+        }
+    }
+
     fn read(&self, location: &str) -> Result<Bytes, ReadError> {
         let s3 = location
             .strip_prefix("s3://")

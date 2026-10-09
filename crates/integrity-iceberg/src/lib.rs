@@ -28,5 +28,5 @@ pub use classify::{
 };
 pub use io::{Budgeted, FileIo, MemoryIo, ReadError};
 pub use metadata::TableMetadata;
-pub use parquet_keys::{ExtractError, extract_rows};
+pub use parquet_keys::{ExtractError, extract_rows, extract_rows_from};
 pub use request::{CommitRequest, MalformedRequest, Requirement, Update};

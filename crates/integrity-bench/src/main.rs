@@ -172,20 +172,43 @@ impl Files {
 
     /// One Parquet file with columns `id` and `ref`, and a manifest listing it.
     fn manifest(&self, ids: &[i64], refs: &[Option<i64>]) -> Result<String, BoxError> {
+        self.manifest_with_payload(ids, refs, 0)
+    }
+
+    /// Like `manifest`, with an extra non-key column of `payload` incompressible bytes per row
+    /// (a wide row, as real tables have).
+    fn manifest_with_payload(
+        &self,
+        ids: &[i64],
+        refs: &[Option<i64>],
+        payload: usize,
+    ) -> Result<String, BoxError> {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         let meta =
             |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
+        let mut fields = vec![
             Field::new("id", DataType::Int64, false).with_metadata(meta("1")),
             Field::new("ref", DataType::Int64, true).with_metadata(meta("2")),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(ids.to_vec())),
-                Arc::new(Int64Array::from(refs.to_vec())),
-            ],
-        )?;
+        ];
+        let mut columns: Vec<arrow_array::ArrayRef> = vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(Int64Array::from(refs.to_vec())),
+        ];
+        if payload > 0 {
+            fields.push(Field::new("payload", DataType::Utf8, false).with_metadata(meta("3")));
+            let mut rng = Rng(n as u64 ^ 0xdead_beef);
+            let values: Vec<String> = ids
+                .iter()
+                .map(|_| {
+                    (0..payload / 16)
+                        .map(|_| format!("{:016x}", rng.next()))
+                        .collect()
+                })
+                .collect();
+            columns.push(Arc::new(arrow_array::StringArray::from(values)));
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
         let data_path = self.location(&format!("d{n}.parquet"));
         let file = std::fs::File::create(&data_path)?;
         let mut w = ArrowWriter::try_new(file, schema, None)?;
@@ -256,6 +279,8 @@ struct Bench {
 
 enum Change {
     Append(Vec<i64>, Vec<Option<i64>>),
+    /// Append rows carrying `usize` payload bytes each.
+    Wide(Vec<i64>, usize),
     /// Replace every current manifest with one file holding the same rows.
     Compact(Vec<i64>, Vec<Option<i64>>),
 }
@@ -293,6 +318,14 @@ impl Bench {
                 (m, "append")
             }
             Change::Compact(ids, refs) => (vec![self.files.manifest(ids, refs)?], "replace"),
+            Change::Wide(ids, payload) => {
+                let mut m = current;
+                m.push(
+                    self.files
+                        .manifest_with_payload(ids, &vec![None; ids.len()], *payload)?,
+                );
+                (m, "append")
+            }
         };
         let (id, list) = self.files.list(&manifests)?;
         let body = json!({
@@ -448,6 +481,9 @@ async fn main() -> Result<(), BoxError> {
         ("orders", "22222222-2222-2222-2222-222222222222"),
         ("hot", "44444444-4444-4444-4444-444444444444"),
         ("baseline", "33333333-3333-3333-3333-333333333333"),
+        ("direct", "55555555-5555-5555-5555-555555555555"),
+        ("free", "66666666-6666-6666-6666-666666666666"),
+        ("wide", "77777777-7777-7777-7777-777777777777"),
     ] {
         shared.lock().map_err(|_| "lock")?.tables.insert(
             format!("/v1/namespaces/bench/tables/{name}"),
@@ -599,6 +635,96 @@ async fn main() -> Result<(), BoxError> {
         seconds(compaction.as_secs_f64()),
         keys / v,
         mib(after.get("integrity_bytes_read_total") - before.get("integrity_bytes_read_total")),
+    ));
+
+    // Overhead against the catalog alone, one writer at a time.
+    let p50_of = |mut v: Vec<Duration>| {
+        v.sort();
+        percentile(&v, 0.5).as_secs_f64()
+    };
+    let mut loads = (Vec::new(), Vec::new());
+    for _ in 0..200 {
+        let t = Instant::now();
+        b.head(&b.upstream, "customer").await?;
+        loads.0.push(t.elapsed());
+        let t = Instant::now();
+        b.head(&b.gateway, "customer").await?;
+        loads.1.push(t.elapsed());
+    }
+    let (direct_load, plane_load) = (p50_of(loads.0), p50_of(loads.1));
+    line(format!(
+        "| Overhead: table load (what readers do before reading data files) | direct p50 {}; through the Plane p50 {} | +{} | data files are read from storage directly |",
+        seconds(direct_load),
+        seconds(plane_load),
+        seconds(plane_load - direct_load),
+    ));
+    let mut commits = (Vec::new(), Vec::new());
+    for i in 0..100 {
+        let t = Instant::now();
+        let status = b
+            .commit(&b.upstream, "direct", &Change::Append(vec![i], vec![None]))
+            .await?;
+        assert_eq!(status, 200);
+        commits.0.push(t.elapsed());
+        let t = Instant::now();
+        let status = b
+            .commit(&b.gateway, "free", &Change::Append(vec![i], vec![None]))
+            .await?;
+        assert_eq!(status, 200);
+        commits.1.push(t.elapsed());
+    }
+    let (direct_commit, proxied_commit) = (p50_of(commits.0), p50_of(commits.1));
+    line(format!(
+        "| Overhead: single-row commit, client side included | straight to the catalog p50 {}; unconstrained table through the Plane p50 {} | +{} | constrained: see the next row |",
+        seconds(direct_commit),
+        seconds(proxied_commit),
+        seconds(proxied_commit - direct_commit),
+    ));
+
+    // Wide rows: the Plane reads the key column chunks, not whole data files.
+    b.register(
+        json!({"table": "bench.wide", "name": "pk_wide", "type": "PRIMARY_KEY", "columns": ["id"]}),
+    )
+    .await?;
+    let (rows, payload) = (10_000i64, 1024usize);
+    let before = b.metrics().await?;
+    let mut direct = Vec::new();
+    let mut plane = Vec::new();
+    for round in 0..5i64 {
+        let ids: Vec<i64> = (round * rows..(round + 1) * rows).collect();
+        let t = Instant::now();
+        assert_eq!(
+            b.commit(&b.upstream, "baseline", &Change::Wide(ids.clone(), payload))
+                .await?,
+            200
+        );
+        direct.push(t.elapsed());
+        let t = Instant::now();
+        assert_eq!(
+            b.commit(&b.gateway, "wide", &Change::Wide(ids, payload))
+                .await?,
+            200
+        );
+        plane.push(t.elapsed());
+    }
+    let after = b.metrics().await?;
+    let read_per_commit =
+        (after.get("integrity_bytes_read_total") - before.get("integrity_bytes_read_total")) / 5.0;
+    let file_size = std::fs::read_dir(&data)?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0) as f64;
+    let (direct_p50, plane_p50) = (p50_of(direct), p50_of(plane));
+    line(format!(
+        "| Wide append: {rows} rows × {payload} B payload, PK on id, 5 commits | client writing the file and committing: straight to the catalog p50 {}; through the Plane p50 {} | +{} | Plane read per commit {} of a {} data file ({:.1} %) |",
+        seconds(direct_p50),
+        seconds(plane_p50),
+        seconds(plane_p50 - direct_p50),
+        mib(read_per_commit),
+        mib(file_size),
+        100.0 * read_per_commit / file_size.max(1.0),
     ));
 
     // 4. One writer, sequential single-row FK appends: the per-commit cost without contention.

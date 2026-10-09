@@ -31,10 +31,50 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// Whole-file reads by Iceberg location (object store, local disk, …).
+/// Reads by Iceberg location (object store, local disk, …).
 pub trait FileIo {
     /// The contents of the file at `location`.
     fn read(&self, location: &str) -> Result<Bytes, ReadError>;
+
+    /// The size of the file at `location` in bytes.
+    fn size(&self, location: &str) -> Result<u64, ReadError> {
+        Ok(self.read(location)?.len() as u64)
+    }
+
+    /// Bytes `range` of the file at `location` (ranged GET on object stores). Reading past the end
+    /// is an error.
+    fn read_range(&self, location: &str, range: std::ops::Range<u64>) -> Result<Bytes, ReadError> {
+        let all = self.read(location)?;
+        slice(&all, location, range)
+    }
+}
+
+/// `bytes[range]`, or an error naming `location` if the range is out of bounds.
+pub fn slice(
+    bytes: &Bytes,
+    location: &str,
+    range: std::ops::Range<u64>,
+) -> Result<Bytes, ReadError> {
+    let (start, end) = (
+        usize::try_from(range.start).unwrap_or(usize::MAX),
+        usize::try_from(range.end).unwrap_or(usize::MAX),
+    );
+    if start > end || end > bytes.len() {
+        return Err(ReadError::Io(format!(
+            "{location}: range {start}..{end} beyond {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.slice(start..end))
+}
+
+/// One file in memory, at any location (for [`crate::extract_rows`] on bytes).
+pub(crate) struct Single(pub Bytes);
+
+impl FileIo for Single {
+    fn read(&self, _location: &str) -> Result<Bytes, ReadError> {
+        Ok(self.0.clone())
+    }
 }
 
 /// Files held in memory, keyed by location (tests, fixtures).
@@ -66,8 +106,7 @@ impl FileIo for MemoryIo {
 
 /// Counts bytes read through `inner` and refuses reads beyond `limit`.
 ///
-/// Whole files are counted, which over-estimates key-column bytes; the budget therefore errs on
-/// the side of rejecting (`VALIDATION_BUDGET_EXCEEDED`), never of reading too much.
+/// Every byte returned is counted (whole files, or only the ranges read from Parquet files).
 #[derive(Debug)]
 pub struct Budgeted<'a, I: ?Sized> {
     inner: &'a I,
@@ -91,16 +130,36 @@ impl<'a, I: FileIo + ?Sized> Budgeted<'a, I> {
     }
 }
 
+impl<I: FileIo + ?Sized> Budgeted<'_, I> {
+    fn charge(&self, bytes: &Bytes) -> Result<(), ReadError> {
+        let used = self.used.fetch_add(bytes.len() as u64, Ordering::SeqCst) + bytes.len() as u64;
+        if used > self.limit {
+            return Err(ReadError::BudgetExceeded { limit: self.limit });
+        }
+        Ok(())
+    }
+}
+
 impl<I: FileIo + ?Sized> FileIo for Budgeted<'_, I> {
     fn read(&self, location: &str) -> Result<Bytes, ReadError> {
         if self.used() > self.limit {
             return Err(ReadError::BudgetExceeded { limit: self.limit });
         }
         let bytes = self.inner.read(location)?;
-        let used = self.used.fetch_add(bytes.len() as u64, Ordering::SeqCst) + bytes.len() as u64;
-        if used > self.limit {
+        self.charge(&bytes)?;
+        Ok(bytes)
+    }
+
+    fn size(&self, location: &str) -> Result<u64, ReadError> {
+        self.inner.size(location)
+    }
+
+    fn read_range(&self, location: &str, range: std::ops::Range<u64>) -> Result<Bytes, ReadError> {
+        if self.used() > self.limit {
             return Err(ReadError::BudgetExceeded { limit: self.limit });
         }
+        let bytes = self.inner.read_range(location, range)?;
+        self.charge(&bytes)?;
         Ok(bytes)
     }
 }

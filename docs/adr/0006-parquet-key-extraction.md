@@ -59,3 +59,13 @@ fail closed on anything it cannot map unambiguously.
 - *iceberg-rust's reader*: brings the whole Iceberg runtime (async, object store) into extraction; the
   adapter will use iceberg-rust for metadata in Phase 6 if its ADR says so, but key extraction stays a
   small, synchronous, testable function.
+
+## Amendment: ranged reads
+
+Extraction no longer downloads whole files. It reads the file size, the footer (one tail read of
+64 KiB, or exactly the footer if larger), then only the column chunks of the requested root columns,
+from every row group, with ranged reads (`FileIo::read_range`; ranged GETs on object stores). The
+Parquet reader runs over just those ranges and fails if it ever needs another byte. Deletion vector
+blobs are read the same way, by their manifest offset and size. Storage errors and the validation
+budget keep their own codes (`STORAGE_READ_FAILED`, `VALIDATION_BUDGET_EXCEEDED`). A 10 MB file
+with 1 KB rows now costs 1.6 % of its size to validate.

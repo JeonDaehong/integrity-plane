@@ -355,3 +355,74 @@ fn garbage_is_a_parquet_error_not_a_panic() {
         );
     }
 }
+
+/// Only the footer and the key column chunks are read: a wide file costs about its key columns.
+#[test]
+fn wide_files_are_read_for_their_key_columns_only() {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use integrity_iceberg::{Budgeted, MemoryIo};
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::file::properties::WriterProperties;
+
+    let meta = |id: &str| {
+        std::collections::HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(meta("1")),
+        Field::new("payload", DataType::Utf8, false).with_metadata(meta("2")),
+    ]));
+    let n = 4000i64;
+    // Incompressible payloads so the file is genuinely wide.
+    let payload: Vec<String> = (0..n)
+        .map(|i| {
+            (0..64)
+                .map(|j| {
+                    format!(
+                        "{:016x}",
+                        ((i * 7919 + j) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(payload)),
+        ],
+    )
+    .unwrap();
+    let mut file = Vec::new();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1000)) // several row groups
+        .build();
+    let mut w = ArrowWriter::try_new(&mut file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let size = file.len();
+
+    let mut io = MemoryIo::new();
+    io.insert("wide.parquet", file);
+    let budgeted = Budgeted::new(&io, u64::MAX);
+    let rows = integrity_iceberg::extract_rows_from(
+        &budgeted,
+        "wide.parquet",
+        &[(FieldId(1), LogicalType::Long)],
+    )
+    .unwrap();
+    assert_eq!(rows.len(), n as usize);
+    assert_eq!(
+        rows.rows()[1234],
+        vec![integrity_core::Datum::Value(KeyValue::Integer(1234))]
+    );
+    let read = budgeted.used() as usize;
+    assert!(size > 4_000_000, "file is {size} bytes");
+    assert!(
+        read * 20 < size,
+        "read {read} of {size} bytes: more than the key column"
+    );
+}

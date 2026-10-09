@@ -14,10 +14,15 @@ use crate::{
 
 /// An index seen through pending writes. `apply` records writes in the overlay (ignoring epochs);
 /// reads see the overlay first, then the base. `epoch` is the base's.
+///
+/// Values read from the base are remembered: the base must not change while the overlay is in
+/// use (the gateway holds the domain queue for the whole commit), so validating and then staging
+/// the same keys reads each of them from the base once.
 #[derive(Debug)]
 pub struct Overlay<'a> {
     base: &'a dyn KeyIndex,
     writes: Mutex<BTreeMap<EncodedKey, Option<IndexValue>>>,
+    read: Mutex<BTreeMap<EncodedKey, Option<IndexValue>>>,
 }
 
 impl<'a> Overlay<'a> {
@@ -26,22 +31,31 @@ impl<'a> Overlay<'a> {
         Self {
             base,
             writes: Mutex::new(BTreeMap::new()),
+            read: Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn lookup(
-        &self,
-        writes: &BTreeMap<EncodedKey, Option<IndexValue>>,
-        key: &EncodedKey,
-    ) -> Result<Option<IndexValue>> {
-        match writes.get(key) {
-            Some(v) => Ok(*v),
-            None => Ok(self
-                .base
-                .get_many(std::slice::from_ref(key))?
-                .pop()
-                .flatten()),
+    /// Base values of `keys`, from memory or one batched base read for the rest.
+    fn base_values(&self, keys: &[EncodedKey]) -> Result<BTreeMap<EncodedKey, Option<IndexValue>>> {
+        let mut read = self.read.lock().map_err(|_| IndexError::Unavailable)?;
+        let mut missing: Vec<EncodedKey> = keys
+            .iter()
+            .filter(|k| !read.contains_key(*k))
+            .cloned()
+            .collect();
+        missing.sort();
+        missing.dedup();
+        let found = self.base.get_many(&missing)?;
+        if found.len() != missing.len() {
+            return Err(IndexError::Corrupt);
         }
+        for (k, v) in missing.into_iter().zip(found) {
+            read.insert(k, v);
+        }
+        Ok(keys
+            .iter()
+            .filter_map(|k| read.get(k).map(|v| (k.clone(), *v)))
+            .collect())
     }
 }
 
@@ -76,19 +90,29 @@ impl KeyIndex for Overlay<'_> {
             .filter(|k| !writes.contains_key(*k))
             .cloned()
             .collect();
-        let mut from_base = self.base.get_many(&missing)?.into_iter();
+        let base = self.base_values(&missing)?;
         keys.iter()
             .map(|k| match writes.get(k) {
                 Some(v) => Ok(*v),
-                None => from_base.next().ok_or(IndexError::Corrupt),
+                None => base.get(k).copied().ok_or(IndexError::Corrupt),
             })
             .collect()
     }
 
     fn stage(&self, delta: &IndexDelta) -> Result<StagedDelta> {
         let writes = self.writes.lock().map_err(|_| IndexError::Unavailable)?;
+        let keys: Vec<EncodedKey> = delta
+            .changes
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| !writes.contains_key(k))
+            .collect();
+        let base = self.base_values(&keys)?;
         resolve(self.kind(), delta, self.base.epoch()?, |k| {
-            self.lookup(&writes, k)
+            match writes.get(k) {
+                Some(v) => Ok(*v),
+                None => base.get(k).copied().ok_or(IndexError::Corrupt),
+            }
         })
     }
 
