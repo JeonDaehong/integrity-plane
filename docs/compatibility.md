@@ -1,7 +1,7 @@
 # Compatibility
 
-> **Status:** partial. Normative source: spec §15 (capability matrix) and §22 (error mapping). The
-> HTTP mapping arrives with Phase 7; nothing here is reachable through a gateway yet.
+> **Status:** partial. Normative source: spec §15 (capability matrix) and §22 (error mapping, as
+> amended by RFC 0003).
 
 ## Commit capability matrix (spec §15)
 
@@ -52,3 +52,29 @@ classification.
 
 Verified against files written by pyarrow 25, PyIceberg 0.12 and arrow-rs 60. Java (parquet-mr)
 writers are verified in Phase 7.
+
+## HTTP status mapping (spec §22, RFC 0003)
+
+| Situation | Codes | HTTP | Java (Spark) | PyIceberg | iceberg-rust |
+|---|---|---|---|---|---|
+| Constraint violated, unsupported, budget | INT-001, 003–008, 012, 014 | 400 | `BadRequestException`, fails fast | `BadRequestError` | error, fails fast |
+| Stale base | INT-009 | 409 | `CommitFailedException`, bounded retry | `CommitFailedException` | retried |
+| Transient Plane state | INT-011, INT-016 | 409 | as above | as above | as above |
+| Operator action needed | INT-010, INT-015 | 423 | `RESTException`, fails fast | `RESTError` | error |
+| Upstream response after forwarding | — | unchanged | — | — | — |
+
+The gateway never answers a commit it did not forward with 5xx. `/v1/config` is forwarded without `uri`
+overrides or idempotency-key support.
+
+## Verified clients (Phase 7, `compat/`, CI workflow "Compatibility")
+
+| Client | Version | Scenario |
+|---|---|---|
+| PyIceberg | 0.12.0 | append, FK violation (INT-005), referenced parent delete via COW delete (INT-006), PK duplicate (INT-003), NOT NULL (INT-007), child-then-parent delete |
+| Spark (Iceberg Java REST client) | Spark 3.5.6, Iceberg 1.10.0 | same, with SQL `INSERT` / `DELETE` (copy-on-write) |
+| iceberg-rust | 0.10.1 | fast append, INT-005, INT-003, INT-007 |
+
+For every client each violation reaches the gateway exactly once (no retry storm), the statement
+fails with the integrity code in its message, and every snapshot on `main` carries a certificate.
+Upstream: Iceberg REST fixture 1.10.1 with a filesystem warehouse; MinIO no longer publishes
+community container images, so the S3 code path (`object_store`) is not yet exercised in CI.
