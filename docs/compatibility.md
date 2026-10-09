@@ -63,7 +63,9 @@ writers are verified in Phase 7.
 | Operator action needed | INT-010, INT-015 | 423 | `RESTException`, fails fast | `RESTError` | error |
 | Upstream response after forwarding | — | unchanged | — | — | — |
 
-The gateway never answers a commit it did not forward with 5xx. `/v1/config` is forwarded without `uri`
+The message of a rejected commit reads `INT-005 FOREIGN_KEY_VIOLATION: commit rejected: INT-005 on
+fk_orders_customer (11 keys); details: GET /v1/integrity/transactions/17`; the structured error with
+sample keys is served there (ADR 0016). The gateway never answers a commit it did not forward with 5xx. `/v1/config` is forwarded without `uri`
 overrides or idempotency-key support.
 
 ## Verified clients (Phase 7, `compat/`, CI workflow "Compatibility")
@@ -71,7 +73,7 @@ overrides or idempotency-key support.
 | Client | Version | Scenario |
 |---|---|---|
 | PyIceberg | 0.12.0 | append, FK violation (INT-005), referenced parent delete via COW delete (INT-006), PK duplicate (INT-003), NOT NULL (INT-007), child-then-parent delete |
-| Spark (Iceberg Java REST client) | Spark 3.5.6, Iceberg 1.10.0 | same, with SQL `INSERT` / `DELETE` (copy-on-write) |
+| Spark (Iceberg Java REST client) | Spark 3.5.6, Iceberg 1.10.0 | same, with SQL `INSERT` / `DELETE` (copy-on-write); composite PRIMARY KEY and FOREIGN KEY on string columns (INT-003, INT-007, INT-005, MATCH SIMPLE NULL exemption, INT-006) |
 | iceberg-rust | 0.10.1 | fast append, INT-005, INT-003, INT-007 |
 | Spark + `integrity` CLI (Appendix A demo, `compat/demo_test.py`) | as above | constraints registered via CLI, INT-005, INT-006, compaction (`rewrite_data_files`) certified, restart after kill -9, a write straight to the upstream catalog pinpointed by `verify`, INT-010 until `rebuild` |
 

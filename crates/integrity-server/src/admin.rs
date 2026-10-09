@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::config::{ConstraintConfig, ReferenceConfig};
 use crate::error::ApiError;
-use crate::gateway::{Gateway, Loaded, TablePath};
+use crate::gateway::{Gateway, Loaded, TablePath, actor_of};
 use crate::onboard::{self, Member, ScanOutcome};
 use crate::registry;
 use crate::store::{Anchor, AuditEvent, StoreError};
@@ -146,12 +146,12 @@ impl Gateway {
         }
         let io = Arc::clone(&self.io);
         let configs = configs.to_vec();
-        let outcome =
-            tokio::task::spawn_blocking(move || onboard::scan(io.as_ref(), &configs, &loaded))
-                .await
-                .map_err(|e| {
-                    ApiError::new(ErrorCode::IndexDegraded, format!("scan task failed: {e}"))
-                })??;
+        let redact = self.redact_keys;
+        let outcome = tokio::task::spawn_blocking(move || {
+            onboard::scan(io.as_ref(), &configs, &loaded, redact)
+        })
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, format!("scan task failed: {e}")))??;
         Ok(match outcome {
             ScanOutcome::Clean(indexes) => Ok(Scanned { indexes, anchors }),
             ScanOutcome::Violations(v) => Err(json!({ "violations": v })),
@@ -307,6 +307,7 @@ impl Gateway {
             Ok(s) => s,
             Err(report) => {
                 let mut event = AuditEvent::new("CONSTRAINT_REJECTED", Some(&config.table));
+                event.actor = Some(actor_of(headers));
                 event.constraints = vec![config.id];
                 event.verdict = Some(ErrorCode::OnboardingViolations.code().to_owned());
                 event.detail = Some(report.to_string());
@@ -340,12 +341,14 @@ impl Gateway {
                 };
                 d.set_anchor(ident, anchor);
                 d.degraded.remove(ident);
+                d.disabled.remove(ident);
             }
             Ok::<_, ApiError>(())
         })?;
         self.clear_transient(&members);
         self.reset_domains();
         let mut event = AuditEvent::new("CONSTRAINT_REGISTERED", Some(&config.table));
+        event.actor = Some(actor_of(headers));
         event.constraints = vec![config.id];
         event.detail = Some(format!("onboarded {}", join(&members)));
         self.audit(event);
@@ -382,12 +385,14 @@ impl Gateway {
                     // Re-registering later onboards the table again.
                     d.remove_anchor(&t);
                     d.degraded.remove(&t);
+                    d.disabled.remove(&t);
                 }
             }
             Ok::<_, ApiError>(())
         })?;
         self.reset_domains();
         let mut event = AuditEvent::new("CONSTRAINT_DROPPED", Some(&config.table));
+        event.actor = Some(actor_of(headers));
         event.constraints = vec![id];
         self.audit(event);
         Ok(json!(config))
@@ -415,6 +420,7 @@ impl Gateway {
                     Ok::<_, ApiError>(())
                 })?;
                 let mut event = AuditEvent::new("DOMAIN_DEGRADED", Some(&config.table));
+                event.actor = Some(actor_of(headers));
                 event.verdict = Some(ErrorCode::OnboardingViolations.code().to_owned());
                 event.detail = Some(report.to_string());
                 self.audit(event);
@@ -434,6 +440,7 @@ impl Gateway {
                 };
                 d.set_anchor(ident, anchor);
                 d.degraded.remove(ident);
+                d.disabled.remove(ident);
             }
             Ok::<_, ApiError>(())
         })?;
@@ -451,10 +458,46 @@ impl Gateway {
             })
             .collect();
         let mut event = AuditEvent::new("INDEX_REBUILT", Some(&config.table));
+        event.actor = Some(actor_of(headers));
         event.constraints = scanned.indexes.keys().map(|c| c.0).collect();
         event.detail = Some(Value::Array(relinks.clone()).to_string());
         self.audit(event);
         Ok(json!({ "domain": members, "anchors": relinks }))
+    }
+
+    /// Disables the domain of `table` (spec §19): its commits are forwarded without validation and
+    /// without certificates until an operator rebuilds it. For emergencies, e.g. a degraded domain
+    /// that must accept writes; audited.
+    pub async fn disable(
+        &self,
+        table: &str,
+        reason: &str,
+        headers: &HeaderMap,
+    ) -> Result<Value, ApiError> {
+        let _exclusive = self.admin.write().await;
+        let doc = self.registry.snapshot();
+        if !doc.is_constrained(table) {
+            return Err(ApiError::new(
+                ErrorCode::ConstraintNotFound,
+                format!("{table} has no constraints"),
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(invalid("disabling a domain needs a reason"));
+        }
+        let members = registry::component(&doc.list(), table);
+        self.registry.update(|d| {
+            for m in &members {
+                d.disabled.insert(m.clone(), reason.to_owned());
+            }
+            Ok::<_, ApiError>(())
+        })?;
+        self.reset_domains();
+        let mut event = AuditEvent::new("DOMAIN_DISABLED", Some(table));
+        event.actor = Some(actor_of(headers));
+        event.detail = Some(format!("{reason} (tables: {})", join(&members)));
+        self.audit(event);
+        Ok(json!({ "domain": members, "state": "Disabled", "reason": reason }))
     }
 
     /// `GET /v1/integrity/constraints?table=…`.
@@ -547,6 +590,7 @@ impl Gateway {
     /// structured error of a refused commit (spec §22).
     pub fn transaction(&self, id: u64) -> Option<Value> {
         let t = self.log.summary(TxnId(id))?;
+        let error = self.registry.error_of(id).ok().flatten();
         Some(json!({
             "txn": id,
             "state": format!("{:?}", t.state).to_ascii_uppercase(),
@@ -555,6 +599,7 @@ impl Gateway {
             "request_id": t.prepared.request_id,
             "validated": t.validated,
             "decision": t.decision,
+            "error": error,
         }))
     }
 
@@ -585,7 +630,13 @@ impl Gateway {
                     .count()
             })
             .unwrap_or(usize::MAX);
-        let state = if !reasons.is_empty() {
+        let disabled: BTreeMap<&String, &String> = members
+            .iter()
+            .filter_map(|m| doc.disabled.get(m).map(|r| (m, r)))
+            .collect();
+        let state = if !disabled.is_empty() {
+            "Disabled"
+        } else if !reasons.is_empty() {
             "Degraded"
         } else if unresolved > 0 {
             "RecoveryRequired"
@@ -608,6 +659,7 @@ impl Gateway {
             "tables": members,
             "state": state,
             "reasons": reasons,
+            "disabled": disabled,
             "constraints": ids,
             "anchors": anchors,
             "constraint_set_versions": versions,
@@ -618,14 +670,24 @@ impl Gateway {
     pub fn metrics_text(&self) -> String {
         let doc = self.registry.snapshot();
         let transient = self.transient.lock().map(|t| t.clone()).unwrap_or_default();
+        let disabled = doc
+            .anchors
+            .keys()
+            .filter(|t| doc.disabled.contains_key(*t))
+            .count();
         let degraded = doc
             .anchors
             .keys()
+            .filter(|t| !doc.disabled.contains_key(*t))
             .filter(|t| doc.degraded.contains_key(*t) || transient.contains_key(*t))
             .count();
         let unresolved = self.log.unresolved().map(|u| u.len()).unwrap_or(0);
-        self.metrics
-            .render(doc.anchors.len() - degraded, degraded, unresolved)
+        self.metrics.render(
+            doc.anchors.len() - degraded - disabled,
+            degraded,
+            disabled,
+            unresolved,
+        )
     }
 }
 

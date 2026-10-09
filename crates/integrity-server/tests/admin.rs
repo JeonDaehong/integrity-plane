@@ -31,6 +31,7 @@ struct Env {
     _shared: Shared,
     up: SocketAddr,
     token: Option<String>,
+    redact: bool,
     running: Option<Running>,
 }
 
@@ -44,6 +45,7 @@ async fn start_gateway(
     files: &Files,
     up: SocketAddr,
     token: Option<&str>,
+    redact: bool,
     index_file: &str,
     log_file: &str,
 ) -> (String, Running) {
@@ -77,7 +79,8 @@ async fn start_gateway(
         registry,
     )
     .unwrap()
-    .with_admin_token(token.map(str::to_owned));
+    .with_admin_token(token.map(str::to_owned))
+    .with_redact_keys(redact);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -101,6 +104,10 @@ async fn serve(app: Router) -> SocketAddr {
 }
 
 async fn env(token: Option<&str>) -> Env {
+    env_with(token, false).await
+}
+
+async fn env_with(token: Option<&str>, redact: bool) -> Env {
     let files = Arc::new(Files {
         dir: Dir::new(),
         next: AtomicI64::new(1),
@@ -123,7 +130,8 @@ async fn env(token: Option<&str>) -> Env {
             .with_state(Arc::clone(&shared)),
     )
     .await;
-    let (gateway, running) = start_gateway(&files, up, token, "indexes.redb", "txn.redb").await;
+    let (gateway, running) =
+        start_gateway(&files, up, token, redact, "indexes.redb", "txn.redb").await;
     Env {
         http: reqwest::Client::new(),
         gateway,
@@ -132,6 +140,7 @@ async fn env(token: Option<&str>) -> Env {
         _shared: shared,
         up,
         token: token.map(str::to_owned),
+        redact,
         running: Some(running),
     }
 }
@@ -148,6 +157,7 @@ impl Env {
             &self.files,
             self.up,
             self.token.as_deref(),
+            self.redact,
             index_file,
             log_file,
         )
@@ -339,7 +349,8 @@ async fn violations_in_existing_data_refuse_registration() {
     assert_eq!((status, code(&body).as_str()), (400, "INT-013"), "{body}");
     assert_eq!(
         body["integrity"]["violations"],
-        json!([{"table": "db.customer", "constraint": 1, "name": "pk_customer", "code": "INT-003"}])
+        json!([{"table": "db.customer", "constraint": "pk_customer", "constraint_id": 1,
+                "code": "INT-003", "violation_count": 1, "sample_keys": [{"id": 1}]}])
     );
     let (_, listed) = e.api("GET", "constraints", None).await;
     assert_eq!(listed["constraints"], json!([]), "nothing registered");
@@ -694,6 +705,10 @@ async fn transactions_domains_and_metrics() {
         text.contains("integrity_keys_validated_total 2\n"),
         "{text}"
     );
+    assert!(
+        text.contains("integrity_index_probe_seconds_count 2\n"),
+        "{text}"
+    );
     let bytes: u64 = text
         .lines()
         .find_map(|l| l.strip_prefix("integrity_bytes_read_total "))
@@ -768,4 +783,176 @@ async fn a_lost_transaction_log_is_refused_until_rebuilt() {
     assert_eq!((status, code(&body).as_str()), (423, "INT-010"), "{body}");
     assert_eq!(e.api("POST", "indexes/1/rebuild", None).await.0, 200);
     assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+}
+
+fn txn_of_rejection(body: &Value) -> u64 {
+    body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Spec §22/§24: a rejected commit names the violation count and its transaction in the Iceberg
+/// error message; the structured error with sample keys is served by the integrity API.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_commits_have_a_structured_error() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    let rows: Vec<Row> = (0..12).map(|i| (100 + i, Some(900 + i % 11))).collect();
+    let (status, body) = e.through_plane("orders", &rows).await;
+    assert_eq!(status, 400);
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("INT-005 FOREIGN_KEY_VIOLATION: commit rejected: INT-005 on fk_orders_customer (11 keys); details: GET /v1/integrity/transactions/"),
+        "{message}"
+    );
+    assert!(
+        body.get("integrity").is_none(),
+        "no key values in the Iceberg error body"
+    );
+    let (_, txn) = e
+        .api(
+            "GET",
+            &format!("transactions/{}", txn_of_rejection(&body)),
+            None,
+        )
+        .await;
+    let error = &txn["error"];
+    assert_eq!(error["code"], "INT-005");
+    assert_eq!(error["transaction_id"], txn["txn"]);
+    let v = &error["violations"][0];
+    assert_eq!(v["constraint"], "fk_orders_customer");
+    assert_eq!(v["table"], "db.orders");
+    assert_eq!(v["violation_count"], 11);
+    let samples = v["sample_keys"].as_array().unwrap();
+    assert_eq!(samples.len(), 10);
+    assert_eq!(samples[0], json!({"ref": 900}));
+
+    // Duplicates and the parent side of a referenced delete.
+    let (_, body) = e
+        .through_plane("customer", &[(1, None), (2, None), (2, None)])
+        .await;
+    let (_, txn) = e
+        .api(
+            "GET",
+            &format!("transactions/{}", txn_of_rejection(&body)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        txn["error"]["violations"][0]["sample_keys"],
+        json!([{"id": 2}, {"id": 1}])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redacted_reports_keep_counts_but_no_key_values() {
+    let e = env_with(None, true).await;
+    e.register_demo().await;
+    let (status, body) = e
+        .through_plane("orders", &[(1, Some(7)), (2, Some(8))])
+        .await;
+    assert_eq!(status, 400);
+    let (_, txn) = e
+        .api(
+            "GET",
+            &format!("transactions/{}", txn_of_rejection(&body)),
+            None,
+        )
+        .await;
+    let v = &txn["error"]["violations"][0];
+    assert_eq!(v["violation_count"], 2);
+    assert_eq!(v["sample_keys_redacted"], true);
+    assert!(v.get("sample_keys").is_none());
+    let (_, audit) = e.api("GET", "audit", None).await;
+    assert!(
+        !audit.to_string().contains("\"ref\""),
+        "no key values stored: {audit}"
+    );
+}
+
+/// Spec §19: an operator can disable a domain (e.g. a degraded one that must accept writes);
+/// its commits are then forwarded unchecked and uncertified, audited, until a rebuild.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disabled_domain_forwards_unchecked_until_rebuilt() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    let (status, _) = e
+        .api("POST", "domains/db.orders/disable", Some(json!({})))
+        .await;
+    assert_eq!(status, 400, "a reason is required");
+    let (status, body) = e
+        .api(
+            "POST",
+            "domains/db.orders/disable",
+            Some(json!({"reason": "incident 42"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["domain"], json!(["db.customer", "db.orders"]));
+
+    // Violations go through, without certificates.
+    let (status, body) = e.through_plane("orders", &[(10, Some(999))]).await;
+    assert_eq!(status, 200, "{body}");
+    let snaps = body["metadata"]["snapshots"].as_array().unwrap();
+    assert!(snaps.last().unwrap()["summary"]["integrity.cert"].is_null());
+    let (_, domain) = e.api("GET", "domains/db.orders", None).await;
+    assert_eq!(domain["state"], "Disabled");
+    let kinds = e.audit_kinds().await;
+    assert!(kinds.contains(&"DOMAIN_DISABLED".to_owned()));
+    assert!(kinds.contains(&"COMMIT_UNCHECKED".to_owned()));
+
+    // Rebuilding validates what was written meanwhile: the orphan keeps it degraded...
+    let (status, body) = e.api("POST", "indexes/1/rebuild", None).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-013"), "{body}");
+    let (_, domain) = e.api("GET", "domains/db.orders", None).await;
+    assert_eq!(
+        domain["state"], "Disabled",
+        "still disabled, nothing re-enabled"
+    );
+    // ... until the data is fixed.
+    assert_eq!(e.bypassing("customer", &[(999, None)]).await.0, 200);
+    assert_eq!(e.api("POST", "indexes/1/rebuild", None).await.0, 200);
+    let (_, domain) = e.api("GET", "domains/db.orders", None).await;
+    assert_eq!(domain["state"], "Healthy");
+    let (status, body) = e.through_plane("orders", &[(11, Some(5))]).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (400, "INT-005"),
+        "enforced again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_events_name_their_actor() {
+    let e = env(None).await;
+    let r = e
+        .http
+        .post(format!("{}/v1/integrity/constraints", e.gateway))
+        .header("x-integrity-actor", "alice")
+        .json(&json!({"table": "db.customer", "name": "pk", "type": "PRIMARY_KEY", "columns": ["id"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    let (_, audit) = e.api("GET", "audit", None).await;
+    let actor = |kind: &str| {
+        audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ev| ev["kind"] == kind)
+            .unwrap()["actor"]
+            .clone()
+    };
+    assert_eq!(actor("CONSTRAINT_REGISTERED"), "alice");
+    // Without the header, the client's User-Agent (reqwest sends none by default: "unknown").
+    assert!(actor("COMMIT_ACCEPTED").is_string());
 }

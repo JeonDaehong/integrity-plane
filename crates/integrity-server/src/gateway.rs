@@ -35,6 +35,7 @@ use crate::error::ApiError;
 use crate::metrics::Metrics;
 use crate::pipeline::{self, Job, Outcome};
 use crate::registry;
+use crate::report;
 use crate::store::{Anchor, AuditEvent, Registry, RegistryDoc, StoreError};
 
 /// A table commit route.
@@ -265,6 +266,8 @@ pub struct Gateway {
     pub(crate) base: String,
     /// Bearer token required by the integrity API, if any.
     pub(crate) admin_token: Option<String>,
+    /// Leave key values out of violation reports.
+    pub(crate) redact_keys: bool,
     /// Held shared by every commit request, exclusively by constraint changes and rebuilds
     /// (ADR 0011).
     pub(crate) admin: tokio::sync::RwLock<()>,
@@ -304,6 +307,7 @@ impl Gateway {
             registry,
             base: "/v1".to_owned(),
             admin_token: None,
+            redact_keys: false,
             admin: tokio::sync::RwLock::new(()),
             domains: std::sync::Mutex::new(BTreeMap::new()),
             transient: std::sync::Mutex::new(BTreeMap::new()),
@@ -376,8 +380,17 @@ impl Gateway {
         self
     }
 
+    /// Leaves sample key values out of violation reports (`errors.redact_keys`).
+    pub fn with_redact_keys(mut self, redact: bool) -> Self {
+        self.redact_keys = redact;
+        self
+    }
+
     /// Appends an audit event; a failure is logged, never turned into a decision.
-    pub(crate) fn audit(&self, event: AuditEvent) {
+    pub(crate) fn audit(&self, mut event: AuditEvent) {
+        if event.actor.is_none() {
+            event.actor = Some("plane".to_owned());
+        }
         if let Err(e) = self.registry.audit(event) {
             tracing::warn!("audit write failed: {e}");
         }
@@ -437,10 +450,19 @@ impl Gateway {
             Route::Commit(table) => {
                 // Constraints cannot change between this check and the response (ADR 0011).
                 let _shared = self.admin.read().await;
-                if self.registry.snapshot().is_constrained(&table.identifier()) {
-                    self.commit(&table, path_and_query, headers, body).await
-                } else {
+                let doc = self.registry.snapshot();
+                let identifier = table.identifier();
+                if !doc.is_constrained(&identifier) {
                     self.proxy(method, path_and_query, &headers, body).await
+                } else if let Some(reason) = disabled_reason(&doc, &identifier) {
+                    // An operator disabled the domain (spec §19): forwarded unchecked.
+                    let mut event = AuditEvent::new("COMMIT_UNCHECKED", Some(&identifier));
+                    event.actor = Some(actor_of(&headers));
+                    event.detail = Some(format!("domain disabled: {reason}"));
+                    self.audit(event);
+                    self.proxy(method, path_and_query, &headers, body).await
+                } else {
+                    self.commit(&table, path_and_query, headers, body).await
                 }
             }
             Route::Proxy => self.proxy(method, path_and_query, &headers, body).await,
@@ -499,6 +521,7 @@ impl Gateway {
             "unresolved_transactions": self.log.unresolved().map(|u| u.len()).ok(),
             "bound_tables": bound,
             "constraint_set_versions": doc.versions,
+            "disabled": if doc.disabled.is_empty() { Value::Null } else { serde_json::json!(doc.disabled) },
         })
     }
 
@@ -856,6 +879,7 @@ impl Gateway {
 
         // Load and bind every table of the integrity domain; check each one's chain head.
         let mut bindings = BTreeMap::new();
+        let mut names = report::ColumnNames::new();
         let mut target_meta = None;
         for ident in members.iter().cloned() {
             let path = if ident == identifier {
@@ -881,6 +905,7 @@ impl Gateway {
                 }
             };
             let binding = registry::bind(&constraints, &ident, &meta)?;
+            report::add_names(&mut names, &ident, &meta);
             self.check_chain_head(&mut doc, &ident, &meta)?;
             bindings.insert(ident.clone(), binding);
             if ident == identifier {
@@ -920,7 +945,11 @@ impl Gateway {
             .map_err(log_error)?;
         fault::hit(FaultPoint::AfterPreparedLog);
         let base_snapshot = change.parent.map(|s| s.0);
-        let abort = |e: ApiError, state: TxnState| -> ApiError {
+        let actor = actor_of(&headers);
+        let abort = |mut e: ApiError, state: TxnState| -> ApiError {
+            // The structured report goes to the audit log (`/v1/integrity/transactions/{id}`), not
+            // into the Iceberg error body (RFC 0003).
+            let report = e.report.take();
             if self.log.finish(txn, state, error_decision(&e)).is_err() {
                 return ApiError::new(ErrorCode::IndexDegraded, "transaction log write failed");
             }
@@ -930,10 +959,19 @@ impl Gateway {
                 "COMMIT_ABORTED"
             };
             let mut event = AuditEvent::new(kind, Some(&identifier));
+            event.actor = Some(actor.clone());
             event.txn = Some(txn.0);
             event.base_snapshot = base_snapshot;
             event.verdict = Some(e.code.code().to_owned());
             event.detail = Some(e.message.clone());
+            event.error = report.map(|r| {
+                serde_json::json!({
+                    "code": e.code.code(),
+                    "message": e.message,
+                    "transaction_id": txn.0,
+                    "violations": r["violations"],
+                })
+            });
             self.audit(event);
             e
         };
@@ -1035,13 +1073,29 @@ impl Gateway {
         self.metrics
             .keys_validated
             .fetch_add(stats.rows.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.metrics
+            .index_probe
+            .observe(std::time::Duration::from_nanos(
+                stats.probe_nanos.load(Ordering::Relaxed),
+            ));
         let outcome = outcome.map_err(|e| abort(e, TxnState::Aborted))?;
         let (plans, staged) = match outcome {
-            Outcome::Rejected(violations) => {
-                return Err(abort(
-                    violation_error(&violations, &constraints),
-                    TxnState::Rejected,
-                ));
+            Outcome::Rejected(details) => {
+                let entries = report::violations(&details, &constraints, &names, self.redact_keys);
+                let code = details
+                    .keys()
+                    .min_by_key(|v| (v.code.number(), v.constraint))
+                    .map_or(ErrorCode::UnsupportedCommitOperation, |v| v.code);
+                let e = ApiError::new(
+                    code,
+                    format!(
+                        "commit rejected: {}; details: GET /v1/integrity/transactions/{}",
+                        report::summary(&entries),
+                        txn.0
+                    ),
+                )
+                .with_report(serde_json::json!({ "violations": entries }));
+                return Err(abort(e, TxnState::Rejected));
             }
             Outcome::Accepted { plans, staged } => (plans, staged),
         };
@@ -1123,6 +1177,7 @@ impl Gateway {
                     .finish(txn, TxnState::Committed, c.decision())
                     .map_err(log_error)?;
                 let mut event = AuditEvent::new("COMMIT_ACCEPTED", Some(&identifier));
+                event.actor = Some(actor.clone());
                 event.txn = Some(txn.0);
                 event.base_snapshot = base_snapshot;
                 event.result_snapshot = Some(final_snapshot);
@@ -1137,6 +1192,7 @@ impl Gateway {
                     .finish(txn, TxnState::Aborted, c.decision())
                     .map_err(log_error)?;
                 let mut event = AuditEvent::new("COMMIT_ABORTED", Some(&identifier));
+                event.actor = Some(actor.clone());
                 event.txn = Some(txn.0);
                 event.base_snapshot = base_snapshot;
                 event.verdict = Some(format!("upstream {}", c.status));
@@ -1161,6 +1217,31 @@ impl Gateway {
     }
 }
 
+/// Who a request says it comes from: `X-Integrity-Actor`, else `User-Agent`. Not authenticated.
+pub(crate) fn actor_of(headers: &HeaderMap) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.chars().take(200).collect::<String>())
+    };
+    header("x-integrity-actor")
+        .or_else(|| header("user-agent"))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// The reason the domain of `identifier` is disabled, if it is.
+pub(crate) fn disabled_reason(doc: &RegistryDoc, identifier: &str) -> Option<String> {
+    if doc.disabled.is_empty() {
+        return None;
+    }
+    registry::component(&doc.list(), identifier)
+        .iter()
+        .find_map(|m| doc.disabled.get(m).cloned())
+}
+
 /// Whether `code` is a constraint verdict (as opposed to a refusal for another reason).
 fn is_violation(code: ErrorCode) -> bool {
     matches!(
@@ -1176,27 +1257,6 @@ fn is_violation(code: ErrorCode) -> bool {
 
 fn rejection(r: Rejection) -> ApiError {
     ApiError::new(r.code(), r.to_string())
-}
-
-fn violation_error(
-    violations: &std::collections::BTreeSet<integrity_core::Violation>,
-    configs: &[ConstraintConfig],
-) -> ApiError {
-    let name = |id: ConstraintId| {
-        configs
-            .iter()
-            .find(|c| c.id == id.0)
-            .map_or_else(|| id.to_string(), |c| c.name.clone())
-    };
-    let first = violations
-        .iter()
-        .min_by_key(|v| (v.code.number(), v.constraint));
-    let code = first.map_or(ErrorCode::UnsupportedCommitOperation, |v| v.code);
-    let details: Vec<String> = violations
-        .iter()
-        .map(|v| format!("{} on {}", v.code.code(), name(v.constraint)))
-        .collect();
-    ApiError::new(code, format!("commit rejected: {}", details.join(", ")))
 }
 
 #[cfg(test)]

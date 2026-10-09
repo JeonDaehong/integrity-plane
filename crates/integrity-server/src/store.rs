@@ -47,6 +47,10 @@ pub struct RegistryDoc {
     /// Tables whose domain is degraded until rebuilt, with the reason (spec §19).
     #[serde(default)]
     pub degraded: BTreeMap<String, String>,
+    /// Tables whose domain an operator disabled (spec §19): commits pass through unchecked and
+    /// uncertified until the domain is rebuilt. Value: the reason given.
+    #[serde(default)]
+    pub disabled: BTreeMap<String, String>,
     /// Identity of the index store the anchors were built with: a different one means the index
     /// file was lost and recreated empty.
     #[serde(default)]
@@ -156,6 +160,10 @@ pub struct AuditEvent {
     pub at_ms: u64,
     /// `CONSTRAINT_REGISTERED`, `COMMIT_ACCEPTED`, …
     pub kind: String,
+    /// Who caused the event, as the request stated it (`X-Integrity-Actor`, else the client's
+    /// `User-Agent`); `plane` for the Plane's own actions. Not authenticated.
+    #[serde(default)]
+    pub actor: Option<String>,
     /// Table identifier.
     pub table: Option<String>,
     /// Transaction id.
@@ -173,6 +181,9 @@ pub struct AuditEvent {
     pub certificate: Option<String>,
     /// Free-form detail.
     pub detail: Option<String>,
+    /// Structured error of a refused commit (spec §24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
 }
 
 impl AuditEvent {
@@ -182,6 +193,7 @@ impl AuditEvent {
             seq: 0,
             at_ms: 0,
             kind: kind.to_owned(),
+            actor: None,
             table: table.map(str::to_owned),
             txn: None,
             constraints: Vec::new(),
@@ -190,6 +202,7 @@ impl AuditEvent {
             verdict: None,
             certificate: None,
             detail: None,
+            error: None,
         }
     }
 }
@@ -345,6 +358,16 @@ impl Registry {
             .iter()
             .filter_map(|e| e.txn)
             .max())
+    }
+
+    /// The structured error recorded for transaction `txn`, if it was refused with one.
+    pub fn error_of(&self, txn: u64) -> Result<Option<serde_json::Value>, StoreError> {
+        Ok(self
+            .audit_since(None, 0)?
+            .into_iter()
+            .rev()
+            .find(|e| e.txn == Some(txn) && e.error.is_some())
+            .and_then(|e| e.error))
     }
 
     /// Audit events from `since` (sequence number), optionally for one table.

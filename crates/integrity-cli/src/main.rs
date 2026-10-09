@@ -2,7 +2,7 @@
 //!
 //! A thin client of the gateway's integrity API. The gateway URL comes from `--url` or
 //! `INTEGRITY_URL` (default `http://127.0.0.1:8181`), the API token from `--token` or
-//! `INTEGRITY_TOKEN`.
+//! `INTEGRITY_TOKEN`. Audit events name `--actor` (default: `$USER` or `$USERNAME`).
 //!
 //! Exit codes: 0 success, 1 the request failed or `verify` found a broken chain, 2 usage error.
 
@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 
 const USAGE: &str = "\
-usage: integrity [--url URL] [--token TOKEN] [--json] <command>
+usage: integrity [--url URL] [--token TOKEN] [--actor NAME] [--json] <command>
 
 commands:
   status
@@ -23,6 +23,7 @@ commands:
   verify NS.TABLE            exit 1 if the certificate chain is broken
   rebuild CONSTRAINT_ID      rebuild the indexes of the constraint's domain
   domain NS.TABLE
+  domain disable NS.TABLE --reason TEXT   forward the domain's commits unchecked until a rebuild
   txn ID
   audit [--table NS.TABLE] [--since SEQ]
 ";
@@ -42,6 +43,7 @@ struct Call {
 struct Invocation {
     url: Option<String>,
     token: Option<String>,
+    actor: Option<String>,
     json: bool,
     call: Call,
 }
@@ -111,6 +113,7 @@ fn query(pairs: &[(&str, Option<&str>)]) -> String {
 fn parse(args: &[String]) -> Result<Invocation, String> {
     let mut url = None;
     let mut token = None;
+    let mut actor = None;
     let mut json_out = false;
     let mut i = 0;
     while i < args.len() {
@@ -121,6 +124,10 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
             }
             "--token" => {
                 token = Some(args.get(i + 1).ok_or("--token needs a value")?.clone());
+                i += 2;
+            }
+            "--actor" => {
+                actor = Some(args.get(i + 1).ok_or("--actor needs a value")?.clone());
                 i += 2;
             }
             "--json" => {
@@ -208,6 +215,17 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
             body: None,
             verify: false,
         },
+        ["domain", "disable", table, ..] => {
+            let f = flags(&rest[3..])?;
+            only(&f, &["reason"])?;
+            let reason = flag(&f, "reason").ok_or("--reason is required")?;
+            Call {
+                method: "POST",
+                path: format!("/v1/integrity/domains/{}/disable", encode(table)),
+                body: Some(json!({ "reason": reason })),
+                verify: false,
+            }
+        }
         ["domain", table] => get(format!("/v1/integrity/domains/{}", encode(table))),
         ["txn", id] => get(format!("/v1/integrity/transactions/{}", number(id)?)),
         ["audit", ..] => {
@@ -227,6 +245,7 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
     Ok(Invocation {
         url,
         token,
+        actor,
         json: json_out,
         call,
     })
@@ -284,6 +303,14 @@ fn run(inv: &Invocation) -> Result<bool, String> {
     };
     if let Some(t) = token {
         req = req.bearer_auth(t);
+    }
+    let actor = inv
+        .actor
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok());
+    if let Some(a) = actor {
+        req = req.header("x-integrity-actor", a);
     }
     if let Some(body) = &inv.call.body {
         req = req.json(body);
@@ -387,6 +414,12 @@ mod tests {
             p("domain db.orders").unwrap().call.path,
             "/v1/integrity/domains/db.orders"
         );
+        let disable = p("--actor bob domain disable db.orders --reason incident").unwrap();
+        assert_eq!(disable.actor.as_deref(), Some("bob"));
+        assert_eq!(disable.call.method, "POST");
+        assert_eq!(disable.call.path, "/v1/integrity/domains/db.orders/disable");
+        assert_eq!(disable.call.body.unwrap(), json!({"reason": "incident"}));
+        assert!(p("domain disable db.orders").is_err(), "reason required");
         assert_eq!(
             p("txn 12").unwrap().call.path,
             "/v1/integrity/transactions/12"

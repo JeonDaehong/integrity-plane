@@ -49,6 +49,8 @@ pub struct Metrics {
     pub validation: Timer,
     /// Time spent waiting for a domain's queue.
     pub queue_wait: Timer,
+    /// Time spent in index lookups, per commit.
+    pub index_probe: Timer,
     /// Bytes read from storage to validate commits.
     pub bytes_read: AtomicU64,
     /// Rows whose keys were extracted and validated.
@@ -86,7 +88,13 @@ fn histogram(out: &mut String, name: &str, help: &str, t: &Timer) {
 
 impl Metrics {
     /// The exposition text. `healthy` and `degraded` count tables with an anchor.
-    pub fn render(&self, healthy: usize, degraded: usize, unresolved: usize) -> String {
+    pub fn render(
+        &self,
+        healthy: usize,
+        degraded: usize,
+        disabled: usize,
+        unresolved: usize,
+    ) -> String {
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut out = String::new();
         counter(
@@ -110,6 +118,12 @@ impl Metrics {
             "integrity_domain_queue_wait_seconds",
             "Time commits waited for their domain's queue.",
             &self.queue_wait,
+        );
+        histogram(
+            &mut out,
+            "integrity_index_probe_seconds",
+            "Time spent looking up keys in the persistent indexes, per commit.",
+            &self.index_probe,
         );
         counter(
             &mut out,
@@ -150,6 +164,10 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "integrity_domain_state{{state=\"disabled\"}} {disabled}"
+        );
+        let _ = writeln!(
+            out,
             "# HELP integrity_unresolved_transactions Transactions waiting for recovery."
         );
         let _ = writeln!(out, "# TYPE integrity_unresolved_transactions gauge");
@@ -169,7 +187,9 @@ mod tests {
         m.validation.observe(Duration::from_millis(1500));
         m.validation.observe(Duration::from_micros(300));
         m.validation.observe(Duration::from_secs(60));
-        let text = m.render(3, 1, 0);
+        m.index_probe.observe(Duration::from_millis(3));
+        let text = m.render(3, 1, 0, 0);
+        assert!(text.contains("integrity_index_probe_seconds_bucket{le=\"0.005\"} 1\n"));
         assert!(text.contains("integrity_commits_total{verdict=\"accepted\"} 2\n"));
         assert!(text.contains("integrity_validation_seconds_sum 61.5003\n"));
         assert!(text.contains("integrity_validation_seconds_count 3\n"));

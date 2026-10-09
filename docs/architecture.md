@@ -133,7 +133,13 @@ validation in the differential tests), and the parent's certificate. Each snapsh
 `UNVERIFIABLE` (equality deletes; expired history). A broken chain degrades the domain like a
 bypass detected at commit time.
 
-Also served: `GET /v1/integrity/transactions/{id}` (the log's records and decision),
+Rejected commits carry, in the same validation pass, a count and up to ten sample keys per violated
+constraint; the structured error is stored with the audit event and served with the transaction
+(ADR 0016). An operator can disable a domain (`POST /v1/integrity/domains/{table}/disable`): its
+commits are then forwarded unchecked and uncertified until a rebuild. Configuration comes from TOML
+with `INTEGRITY__SECTION__KEY` environment overrides.
+
+Also served: `GET /v1/integrity/transactions/{id}` (the log's records, decision and structured error),
 `GET /v1/integrity/domains/{table}` (`Healthy`, `Degraded` with reasons, or `RecoveryRequired`),
 `GET /v1/integrity/audit?table=&since=`, and Prometheus text at `/metrics` (commit verdicts,
 validation and queue wait time, recovery outcomes, bypasses, domain states). Metrics carry no table

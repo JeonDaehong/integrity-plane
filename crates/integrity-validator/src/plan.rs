@@ -4,23 +4,41 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use integrity_core::{
-    CommitRows, ConstraintKind, Datum, KeyDelta, KeyDisposition, KeyError, KeyMultiset, KeySpec,
-    KeyValue, RowBatch, Violation, classify,
+    CommitRows, ConstraintKind, Datum, EncodedKey, KeyDelta, KeyDisposition, KeyError, KeyMultiset,
+    KeySpec, KeyValue, RowBatch, Violation, classify,
 };
 use integrity_types::{ConstraintId, ErrorCode, FieldId};
 
-use crate::{Inconsistency, ResolvedConstraint, ValidationError};
+use crate::{Inconsistency, ResolvedConstraint, ValidationError, ViolationDetail};
 
-/// Key deltas and index-free violations for one commit.
+/// Key deltas and violations for one commit (index-free ones from [`Plan::build`], the others
+/// added by the validator).
 #[derive(Debug, Default)]
 pub(crate) struct Plan {
     /// Per PK/UNIQUE/FK-child constraint on the committed table.
     pub deltas: BTreeMap<ConstraintId, KeyDelta>,
-    /// Violations decided without any index.
+    /// Every violated `(constraint, code)`.
     pub violations: BTreeSet<Violation>,
+    /// What violates each of them.
+    pub details: BTreeMap<Violation, ViolationDetail>,
 }
 
 impl Plan {
+    /// Records that `key` violates `(constraint, code)`.
+    pub fn record_key(&mut self, constraint: ConstraintId, code: ErrorCode, key: &EncodedKey) {
+        let v = Violation { constraint, code };
+        self.violations.insert(v);
+        self.details.entry(v).or_default().add_key(key);
+    }
+
+    /// Records a row that violates `(constraint, code)` without forming a key (NULLs), with the
+    /// key tuple if there is one.
+    pub fn record_row(&mut self, constraint: ConstraintId, code: ErrorCode, tuple: Option<Tuple>) {
+        let v = Violation { constraint, code };
+        self.violations.insert(v);
+        self.details.entry(v).or_default().add_row(tuple);
+    }
+
     /// Builds the plan from the constraints on the committed table.
     pub fn build<'a>(
         commit: &CommitRows,
@@ -31,10 +49,12 @@ impl Plan {
             let c = &rc.constraint;
             match &c.kind {
                 ConstraintKind::NotNull(field) => {
-                    let col = column(&commit.added, *field)?;
-                    if col.is_some_and(|i| commit.added.rows().iter().any(|r| r[i] == Datum::Null))
-                    {
-                        plan.flag(c.id, ErrorCode::NotNullViolation);
+                    if let Some(i) = column(&commit.added, *field)? {
+                        for row in commit.added.rows() {
+                            if row[i] == Datum::Null {
+                                plan.record_row(c.id, ErrorCode::NotNullViolation, None);
+                            }
+                        }
                     }
                 }
                 ConstraintKind::PrimaryKey(key)
@@ -49,20 +69,18 @@ impl Plan {
                         _ => None,
                     };
                     // Spec §8: multiplicities of added keys, before any index probe.
-                    if let Some(code) = duplicate
-                        && delta.added.duplicates().next().is_some()
-                    {
-                        plan.flag(c.id, code);
+                    if let Some(code) = duplicate {
+                        let dups: Vec<EncodedKey> =
+                            delta.added.duplicates().map(|(k, _)| k.clone()).collect();
+                        for k in &dups {
+                            plan.record_key(c.id, code, k);
+                        }
                     }
                     plan.deltas.insert(c.id, delta);
                 }
             }
         }
         Ok(plan)
-    }
-
-    fn flag(&mut self, constraint: ConstraintId, code: ErrorCode) {
-        self.violations.insert(Violation { constraint, code });
     }
 
     fn key_delta(
@@ -82,7 +100,7 @@ impl Plan {
             match classify(role, schema, &tuple).map_err(|e| malformed(e, key))? {
                 KeyDisposition::Key(k) => added.insert(k).map_err(ValidationError::Delta)?,
                 KeyDisposition::Exempt => {}
-                KeyDisposition::Violation(code) => self.flag(c.id, code),
+                KeyDisposition::Violation(code) => self.record_row(c.id, code, Some(tuple)),
             }
         }
 
@@ -115,7 +133,7 @@ fn column(batch: &RowBatch, field: FieldId) -> Result<Option<usize>, ValidationE
         .ok_or(ValidationError::MissingColumn(field))
 }
 
-type Tuple = Vec<Option<KeyValue>>;
+pub(crate) type Tuple = Vec<Option<KeyValue>>;
 
 /// The key tuple of every row in `batch`.
 fn tuples<'b>(

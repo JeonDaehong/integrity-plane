@@ -70,7 +70,10 @@ Registering, dropping and rebuilding constraints change what is enforced; `verif
 are expensive. Set `[server] admin_token` so `/v1/integrity/*` (except `status`) requires
 `Authorization: Bearer <token>`, and keep the API off untrusted networks either way. Without a
 token the API is open to anyone who can reach the gateway. The token is compared by digest; it is
-not rate-limited, and there is no per-operator identity in the audit log yet.
+not rate-limited. Audit events name an actor, but it is whatever the request declares
+(`X-Integrity-Actor` or `User-Agent`): useful for attribution among cooperating operators, not
+evidence. Disabling a domain (spec §19) switches enforcement off for it until a rebuild; it is a
+privileged, audited action and must be restricted like the rest of the API.
 
 ### Control-store damage or loss
 
@@ -96,8 +99,11 @@ the mitigation; until then a certificate proves consistency of the chain, not wh
 
 Primary and foreign keys can be personal data (emails, national ids).
 
-- Error responses, violation reports, audit events, metrics and log messages name constraints,
-  tables, snapshot ids and integrity codes, never key values. Metrics carry no table names.
+- Commit error responses, metrics and log messages name constraints, tables, snapshot ids and
+  integrity codes, never key values. Metrics carry no table names.
+- Structured violation reports (`/v1/integrity/transactions/{id}`, onboarding and rebuild reports)
+  include up to ten sample keys per violated constraint, and they are kept in the audit log. Set
+  `errors.redact_keys = true` to keep key values out of reports and storage entirely (ADR 0016).
 - Key values are stored in the persistent indexes (encoded, not encrypted) and in the transaction
   log (staged index deltas). Protect the control-store directory like the tables themselves, and
   include it in data-deletion procedures: deleting a row from a table removes its key from the

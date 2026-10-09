@@ -32,7 +32,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_toml(&std::fs::read_to_string(path)?)?;
+    let config = Config::from_toml_with_env(&std::fs::read_to_string(path)?, std::env::vars())?;
     std::fs::create_dir_all(&config.control_store.path)?;
     let store = PersistentStore::open(config.control_store.path.join("indexes.redb"))?;
     let log = TxnLog::open(config.control_store.path.join("txn.redb"))?;
@@ -54,7 +54,8 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         registry,
     )?
     .with_prefix(config.upstream.prefix.as_deref())
-    .with_admin_token(config.server.admin_token.clone());
+    .with_admin_token(config.server.admin_token.clone())
+    .with_redact_keys(config.errors.redact_keys);
     if let Err(e) = gateway.recover_on_start().await {
         tracing::warn!("recovery pending until upstream answers: {e}");
     }

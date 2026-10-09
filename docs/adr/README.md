@@ -20,6 +20,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0013](0013-indexes-are-derived-state.md) | Indexes are derived state | Accepted |
 | [0014](0014-counts-instead-of-locators.md) | Indexes store keys and counts, not row locations | Accepted |
 | [0015](0015-serial-domain-queues.md) | One serial commit queue per integrity domain | Accepted |
+| [0016](0016-violation-reports-disabled-domains-actors.md) | Violation reports, disabled domains and audit actors | Accepted |
 
 The decisions spec §31 requires for 0.1 are all recorded: Iceberg first (0012), proxy gateway (0010),
 indexes as derived state (0013), counts instead of locators (0014), serial domain queues (0015) and

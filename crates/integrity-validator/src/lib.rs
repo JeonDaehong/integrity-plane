@@ -76,6 +76,50 @@ impl<I: KeyIndex> IndexSet for BTreeMap<ConstraintId, I> {
     }
 }
 
+/// What violates one `(constraint, code)` in a rejected commit: how many offending keys (or rows,
+/// for NULL violations) and up to [`SAMPLE_LIMIT`] of them. Key values can be personal data;
+/// callers decide whether to expose them (spec §24).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViolationDetail {
+    keys: BTreeSet<EncodedKey>,
+    rows: u64,
+    samples: Vec<Vec<Option<KeyValue>>>,
+}
+
+/// Maximum number of sample keys kept per violation (spec §24).
+pub const SAMPLE_LIMIT: usize = 10;
+
+impl ViolationDetail {
+    fn add_key(&mut self, key: &EncodedKey) {
+        if self.keys.insert(key.clone())
+            && self.samples.len() < SAMPLE_LIMIT
+            && let Ok((_, tuple)) = key.decode()
+        {
+            self.samples.push(tuple);
+        }
+    }
+
+    fn add_row(&mut self, tuple: Option<Vec<Option<KeyValue>>>) {
+        self.rows += 1;
+        if let Some(t) = tuple
+            && self.samples.len() < SAMPLE_LIMIT
+        {
+            self.samples.push(t);
+        }
+    }
+
+    /// Distinct offending keys plus offending rows that form no key.
+    pub fn count(&self) -> u64 {
+        self.keys.len() as u64 + self.rows
+    }
+
+    /// Up to [`SAMPLE_LIMIT`] offending key tuples, in key-column order (`None` = NULL). Empty for
+    /// NOT NULL, whose offending rows have no key.
+    pub fn samples(&self) -> &[Vec<Option<KeyValue>>] {
+        &self.samples
+    }
+}
+
 /// The outcome of validating a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -282,6 +326,16 @@ impl Validator {
         commit: &CommitRows,
         indexes: &impl IndexSet,
     ) -> Result<Decision, ValidationError> {
+        self.validate_with_details(commit, indexes).map(|(d, _)| d)
+    }
+
+    /// [`Validator::validate`], also returning what violates each violated constraint (empty when
+    /// accepted). The details have exactly the decision's violations as keys.
+    pub fn validate_with_details(
+        &self,
+        commit: &CommitRows,
+        indexes: &impl IndexSet,
+    ) -> Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
         let table = &commit.table;
         let own: Vec<&ResolvedConstraint> = self.on_table(table).collect();
         // Enforced FKs whose parent key lives on this table.
@@ -352,15 +406,10 @@ impl Validator {
                     }
                     let keys: Vec<EncodedKey> = net.iter().map(|(k, _)| k.clone()).collect();
                     let found = probe(indexes, id, &keys)?;
-                    for ((_, change), value) in net.iter().zip(found) {
+                    for ((key, change), value) in net.iter().zip(found) {
                         match (change > 0, value) {
                             // Count rises and the key is already present: duplicate.
-                            (true, Some(_)) => {
-                                plan.violations.insert(Violation {
-                                    constraint: id,
-                                    code: duplicate,
-                                });
-                            }
+                            (true, Some(_)) => plan.record_key(id, duplicate, key),
                             // Count falls but the key was never indexed.
                             (false, None) => {
                                 return Err(ValidationError::Inconsistent(
@@ -376,11 +425,10 @@ impl Validator {
                     // referenced had a parent before, and the parent table is not written.
                     let keys: Vec<EncodedKey> = net.increases().map(|(k, _)| k.clone()).collect();
                     let found = probe(indexes, fk.parent_constraint, &keys)?;
-                    if found.iter().any(Option::is_none) {
-                        plan.violations.insert(Violation {
-                            constraint: id,
-                            code: ErrorCode::ForeignKeyViolation,
-                        });
+                    for (key, value) in keys.iter().zip(found) {
+                        if value.is_none() {
+                            plan.record_key(id, ErrorCode::ForeignKeyViolation, key);
+                        }
                     }
                 }
                 ConstraintKind::NotNull(_) => {}
@@ -397,14 +445,11 @@ impl Validator {
                 .decreases()
                 .map(|(k, _)| k.clone())
                 .collect();
-            for value in probe(indexes, rc.constraint.id, &gone)? {
+            for (key, value) in gone.iter().zip(probe(indexes, rc.constraint.id, &gone)?) {
                 match value {
                     None => {}
                     Some(IndexValue::Reference { .. }) => {
-                        plan.violations.insert(Violation {
-                            constraint: rc.constraint.id,
-                            code: ErrorCode::ReferencedRowDelete,
-                        });
+                        plan.record_key(rc.constraint.id, ErrorCode::ReferencedRowDelete, key);
                     }
                     Some(IndexValue::Unique { .. }) => {
                         return Err(ValidationError::Inconsistent(
@@ -416,7 +461,7 @@ impl Validator {
         }
 
         if !plan.violations.is_empty() {
-            return Ok(Decision::Rejected(plan.violations));
+            return Ok((Decision::Rejected(plan.violations), plan.details));
         }
         let key_deltas: BTreeMap<ConstraintId, NetDelta> = plan
             .deltas
@@ -436,11 +481,14 @@ impl Validator {
                 )
             })
             .collect();
-        Ok(Decision::Accepted(ValidatedDeltas {
-            deltas,
-            key_deltas,
-            observed,
-        }))
+        Ok((
+            Decision::Accepted(ValidatedDeltas {
+                deltas,
+                key_deltas,
+                observed,
+            }),
+            BTreeMap::new(),
+        ))
     }
 
     /// Turns equality deletes into removed keys of the one PK/UNIQUE constraint whose columns they

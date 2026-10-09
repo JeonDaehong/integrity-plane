@@ -27,8 +27,9 @@ All of these are covered by tests in this repository; none has been run in produ
 - **Crash recovery** through a durable transaction log, idempotent retries (`Idempotency-Key`),
   and per-domain commit queues ([`docs/recovery.md`](docs/recovery.md)).
 - **Integrity API and `integrity` CLI:** register constraints (with an onboarding scan of existing
-  data), list, drop, rebuild, verify, audit log, transaction and domain status; Prometheus metrics
-  at `/metrics`.
+  data), list, drop, rebuild, verify, disable a domain, audit log with actors, transaction and
+  domain status; structured violation reports with sample keys (redactable); Prometheus metrics at
+  `/metrics`.
 
 What is not supported, or only partly: [`docs/limitations.md`](docs/limitations.md). Measurements:
 [`docs/benchmarks.md`](docs/benchmarks.md). Threats and mitigations:

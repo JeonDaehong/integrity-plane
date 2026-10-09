@@ -76,6 +76,22 @@ def main():
     ).collect()[0]
     assert certified["n"] == certified["c"], certified
     print("ok   all customer snapshots certified")
+
+    # Composite keys: PRIMARY KEY (country, code), FOREIGN KEY (country, code) MATCH SIMPLE.
+    spark.sql(f"CREATE TABLE gw.{NS}.region (country STRING, code STRING, name STRING) USING iceberg")
+    spark.sql(f"CREATE TABLE gw.{NS}.store (id BIGINT, country STRING, code STRING) USING iceberg")
+    spark.sql(f"INSERT INTO gw.{NS}.region VALUES ('KR', 'SEL', 'Seoul'), ('KR', 'PUS', 'Busan'), ('US', 'SEL', 'Selma')")
+    print("ok   composite keys sharing a column value")
+    expect_rejection(spark, "INT-003", "region", f"INSERT INTO gw.{NS}.region VALUES ('KR', 'SEL', 'again')")
+    expect_rejection(spark, "INT-007", "region", f"INSERT INTO gw.{NS}.region VALUES ('KR', NULL, 'no code')")
+    spark.sql(f"INSERT INTO gw.{NS}.store VALUES (1, 'KR', 'SEL'), (2, 'US', 'SEL')")
+    # Both parts exist, but not as one parent key.
+    expect_rejection(spark, "INT-005", "store", f"INSERT INTO gw.{NS}.store VALUES (3, 'US', 'PUS')")
+    # MATCH SIMPLE: a NULL part exempts the row.
+    spark.sql(f"INSERT INTO gw.{NS}.store VALUES (4, NULL, 'XXX')")
+    expect_rejection(spark, "INT-006", "region", f"DELETE FROM gw.{NS}.region WHERE country = 'KR' AND code = 'SEL'")
+    spark.sql(f"DELETE FROM gw.{NS}.region WHERE country = 'KR' AND code = 'PUS'")
+    print("ok   composite PK/FK enforced; unreferenced parent deleted")
     spark.stop()
 
 

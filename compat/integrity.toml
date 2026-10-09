@@ -101,3 +101,27 @@ name = "fk_orders_customer"
 type = "foreign_key"
 columns = [2]
 references = { table = "irust.customer", constraint = 31 }
+
+# Composite keys (Spark): region(country string, code string, name string),
+# store(id long, country string, code string), store(country, code) -> region.
+[[constraint]]
+id = 25
+table = "spark.region"
+name = "pk_region"
+type = "primary_key"
+columns = [1, 2]
+
+[[constraint]]
+id = 26
+table = "spark.store"
+name = "pk_store"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 27
+table = "spark.store"
+name = "fk_store_region"
+type = "foreign_key"
+columns = [2, 3]
+references = { table = "spark.region", constraint = 25 }

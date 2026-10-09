@@ -15,7 +15,7 @@ use integrity_iceberg::{
 use integrity_index::{IndexEpoch, KeyIndex, Overlay, PersistentIndex, StagedDelta};
 use integrity_txn::{FaultPoint, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, TableId};
-use integrity_validator::{Decision, ValidatedDeltas, Validator};
+use integrity_validator::{Decision, ValidatedDeltas, Validator, ViolationDetail};
 
 use crate::error::ApiError;
 
@@ -38,8 +38,8 @@ pub enum Outcome {
         /// The whole commit's writes, one staged delta per index that changes.
         staged: Vec<(ConstraintId, StagedDelta)>,
     },
-    /// A step violates constraints.
-    Rejected(BTreeSet<Violation>),
+    /// A step violates constraints: what violates each of them.
+    Rejected(BTreeMap<Violation, ViolationDetail>),
 }
 
 /// Everything the blocking validation needs, owned.
@@ -71,6 +71,47 @@ pub struct Stats {
     pub bytes: std::sync::atomic::AtomicU64,
     /// Rows whose keys were extracted (added, removed and equality-deleted).
     pub rows: std::sync::atomic::AtomicU64,
+    /// Nanoseconds spent in persistent index lookups.
+    pub probe_nanos: std::sync::atomic::AtomicU64,
+}
+
+/// A persistent index whose lookups are timed into [`Stats::probe_nanos`].
+struct Timed<'a> {
+    inner: &'a PersistentIndex,
+    nanos: &'a std::sync::atomic::AtomicU64,
+}
+
+impl KeyIndex for Timed<'_> {
+    fn kind(&self) -> integrity_index::IndexKind {
+        self.inner.kind()
+    }
+    fn get_many(
+        &self,
+        keys: &[integrity_core::EncodedKey],
+    ) -> integrity_index::Result<Vec<Option<integrity_index::IndexValue>>> {
+        let start = std::time::Instant::now();
+        let out = self.inner.get_many(keys);
+        self.nanos.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        out
+    }
+    fn stage(&self, delta: &integrity_index::IndexDelta) -> integrity_index::Result<StagedDelta> {
+        self.inner.stage(delta)
+    }
+    fn apply(&self, staged: StagedDelta, epoch: IndexEpoch) -> integrity_index::Result<()> {
+        self.inner.apply(staged, epoch)
+    }
+    fn epoch(&self) -> integrity_index::Result<IndexEpoch> {
+        self.inner.epoch()
+    }
+    fn entries(
+        &self,
+    ) -> integrity_index::Result<Vec<(integrity_core::EncodedKey, integrity_index::IndexValue)>>
+    {
+        self.inner.entries()
+    }
 }
 
 fn api(e: impl std::fmt::Display, code: ErrorCode) -> ApiError {
@@ -88,8 +129,20 @@ pub fn run(job: &Job) -> Result<Outcome, ApiError> {
 }
 
 fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Outcome, ApiError> {
-    let overlays: BTreeMap<ConstraintId, Overlay<'_>> = job
+    let timed: BTreeMap<ConstraintId, Timed<'_>> = job
         .indexes
+        .iter()
+        .map(|(id, index)| {
+            (
+                *id,
+                Timed {
+                    inner: index,
+                    nanos: &job.stats.probe_nanos,
+                },
+            )
+        })
+        .collect();
+    let overlays: BTreeMap<ConstraintId, Overlay<'_>> = timed
         .iter()
         .map(|(id, index)| (*id, Overlay::new(index as &dyn KeyIndex)))
         .collect();
@@ -131,11 +184,11 @@ fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Ou
 
         match job
             .validator
-            .validate(&rows, &overlays)
+            .validate_with_details(&rows, &overlays)
             .map_err(|e| ApiError::new(e.code(), e.to_string()))?
         {
-            Decision::Rejected(violations) => return Ok(Outcome::Rejected(violations)),
-            Decision::Accepted(validated) => {
+            (Decision::Rejected(_), details) => return Ok(Outcome::Rejected(details)),
+            (Decision::Accepted(validated), _) => {
                 for (id, staged) in validated
                     .stage(&overlays)
                     .map_err(|e| ApiError::new(e.code(), e.to_string()))?

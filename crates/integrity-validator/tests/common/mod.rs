@@ -133,8 +133,25 @@ impl Engine {
             removed: self.rows(&commit.table, &commit.removed),
             equality_deletes,
         };
-        match self.validator.validate(&rows, &self.indexes)? {
-            Decision::Rejected(v) => Ok(Verdict::Rejected(v)),
+        let (decision, details) = self.validator.validate_with_details(&rows, &self.indexes)?;
+        match decision {
+            Decision::Rejected(v) => {
+                // Every violation is explained, and nothing else is.
+                assert_eq!(
+                    details
+                        .keys()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    v,
+                    "violation details disagree with the verdict"
+                );
+                for d in details.values() {
+                    assert!(d.count() >= 1);
+                    assert!(d.samples().len() <= integrity_validator::SAMPLE_LIMIT);
+                    assert!(d.samples().len() as u64 <= d.count());
+                }
+                Ok(Verdict::Rejected(v))
+            }
             Decision::Accepted(deltas) => {
                 // `verify` recomputes certificates from rows alone; it must agree with validation.
                 if rows.equality_deletes.is_none() {

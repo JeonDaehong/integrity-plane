@@ -11,11 +11,10 @@ use integrity_iceberg::{Budgeted, FileIo, TableMetadata, commit_rows, diff_snaps
 use integrity_index::{IndexEpoch, IndexKind, IndexValue, KeyIndex, MemoryIndex};
 use integrity_types::{ConstraintId, ErrorCode};
 use integrity_validator::{Decision, Validator};
-use serde::Serialize;
 
 use crate::config::ConstraintConfig;
 use crate::error::ApiError;
-use crate::registry;
+use crate::{registry, report};
 
 /// A table of the domain, loaded at the snapshot the scan pins.
 #[derive(Debug, Clone)]
@@ -26,26 +25,14 @@ pub struct Member {
     pub meta: TableMetadata,
 }
 
-/// A violated constraint, as reported to the operator. Never contains key values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReportedViolation {
-    /// Table the violating rows are in.
-    pub table: String,
-    /// Constraint id.
-    pub constraint: u64,
-    /// Constraint name.
-    pub name: String,
-    /// Integrity code, e.g. `INT-003`.
-    pub code: String,
-}
-
 /// What the scan found.
 #[derive(Debug)]
 pub enum ScanOutcome {
     /// The data satisfies every constraint: the full contents of every index of the domain.
     Clean(BTreeMap<ConstraintId, (IndexKind, Vec<(EncodedKey, IndexValue)>)>),
-    /// The first table (in FK order) whose data violates constraints, and what it violates.
-    Violations(Vec<ReportedViolation>),
+    /// The first table (in FK order) whose data violates constraints: one report entry per
+    /// violated constraint (`report::violations`).
+    Violations(Vec<serde_json::Value>),
 }
 
 fn invalid(m: impl Into<String>) -> ApiError {
@@ -99,10 +86,13 @@ pub fn scan(
     io: &(dyn FileIo + Send + Sync),
     configs: &[ConstraintConfig],
     members: &[Member],
+    redact_keys: bool,
 ) -> Result<ScanOutcome, ApiError> {
     let io = Budgeted::new(io, u64::MAX);
     let mut bindings = BTreeMap::new();
+    let mut column_names = report::ColumnNames::new();
     for m in members {
+        report::add_names(&mut column_names, &m.identifier, &m.meta);
         let binding =
             registry::bind(configs, &m.identifier, &m.meta).map_err(|e| invalid(e.message))?;
         bindings.insert(m.identifier.clone(), binding);
@@ -154,29 +144,18 @@ pub fn scan(
         let rows = commit_rows(&io, binding.table.clone(), head, &changes, &columns)
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?;
         match validator
-            .validate(&rows, &indexes)
+            .validate_with_details(&rows, &indexes)
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?
         {
-            Decision::Rejected(violations) => {
-                let name = |id: ConstraintId| {
-                    configs
-                        .iter()
-                        .find(|c| c.id == id.0)
-                        .map_or_else(|| id.to_string(), |c| c.name.clone())
-                };
-                return Ok(ScanOutcome::Violations(
-                    violations
-                        .iter()
-                        .map(|v| ReportedViolation {
-                            table: ident.clone(),
-                            constraint: v.constraint.0,
-                            name: name(v.constraint),
-                            code: v.code.code().to_owned(),
-                        })
-                        .collect(),
-                ));
+            (Decision::Rejected(_), details) => {
+                return Ok(ScanOutcome::Violations(report::violations(
+                    &details,
+                    configs,
+                    &column_names,
+                    redact_keys,
+                )));
             }
-            Decision::Accepted(validated) => {
+            (Decision::Accepted(validated), _) => {
                 epoch += 1;
                 for (id, staged) in validated
                     .stage(&indexes)

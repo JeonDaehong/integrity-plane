@@ -1,0 +1,53 @@
+name: Release hygiene
+
+# Spec §31: an SBOM of the Rust dependency tree, and a check that the container build is
+# reproducible (two clean builds produce byte-identical binaries).
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths:
+      - Dockerfile
+      - Cargo.lock
+      - .github/workflows/release-hygiene.yml
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate CycloneDX SBOMs
+        run: |
+          cargo cyclonedx --format json
+          mkdir -p sbom
+          find crates -name '*.cdx.json' -exec cp {} sbom/ \;
+          ls -l sbom
+          test "$(ls sbom | wc -l)" -ge 9
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
+
+  reproducible:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build twice from scratch and compare
+        run: |
+          for n in 1 2; do
+            docker build --no-cache --target build -t oip-build-$n .
+            docker run --rm oip-build-$n sha256sum target/release/integrity-server target/release/integrity > sums-$n.txt
+          done
+          cat sums-1.txt sums-2.txt
+          diff sums-1.txt sums-2.txt

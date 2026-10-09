@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod onboard;
 pub mod pipeline;
 pub mod registry;
+pub mod report;
 pub mod store;
 pub mod verify;
 
@@ -42,6 +43,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/integrity/verify", get(verify))
         .route("/v1/integrity/transactions/{id}", get(transaction))
         .route("/v1/integrity/domains/{table}", get(domain))
+        .route("/v1/integrity/domains/{table}/disable", post(disable))
         .route("/metrics", get(metrics))
         .fallback(catalog)
         .with_state(gateway)
@@ -188,6 +190,22 @@ async fn domain(
     }
     g.domain_state(&table)
         .map_or_else(|| not_found("domain"), |v| axum::Json(v).into_response())
+}
+
+async fn disable(
+    State(g): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Path(table): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !authorized(&g, &headers) {
+        return unauthorized();
+    }
+    let reason = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["reason"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    reply(g.disable(&table, &reason, &headers).await)
 }
 
 async fn metrics(State(g): State<Arc<Gateway>>) -> Response {

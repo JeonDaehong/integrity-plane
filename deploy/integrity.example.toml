@@ -19,7 +19,14 @@ timeout_secs = 60
 path = "/var/lib/integrity"
 
 [limits]
-max_inline_validation_bytes = 2147483648
+max_inline_validation_bytes = "2GiB"
+
+[errors]
+# Keep key values out of violation reports and the audit log (keys can be personal data).
+redact_keys = false
+
+# Any key can be overridden from the environment: INTEGRITY__SECTION__KEY, e.g.
+# INTEGRITY__UPSTREAM__CATALOG_URI=http://polaris:8181 or INTEGRITY__SERVER__ADMIN_TOKEN=...
 
 [storage]
 endpoint = "http://minio:9000"

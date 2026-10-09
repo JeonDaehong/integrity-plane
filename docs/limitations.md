@@ -27,7 +27,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Registering, dropping and rebuilding pause commits in all domains while they run.
 - Tables with delete files cannot be onboarded or rebuilt; compact them first.
 - Foreign keys that form a cycle between different tables are refused (a self-reference is fine).
-- Violation reports name constraints and codes, but not sample keys or file locations.
+- Violation reports give counts and up to ten sample keys per constraint, but not the files the
+  offending rows are in.
 - Dropping a constraint leaves its index data in the store.
 
 ## Certificates and verification
@@ -46,8 +47,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - The persistent index takes about 100 bytes per key.
 - Losing `registry.redb` cannot be detected from the other files; constraints from the
   configuration file are re-imported and tables with data must be onboarded again.
-- The integrity API has one optional shared bearer token, no per-operator identity and no rate
-  limiting.
+- The integrity API has one optional shared bearer token and no rate limiting; audit actors are
+  self-declared (`X-Integrity-Actor` or `User-Agent`), not authenticated.
+- A disabled domain (spec §19) accepts anything, uncertified, until it is rebuilt.
 - Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg 0.12, iceberg-rust 0.10, against the
   Iceberg REST fixture catalog. Polaris, Lakekeeper and Nessie as upstream are untested. S3 is tested
   against SeaweedFS (MinIO no longer publishes container images), not against AWS S3.

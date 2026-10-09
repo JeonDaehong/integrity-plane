@@ -404,3 +404,83 @@ fn verdicts_on_the_small_fixture() {
         Decision::Accepted(_)
     ));
 }
+
+/// Spec §24: each violation reports how many keys offend and up to ten of them.
+#[test]
+fn violation_details_count_and_sample_offending_keys() {
+    let v = Validator::new(fixture(EnforcementMode::Enforced));
+    let idx = indexes();
+    apply(&v, &idx, &customers([1, 2]), 1);
+    let detail = |c: &CommitRows, id: ConstraintId, code: ErrorCode| {
+        let (decision, details) = v.validate_with_details(c, &idx).unwrap();
+        assert!(matches!(decision, Decision::Rejected(_)));
+        details[&integrity_core::Violation {
+            constraint: id,
+            code,
+        }]
+            .clone()
+    };
+    let ints = |d: &integrity_validator::ViolationDetail| -> Vec<Vec<Option<KeyValue>>> {
+        d.samples().to_vec()
+    };
+    let one = |i: i64| vec![Some(KeyValue::Integer(i))];
+
+    // 15 orders, children of 12 distinct missing customers: 12 offending keys, 10 samples.
+    let rows = (0..15)
+        .map(|o| vec![int(o), int(100 + o % 12)])
+        .collect::<Vec<_>>();
+    let fk = detail(
+        &commit("orders", batch(&[1, 2], rows), batch(&[1, 2], vec![])),
+        FK,
+        ErrorCode::ForeignKeyViolation,
+    );
+    assert_eq!(fk.count(), 12);
+    assert_eq!(fk.samples().len(), integrity_validator::SAMPLE_LIMIT);
+    assert_eq!(ints(&fk)[0], one(100));
+
+    // Duplicates inside the commit and against the index are counted once per key.
+    let dup = detail(
+        &customers([2, 3, 3, 4]),
+        PK_CUSTOMER,
+        ErrorCode::DuplicatePrimaryKey,
+    );
+    assert_eq!(dup.count(), 2);
+    assert_eq!(ints(&dup), vec![one(3), one(2)]);
+
+    // NULL in a primary key: one row each, sampled as the tuple with its NULL.
+    let nulls = commit(
+        "customer",
+        batch(&[1], vec![vec![Datum::Null], vec![Datum::Null]]),
+        batch(&[1], vec![]),
+    );
+    let (decision, details) = v.validate_with_details(&nulls, &idx).unwrap();
+    let Decision::Rejected(violations) = decision else {
+        panic!("accepted")
+    };
+    let only = violations.iter().next().unwrap();
+    assert_eq!(details[only].count(), 2);
+    assert_eq!(details[only].samples(), &[vec![None], vec![None]]);
+
+    // Deleting referenced parents names them.
+    apply(
+        &v,
+        &idx,
+        &commit(
+            "orders",
+            batch(&[1, 2], vec![vec![int(1), int(1)], vec![int(2), int(2)]]),
+            batch(&[1, 2], vec![]),
+        ),
+        2,
+    );
+    let gone = detail(
+        &commit(
+            "customer",
+            batch(&[1], vec![]),
+            batch(&[1], vec![vec![int(1)], vec![int(2)]]),
+        ),
+        FK,
+        ErrorCode::ReferencedRowDelete,
+    );
+    assert_eq!(gone.count(), 2);
+    assert_eq!(ints(&gone), vec![one(1), one(2)]);
+}
