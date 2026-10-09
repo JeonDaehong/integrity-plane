@@ -1,10 +1,11 @@
 //! The REST gateway (spec §14, §16, §22, ADR 0010, RFC 0003, RFC 0004).
 //!
-//! Commits to tables with constraints go through the integrity pipeline under one lock, with every
-//! step recorded in the transaction log so that a crash at any point is recoverable; every other
-//! request is forwarded to the upstream catalog unchanged. Per-domain queues arrive in Phase 9.
+//! Commits to tables with constraints go through the integrity pipeline, serialized per integrity
+//! domain (the FK-connected component of the table, spec §11) and recorded in the transaction log so
+//! that a crash at any point is recoverable. Commits in different domains run in parallel. Every
+//! other request is forwarded to the upstream catalog unchanged.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -236,8 +237,11 @@ fn log_error(e: integrity_txn::TxnError) -> ApiError {
     ApiError::new(ErrorCode::IndexDegraded, format!("transaction log: {e}"))
 }
 
+/// One integrity domain's queue state. Holding its lock is holding the domain's commit queue
+/// (spec §11): validation, publication and index application of one commit at a time.
 #[derive(Debug, Default)]
 struct State {
+    /// Tables of this domain bound to their upstream UUIDs.
     bindings: BTreeMap<String, Binding>,
     degraded: Option<String>,
 }
@@ -251,7 +255,8 @@ pub struct Gateway {
     log: TxnLog,
     budget: u64,
     constraints: Vec<ConstraintConfig>,
-    state: Mutex<State>,
+    /// One queue per integrity domain, keyed by the domain's smallest table identifier.
+    domains: std::sync::Mutex<BTreeMap<String, Arc<Mutex<State>>>>,
     /// Commit requests received per table identifier (observability; detects retry storms).
     commit_requests: std::sync::Mutex<BTreeMap<String, u64>>,
 }
@@ -280,7 +285,7 @@ impl Gateway {
             log,
             budget,
             constraints,
-            state: Mutex::new(State::default()),
+            domains: std::sync::Mutex::new(BTreeMap::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
@@ -318,11 +323,26 @@ impl Gateway {
         }
     }
 
-    /// Resolves transactions left unfinished by a previous process (spec §16). Leaves them for
-    /// later if upstream cannot be reached.
+    /// The queue of the domain `identifier` belongs to.
+    fn domain(&self, identifier: &str) -> (Arc<Mutex<State>>, BTreeSet<String>) {
+        let members = registry::component(&self.constraints, identifier);
+        let key = members
+            .first()
+            .cloned()
+            .unwrap_or_else(|| identifier.to_owned());
+        let mut domains = match self.domains.lock() {
+            Ok(d) => d,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let queue = Arc::clone(domains.entry(key).or_default());
+        (queue, members)
+    }
+
+    /// Resolves transactions left unfinished by a previous process (spec §16), before any request
+    /// is served. Leaves them for later if upstream cannot be reached.
     pub async fn recover_on_start(&self) -> Result<(), String> {
-        let mut st = self.state.lock().await;
-        self.recover(&mut st, &HeaderMap::new())
+        let mut st = State::default();
+        self.recover(&mut st, &HeaderMap::new(), None)
             .await
             .map_err(|e| e.message)
     }
@@ -334,12 +354,26 @@ impl Gateway {
             .lock()
             .map(|c| c.clone())
             .unwrap_or_default();
-        let st = self.state.lock().await;
+        let queues: Vec<(String, Arc<Mutex<State>>)> = match self.domains.lock() {
+            Ok(d) => d.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut degraded = BTreeMap::new();
+        let mut bound = BTreeMap::new();
+        for (key, queue) in queues {
+            let st = queue.lock().await;
+            if let Some(reason) = &st.degraded {
+                degraded.insert(key, reason.clone());
+            }
+            for (ident, b) in &st.bindings {
+                bound.insert(ident.clone(), b.table.to_string());
+            }
+        }
         serde_json::json!({
             "commit_requests": commit_requests,
-            "degraded": st.degraded,
+            "degraded": if degraded.is_empty() { Value::Null } else { serde_json::json!(degraded) },
             "unresolved_transactions": self.log.unresolved().map(|u| u.len()).ok(),
-            "bound_tables": st.bindings.iter().map(|(k, b)| (k.clone(), b.table.to_string())).collect::<BTreeMap<_, _>>(),
+            "bound_tables": bound,
         })
     }
 
@@ -483,10 +517,18 @@ impl Gateway {
         Ok(out)
     }
 
-    /// Resolves every unfinished transaction (spec §16, RFC 0004). `Validated` was never forwarded
-    /// and aborts without asking upstream; `Committing` is decided by whether its final snapshot is
-    /// in the table. Fails with `RECOVERY_REQUIRED` while upstream cannot answer.
-    async fn recover(&self, st: &mut State, headers: &HeaderMap) -> Result<(), ApiError> {
+    /// Resolves unfinished transactions (spec §16, RFC 0004). `Validated` was never forwarded and
+    /// aborts without asking upstream; `Committing` is decided by whether its final snapshot is in
+    /// the table. Fails with `RECOVERY_REQUIRED` while upstream cannot answer.
+    ///
+    /// `scope` limits recovery to one domain's tables: another domain may be forwarding its own
+    /// transaction right now, and resolving it from here would race with its outcome.
+    async fn recover(
+        &self,
+        st: &mut State,
+        headers: &HeaderMap,
+        scope: Option<&BTreeSet<String>>,
+    ) -> Result<(), ApiError> {
         let interrupted = |what: &str| {
             error_decision(&ApiError::new(
                 ErrorCode::RecoveryRequired,
@@ -494,6 +536,9 @@ impl Gateway {
             ))
         };
         for u in self.log.unresolved().map_err(log_error)? {
+            if scope.is_some_and(|members| !members.contains(&u.prepared.identifier)) {
+                continue;
+            }
             match u.state {
                 TxnState::Prepared => self
                     .log
@@ -586,8 +631,10 @@ impl Gateway {
         let mut request = CommitRequest::from_json(json)
             .map_err(|e| ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()))?;
 
-        let mut st = self.state.lock().await;
-        self.recover(&mut st, &headers).await?;
+        let identifier = table.identifier();
+        let (queue, members) = self.domain(&identifier);
+        let mut st = queue.lock().await;
+        self.recover(&mut st, &headers, Some(&members)).await?;
         if let Some(d) = request_id.as_deref().and_then(|r| self.log.decision_for(r)) {
             return Ok(replay(&d));
         }
@@ -596,9 +643,8 @@ impl Gateway {
         }
 
         // Bind every table of the integrity domain.
-        let identifier = table.identifier();
         let mut target_meta = None;
-        for ident in registry::component(&self.constraints, &identifier) {
+        for ident in members.iter().cloned() {
             let path = if ident == identifier {
                 table.path()
             } else {
@@ -866,7 +912,7 @@ impl Gateway {
             }
             unknown => {
                 fault::hit(FaultPoint::AfterUpstreamUnknown);
-                match self.recover(&mut st, &headers).await {
+                match self.recover(&mut st, &headers, Some(&members)).await {
                     Ok(()) => Ok(self.log.decision(txn).map_or_else(
                         || StatusCode::GATEWAY_TIMEOUT.into_response(),
                         |d| replay(&d),

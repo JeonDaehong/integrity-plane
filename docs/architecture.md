@@ -108,3 +108,17 @@ repeated `Idempotency-Key` gets the recorded answer. Decisions use the status ma
 [RFC 0003](rfc/0003-http-status-mapping.md). Everything else, including table creation and loads, is
 forwarded unchanged; `/v1/config` is stripped of `uri` overrides and idempotency support.
 Constraints come from the configuration file (`deploy/integrity.example.toml`) until Phase 10.
+
+## Integrity domains and concurrency (spec §11)
+
+A domain is the FK-connected component of a table among the configured constraints. Each domain
+has one commit queue (an async lock): validation, publication upstream and index application of a
+commit happen while holding it, so the "child insert vs. parent delete" race cannot occur. Commits in
+different domains run in parallel. Recovery before a commit only resolves that domain's unfinished
+transactions; another domain may be publishing its own at the same moment.
+
+`crates/integrity-server/tests/concurrency.rs` runs, over twelve seeds, concurrent order inserters on a
+hot parent key, a deleter and re-inserter of that parent, and child cleanup, with engine-like clients
+that retry on 409. The upstream's global commit order is replayed and PK and FK are checked after
+every commit; the indexes must equal the final data. A second test holds one domain's upstream commit
+and checks that another domain commits meanwhile while the held domain stays serial.
