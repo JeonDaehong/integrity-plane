@@ -72,3 +72,32 @@ name = "fk_orders_customer"
 type = "foreign_key"
 columns = [2]
 references = { table = "spark.customer", constraint = 21 }
+
+[[constraint]]
+id = 31
+table = "irust.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 32
+table = "irust.customer"
+name = "nn_customer_name"
+type = "not_null"
+columns = [2]
+
+[[constraint]]
+id = 33
+table = "irust.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 34
+table = "irust.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "irust.customer", constraint = 31 }

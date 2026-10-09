@@ -1,0 +1,19 @@
+# iceberg-rust client against the integrity gateway (Phase 7 compatibility).
+# Standalone: iceberg-rust needs Rust 1.94 and Arrow 58, unlike the main workspace.
+[package]
+name = "integrity-compat-iceberg-rust"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+arrow-array = "58"
+parquet = "58"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
