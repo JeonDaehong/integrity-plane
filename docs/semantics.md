@@ -10,7 +10,7 @@ where the implementation pins down details the spec leaves open.
 | Commit-level semantics | §8 | `integrity_core::delta`, `integrity-validator` | Implemented for single-table commits (Phase 3) |
 | Key encoding | §9 | `integrity_core::key` | Implemented per [RFC 0001](rfc/0001-key-encoding-v1.md) |
 
-The validator implements these semantics, but no commit path calls it yet (the gateway is Phase 7).
+The gateway applies these semantics to every commit of a constrained table (`integrity-server`).
 
 ## Constraint model (§6)
 

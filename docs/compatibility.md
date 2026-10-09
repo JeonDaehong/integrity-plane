@@ -77,5 +77,6 @@ overrides or idempotency-key support.
 
 For every client each violation reaches the gateway exactly once (no retry storm), the statement
 fails with the integrity code in its message, and every snapshot on `main` carries a certificate.
-Upstream: Iceberg REST fixture 1.10.1 with a filesystem warehouse; MinIO no longer publishes
-community container images, so the S3 code path (`object_store`) is not yet exercised in CI.
+Upstream: Iceberg REST fixture 1.10.1 with a filesystem warehouse. The CI job `compose-s3` also runs
+the Appendix A demo against `deploy/docker-compose.yml`, where the catalog, the Plane and the
+clients use S3 (SeaweedFS's S3 gateway; MinIO no longer publishes container images).

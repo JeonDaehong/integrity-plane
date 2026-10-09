@@ -16,7 +16,11 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0009](0009-equality-deletes.md) | Equality deletes on a PK/UNIQUE key (Flink upsert) | Accepted |
 | [0010](0010-proxy-gateway.md) | Proxy gateway first; embedded mode later | Accepted |
 | [0011](0011-registry-anchors-and-rebuild.md) | Constraint registry, chain anchors, onboarding and rebuild | Accepted |
+| [0012](0012-iceberg-first.md) | Apache Iceberg is the first and only format in 0.x | Accepted |
+| [0013](0013-indexes-are-derived-state.md) | Indexes are derived state | Accepted |
+| [0014](0014-counts-instead-of-locators.md) | Indexes store keys and counts, not row locations | Accepted |
+| [0015](0015-serial-domain-queues.md) | One serial commit queue per integrity domain | Accepted |
 
-ADRs required for 0.1 by spec §31 that are still to be written: Iceberg first; proxy gateway vs
-embedded; indexes as derived state; counts instead of locators; serial domain queues; key encoding (specified by RFC 0001);
-certificate format; error/status mapping. (Index backend: ADR 0005.)
+The decisions spec §31 requires for 0.1 are all recorded: Iceberg first (0012), proxy gateway (0010),
+indexes as derived state (0013), counts instead of locators (0014), serial domain queues (0015) and
+index backend (0005); key encoding, certificate format and error/status mapping are RFCs 0001–0003.

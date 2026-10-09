@@ -30,8 +30,9 @@ All of these are covered by tests in this repository; none has been run in produ
   data), list, drop, rebuild, verify, audit log, transaction and domain status; Prometheus metrics
   at `/metrics`.
 
-Not yet: S3 storage is implemented but not exercised in CI (a local filesystem warehouse is), no
-benchmarks, no signed certificates, single-node only.
+What is not supported, or only partly: [`docs/limitations.md`](docs/limitations.md). Measurements:
+[`docs/benchmarks.md`](docs/benchmarks.md). Threats and mitigations:
+[`docs/threat-model.md`](docs/threat-model.md).
 
 ## Design
 
@@ -48,7 +49,11 @@ cargo build --release -p integrity-server -p integrity-cli
 ./target/release/integrity verify db.customer
 ```
 
-`compat/demo_test.py` runs the full demo of the specification (Appendix A) with Spark in CI.
+Or the whole stack (S3 storage, Iceberg REST catalog, Plane):
+`docker compose -f deploy/docker-compose.yml up -d --build`.
+
+`compat/demo_test.py` runs the full demo of the specification (Appendix A) with Spark in CI, against
+both a local warehouse and the compose stack.
 
 ## Building
 
