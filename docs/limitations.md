@@ -39,7 +39,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 ## Certificates and verification
 
 - Certificates are signed only with `[signing]` configured; the key is a file in the control
-  store (no HSM or KMS integration).
+  store. Next step: signer backends that keep the key in an HSM or KMS (PKCS#11 and Vault Transit
+  first, both with Ed25519; then cloud KMS). AWS KMS and Azure Key Vault may need a second signature
+  algorithm (ECDSA P-256), which is a certificate format change (new RFC).
 - A forged certificate copied into a bypassing snapshot passes the commit-time check; only `verify`
   detects it.
 - `verify` cannot recompute snapshots with equality deletes (reported `UNVERIFIABLE`) or chains whose
