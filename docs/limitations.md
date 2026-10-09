@@ -5,16 +5,20 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Out of scope for 0.1 (by design)
 
-- CHECK constraints, merge-on-read position deletes and deletion vectors, branch-gated publication,
-  signed certificates, picking up constraints from engine DDL: planned for 0.2.
+- CHECK constraints, deletion vectors (v3), branch-gated publication, signed certificates, picking
+  up constraints from engine DDL: planned for 0.2. Merge-on-read position deletes (v2) are supported
+  (ADR 0017).
 - Multi-table atomic commits (`/transactions/commit` is refused), high availability: 0.3.
 - Other table formats than Iceberg (ADR 0012); `ON DELETE CASCADE`; per-key locking (ADR 0015).
 
 ## Commits
 
 - Anything outside the capability matrix in [`compatibility.md`](compatibility.md) is refused with
-  `UNSUPPORTED_COMMIT_OPERATION`, including position deletes, removing delete files, rollbacks of
-  `main` to an existing snapshot, non-Parquet data files and key columns nested in structs.
+  `UNSUPPORTED_COMMIT_OPERATION`, including deletion vectors, position and equality deletes in the
+  same table, removing equality delete files, rollbacks of `main` to an existing snapshot,
+  non-Parquet data files and key columns nested in structs.
+- On tables with position deletes, each commit reads all manifests of both snapshots and every live
+  position delete file.
 - Commits to branches other than `main` pass through uncertified.
 - The Plane reads whole data files, not only the key column chunks, so bytes read per commit grow
   with file size (reported by `integrity_bytes_read_total`).
@@ -26,7 +30,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 - Constraints are on top-level columns only; NOT NULL on one column.
 - Registering, dropping and rebuilding pause commits in all domains while they run.
-- Tables with delete files cannot be onboarded or rebuilt; compact them first.
+- Tables with equality delete files cannot be onboarded or rebuilt; compact them first. Position
+  deletes are applied.
 - Foreign keys that form a cycle between different tables are refused (a self-reference is fine).
 - Violation reports give counts and up to ten sample keys per constraint, but not the files the
   offending rows are in.

@@ -125,3 +125,27 @@ name = "fk_store_region"
 type = "foreign_key"
 columns = [2, 3]
 references = { table = "spark.region", constraint = 25 }
+
+# Merge-on-read (Spark): mcust(customer_id long, name string), morders(order_id long,
+# customer_id long), both with position deletes for DELETE / UPDATE / MERGE.
+[[constraint]]
+id = 28
+table = "spark.mcust"
+name = "pk_mcust"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 29
+table = "spark.morders"
+name = "pk_morders"
+type = "primary_key"
+columns = [1]
+
+[[constraint]]
+id = 30
+table = "spark.morders"
+name = "fk_morders_mcust"
+type = "foreign_key"
+columns = [2]
+references = { table = "spark.mcust", constraint = 28 }

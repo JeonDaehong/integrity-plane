@@ -41,7 +41,10 @@ def expect_rejection(spark, code, table, sql):
 def main():
     builder = (
         SparkSession.builder.appName("integrity-compat")
-        .config("spark.jars.packages", f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG}")
+        .config("spark.jars.packages", ",".join(
+            [f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG}"]
+            + ([f"org.apache.iceberg:iceberg-aws-bundle:{ICEBERG}"] if "io-impl" in EXTRA else [])
+        ))
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.gw", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.gw.type", "rest")
@@ -99,6 +102,45 @@ def main():
     expect_rejection(spark, "INT-006", "region", f"DELETE FROM gw.{NS}.region WHERE country = 'KR' AND code = 'SEL'")
     spark.sql(f"DELETE FROM gw.{NS}.region WHERE country = 'KR' AND code = 'PUS'")
     print("ok   composite PK/FK enforced; unreferenced parent deleted")
+
+    # Merge-on-read: DELETE / UPDATE / MERGE write position delete files (ADR 0017).
+    mor = ("TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read', "
+           "'write.update.mode'='merge-on-read', 'write.merge.mode'='merge-on-read')")
+    spark.sql(f"CREATE TABLE gw.{NS}.mcust (customer_id BIGINT, name STRING) USING iceberg {mor}")
+    spark.sql(f"CREATE TABLE gw.{NS}.morders (order_id BIGINT, customer_id BIGINT) USING iceberg {mor}")
+    # One data file, so that deleting one of its rows needs a position delete.
+    spark.sql(
+        f"INSERT INTO gw.{NS}.mcust SELECT /*+ COALESCE(1) */ * FROM VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    )
+    spark.sql(f"INSERT INTO gw.{NS}.morders VALUES (10, 1)")
+    expect_rejection(spark, "INT-006", "mcust", f"DELETE FROM gw.{NS}.mcust WHERE customer_id = 1")
+    spark.sql(f"DELETE FROM gw.{NS}.mcust WHERE customer_id = 3")
+    deletes = spark.sql(f"SELECT count(*) AS n FROM gw.{NS}.mcust.delete_files").collect()[0]["n"]
+    assert deletes > 0, "the DELETE was expected to write position deletes"
+    print("ok   merge-on-read DELETE of an unreferenced row;", deletes, "delete file(s)")
+    spark.sql(f"UPDATE gw.{NS}.mcust SET name = 'bb' WHERE customer_id = 2")
+    expect_rejection(spark, "INT-005", "morders", f"UPDATE gw.{NS}.morders SET customer_id = 999 WHERE order_id = 10")
+    spark.sql(
+        f"MERGE INTO gw.{NS}.mcust t USING (SELECT 4 AS id, 'd' AS name) s ON t.customer_id = s.id "
+        "WHEN MATCHED THEN UPDATE SET name = s.name "
+        "WHEN NOT MATCHED THEN INSERT (customer_id, name) VALUES (s.id, s.name)"
+    )
+    expect_rejection(spark, "INT-003", "mcust", f"INSERT INTO gw.{NS}.mcust VALUES (2, 'dup')")
+    spark.sql(f"INSERT INTO gw.{NS}.mcust VALUES (3, 'again')")
+    print("ok   merge-on-read UPDATE / MERGE enforced; a deleted key can be inserted again")
+    spark.sql(
+        f"CALL gw.system.rewrite_data_files(table => '{NS}.mcust', "
+        "options => map('min-input-files', '1', 'delete-file-threshold', '1'))"
+    ).collect()
+    head = spark.sql(f"SELECT operation, summary FROM gw.{NS}.mcust.snapshots ORDER BY committed_at").collect()[-1]
+    assert head["operation"] == "replace", head
+    ids = sorted(r["customer_id"] for r in spark.sql(f"SELECT customer_id FROM gw.{NS}.mcust").collect())
+    assert ids == [1, 2, 3, 4], ids
+    certified = spark.sql(
+        f"SELECT count(*) AS n, count(summary['integrity.cert']) AS c FROM gw.{NS}.mcust.snapshots"
+    ).collect()[0]
+    assert certified["n"] == certified["c"], certified
+    print("ok   compaction applying deletes certified; every snapshot certified")
     spark.stop()
 
 

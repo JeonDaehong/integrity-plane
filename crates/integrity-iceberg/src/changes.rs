@@ -95,7 +95,29 @@ pub struct FileChanges {
     pub removed: Vec<DataFile>,
     /// Equality delete files added by the snapshot, all on the same field set (ADR 0009).
     pub equality_deletes: Vec<DataFile>,
+    /// Position deletes, when either snapshot has any (ADR 0017).
+    pub positions: Option<PositionDeletes>,
 }
+
+/// The position delete files of both snapshots and the data files they may refer to (ADR 0017).
+///
+/// A data file's live rows are its rows minus the positions its snapshot's position delete files
+/// name. The rows a commit removes are the live rows of removed data files plus the rows newly
+/// deleted in kept data files; the rows it adds are the live rows of added data files plus rows
+/// whose deletion it undoes (by removing a delete file).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PositionDeletes {
+    /// Live position delete files of the parent snapshot.
+    pub before: Vec<DataFile>,
+    /// Live position delete files of the new snapshot.
+    pub after: Vec<DataFile>,
+    /// Paths of the position delete files the commit adds or removes.
+    pub changed: BTreeSet<String>,
+    /// Data files live in both snapshots, by path.
+    pub kept: BTreeMap<String, DataFile>,
+}
+
+type Live = BTreeMap<String, (DataFile, Option<i64>)>;
 
 fn manifests(io: &impl FileIo, list: Option<&str>) -> Result<Vec<ManifestFile>, InspectError> {
     match list {
@@ -167,11 +189,11 @@ pub fn diff_snapshots(
 
     let before = live_files(io, &dropped)?;
     let after = live_files(io, &introduced)?;
-    type Live = BTreeMap<String, (DataFile, Option<i64>)>;
     let unchanged =
         |path: &str, file: &DataFile, other: &Live| other.get(path).is_some_and(|(f, _)| f == file);
 
     let mut changes = FileChanges::default();
+    let mut position_changed = BTreeSet::new();
     for (path, (file, sequence_number)) in &after {
         if unchanged(path, file, &before) {
             continue;
@@ -189,9 +211,7 @@ pub fn diff_snapshots(
                 changes.equality_deletes.push(file.clone());
             }
             FileContent::PositionDeletes => {
-                return Err(unsupported(
-                    "commit adds position deletes or deletion vectors (merge-on-read)",
-                ));
+                position_changed.insert(path.clone());
             }
         }
     }
@@ -199,16 +219,74 @@ pub fn diff_snapshots(
         if unchanged(path, file, &after) {
             continue;
         }
-        if file.content != FileContent::Data {
-            return Err(unsupported("commit removes delete files"));
+        match file.content {
+            FileContent::Data => changes.removed.push(file.clone()),
+            FileContent::PositionDeletes => {
+                position_changed.insert(path.clone());
+            }
+            FileContent::EqualityDeletes => {
+                return Err(unsupported("commit removes equality delete files"));
+            }
         }
-        changes.removed.push(file.clone());
     }
 
-    let parent_has_deletes = parent.iter().any(|m| m.content == ManifestContent::Deletes);
-    if (parent_has_deletes || !changes.equality_deletes.is_empty()) && !changes.removed.is_empty() {
+    // With delete manifests on either side, position deletes need the complete picture: every
+    // live delete file (unchanged ones included) and every data file kept by the commit.
+    let any_deletes = parent
+        .iter()
+        .chain(new.iter())
+        .any(|m| m.content == ManifestContent::Deletes);
+    let (parent_all, new_all) = if any_deletes {
+        (
+            live_files(io, &parent.iter().collect::<Vec<_>>())?,
+            live_files(io, &new.iter().collect::<Vec<_>>())?,
+        )
+    } else {
+        (Live::new(), Live::new())
+    };
+    let of = |live: &Live, content: FileContent| -> Vec<DataFile> {
+        live.values()
+            .filter(|(f, _)| f.content == content)
+            .map(|(f, _)| f.clone())
+            .collect()
+    };
+    let positions_before = of(&parent_all, FileContent::PositionDeletes);
+    let positions_after = of(&new_all, FileContent::PositionDeletes);
+    let equality_live = !of(&parent_all, FileContent::EqualityDeletes).is_empty()
+        || !of(&new_all, FileContent::EqualityDeletes).is_empty();
+    if !positions_before.is_empty() || !positions_after.is_empty() {
+        if equality_live {
+            return Err(unsupported(
+                "position and equality deletes in the same table",
+            ));
+        }
+        if let Some(f) = positions_before
+            .iter()
+            .chain(&positions_after)
+            .find(|f| !f.format.eq_ignore_ascii_case("parquet"))
+        {
+            return Err(unsupported(format!(
+                "position deletes in {} format (deletion vectors are not supported)",
+                f.format
+            )));
+        }
+        let kept = new_all
+            .iter()
+            .filter(|(path, (f, _))| {
+                f.content == FileContent::Data && unchanged(path, f, &parent_all)
+            })
+            .map(|(path, (f, _))| (path.clone(), f.clone()))
+            .collect();
+        changes.positions = Some(PositionDeletes {
+            before: positions_before,
+            after: positions_after,
+            changed: position_changed,
+            kept,
+        });
+    } else if (equality_live || !changes.equality_deletes.is_empty()) && !changes.removed.is_empty()
+    {
         return Err(unsupported(
-            "commit removes data files from a table with delete files",
+            "commit removes data files from a table with equality delete files",
         ));
     }
     let mut field_sets = changes.equality_deletes.iter().map(|f| {
@@ -223,11 +301,13 @@ pub fn diff_snapshots(
             "equality delete files without, or with different, equality fields",
         ));
     }
+    let kept_touched = changes.positions.iter().flat_map(|p| p.kept.values());
     for f in changes
         .added
         .iter()
         .chain(&changes.removed)
         .chain(&changes.equality_deletes)
+        .chain(kept_touched)
     {
         if !f.format.eq_ignore_ascii_case("parquet") {
             return Err(unsupported(format!("data file format {}", f.format)));
@@ -248,22 +328,30 @@ pub fn commit_rows(
     changes: &FileChanges,
     columns: &[(FieldId, LogicalType)],
 ) -> Result<CommitRows, InspectError> {
+    // Rows of a data file, in file order (row position = index).
+    let file_rows = |file: &DataFile| -> Result<RowBatch, InspectError> {
+        let rows = extract_rows(io.read(&file.path)?, columns)?;
+        if rows.len() as i64 != file.record_count {
+            return Err(unsupported(format!(
+                "{} has {} rows but its manifest says {}",
+                file.path,
+                rows.len(),
+                file.record_count
+            )));
+        }
+        Ok(rows)
+    };
+    let new_batch = || RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
+    let push = |batch: &mut RowBatch, row: &[Datum]| -> Result<(), InspectError> {
+        batch
+            .push(row.to_vec())
+            .map_err(|e| unsupported(e.to_string()))
+    };
     let read = |files: &[DataFile]| -> Result<RowBatch, InspectError> {
-        let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
+        let mut batch = new_batch();
         for file in files {
-            let rows = extract_rows(io.read(&file.path)?, columns)?;
-            if rows.len() as i64 != file.record_count {
-                return Err(unsupported(format!(
-                    "{} has {} rows but its manifest says {}",
-                    file.path,
-                    rows.len(),
-                    file.record_count
-                )));
-            }
-            for row in rows.rows() {
-                batch
-                    .push(row.clone())
-                    .map_err(|e| unsupported(e.to_string()))?;
+            for row in file_rows(file)?.rows() {
+                push(&mut batch, row)?;
             }
         }
         Ok(batch)
@@ -307,13 +395,136 @@ pub fn commit_rows(
             Some(batch)
         }
     };
+    let Some(pd) = &changes.positions else {
+        return Ok(CommitRows {
+            table,
+            snapshot,
+            added: read(&changes.added)?,
+            removed: read(&changes.removed)?,
+            equality_deletes,
+        });
+    };
+
+    // Position deletes (ADR 0017): deleted positions per data file, before and after.
+    let mut by_file: HashMap<String, BTreeMap<String, BTreeSet<i64>>> = HashMap::new();
+    let mut deleted =
+        |files: &[DataFile]| -> Result<BTreeMap<String, BTreeSet<i64>>, InspectError> {
+            let mut out: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+            for f in files {
+                if !by_file.contains_key(&f.path) {
+                    by_file.insert(f.path.clone(), position_deletes(io, f)?);
+                }
+                for (path, positions) in &by_file[&f.path] {
+                    out.entry(path.clone()).or_default().extend(positions);
+                }
+            }
+            Ok(out)
+        };
+    let before = deleted(&pd.before)?;
+    let after = deleted(&pd.after)?;
+    let empty = BTreeSet::new();
+    let live =
+        |file: &DataFile, gone: &BTreeSet<i64>, batch: &mut RowBatch| -> Result<(), InspectError> {
+            let rows = file_rows(file)?;
+            check_positions(file, gone, rows.len())?;
+            for (pos, row) in rows.rows().iter().enumerate() {
+                if !gone.contains(&(pos as i64)) {
+                    push(batch, row)?;
+                }
+            }
+            Ok(())
+        };
+    let mut added = new_batch();
+    let mut removed = new_batch();
+    for f in &changes.added {
+        live(f, after.get(&f.path).unwrap_or(&empty), &mut added)?;
+    }
+    for f in &changes.removed {
+        live(f, before.get(&f.path).unwrap_or(&empty), &mut removed)?;
+    }
+    // Kept data files whose deleted positions the commit changes.
+    for (path, file) in &pd.kept {
+        let b = before.get(path).unwrap_or(&empty);
+        let a = after.get(path).unwrap_or(&empty);
+        if b == a {
+            continue;
+        }
+        let rows = file_rows(file)?;
+        check_positions(file, a, rows.len())?;
+        check_positions(file, b, rows.len())?;
+        for pos in a.difference(b) {
+            push(&mut removed, &rows.rows()[*pos as usize])?;
+        }
+        for pos in b.difference(a) {
+            push(&mut added, &rows.rows()[*pos as usize])?;
+        }
+    }
     Ok(CommitRows {
         table,
         snapshot,
-        added: read(&changes.added)?,
-        removed: read(&changes.removed)?,
+        added,
+        removed,
         equality_deletes,
     })
+}
+
+/// Field ids of `file_path` and `pos` in position delete files (Iceberg spec, reserved ids).
+const DELETE_FILE_PATH: FieldId = FieldId(2_147_483_546);
+const DELETE_POS: FieldId = FieldId(2_147_483_545);
+
+/// Reads a position delete file: deleted positions per data file path.
+fn position_deletes(
+    io: &impl FileIo,
+    file: &DataFile,
+) -> Result<BTreeMap<String, BTreeSet<i64>>, InspectError> {
+    let rows = extract_rows(
+        io.read(&file.path)?,
+        &[
+            (DELETE_FILE_PATH, LogicalType::String),
+            (DELETE_POS, LogicalType::Long),
+        ],
+    )?;
+    if rows.len() as i64 != file.record_count {
+        return Err(unsupported(format!(
+            "{} has {} rows but its manifest says {}",
+            file.path,
+            rows.len(),
+            file.record_count
+        )));
+    }
+    let mut out: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+    for row in rows.rows() {
+        match (&row[0], &row[1]) {
+            (
+                Datum::Value(integrity_core::KeyValue::String(path)),
+                Datum::Value(integrity_core::KeyValue::Integer(pos)),
+            ) => {
+                out.entry(path.clone()).or_default().insert(*pos);
+            }
+            _ => {
+                return Err(unsupported(format!(
+                    "{} is not a valid position delete file",
+                    file.path
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every deleted position must name a row of the file.
+fn check_positions(
+    file: &DataFile,
+    positions: &BTreeSet<i64>,
+    rows: usize,
+) -> Result<(), InspectError> {
+    match positions.iter().find(|&&p| p < 0 || p as usize >= rows) {
+        Some(p) => Err(unsupported(format!(
+            "position delete {p} beyond the {rows} rows of {}",
+            file.path
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Checks the declared operation against what the commit actually does (spec §15): `append`

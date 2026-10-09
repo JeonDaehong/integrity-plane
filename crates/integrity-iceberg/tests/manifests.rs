@@ -135,6 +135,33 @@ impl Table {
         self.io.insert(path, out);
     }
 
+    /// A Parquet position delete file of `(data file path, row position)`.
+    fn positions(&mut self, path: &str, deletes: &[(&str, i64)]) {
+        let meta =
+            |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(meta("2147483546")),
+            Field::new("pos", DataType::Int64, false).with_metadata(meta("2147483545")),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    deletes.iter().map(|d| d.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    deletes.iter().map(|d| d.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        self.io.insert(path, out);
+    }
+
     /// A manifest list of `(manifest path, content)`.
     fn list(&mut self, path: &str, manifests: &[(&str, i32)]) {
         let records = manifests
@@ -325,29 +352,25 @@ fn relisting_a_live_file_counts_as_adding_it_again() {
 }
 
 #[test]
-fn position_deletes_and_removed_delete_files_are_unsupported() {
+fn equality_delete_files_limit_what_a_commit_may_remove() {
     let mut t = parent();
-    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
-    t.list("pos.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
-    assert!(unsupported(t.diff(Some("parent.avro"), "pos.avro")).contains("merge-on-read"));
-
     t.manifest("d2.avro", &[(1, 2, "eq.parquet", "PARQUET", 1)]);
     t.list(
         "parent-with-deletes.avro",
         &[("m1.avro", 0), ("d2.avro", 1)],
     );
-    // Removing a data file while delete files exist.
+    // Removing a data file while equality delete files exist.
     t.manifest("m2.avro", &[(1, 0, "a.parquet", "PARQUET", 2)]);
     t.list("drop-b.avro", &[("m2.avro", 0), ("d2.avro", 1)]);
     assert!(
         unsupported(t.diff(Some("parent-with-deletes.avro"), "drop-b.avro"))
-            .contains("delete files")
+            .contains("equality delete files")
     );
-    // Removing a delete file.
+    // Removing an equality delete file.
     t.list("no-deletes.avro", &[("m1.avro", 0)]);
     assert!(
         unsupported(t.diff(Some("parent-with-deletes.avro"), "no-deletes.avro"))
-            .contains("removes delete files")
+            .contains("removes equality delete files")
     );
     // Appending to a table with delete files is fine.
     t.data("c.parquet", &[(4, "eu")]);
@@ -361,6 +384,167 @@ fn position_deletes_and_removed_delete_files_are_unsupported() {
         .unwrap();
     assert_eq!(paths(&changes.added), ["c.parquet"]);
     assert!(changes.equality_deletes.is_empty());
+}
+
+// ---------- merge-on-read position deletes (ADR 0017) ----------
+
+fn row(id: i64, region: &str) -> Vec<Datum> {
+    vec![
+        Datum::Value(KeyValue::Integer(id)),
+        Datum::Value(KeyValue::String(region.into())),
+    ]
+}
+
+fn sorted(batch: &integrity_core::RowBatch) -> Vec<Vec<Datum>> {
+    let mut rows = batch.rows().to_vec();
+    rows.sort_by_key(|r| format!("{r:?}"));
+    rows
+}
+
+/// The parent of `parent()` plus position delete file pos1.parquet deleting row 1 of a.parquet
+/// (`(2, "us")`), in delete manifest d1.avro: list parent-pos.avro.
+fn parent_with_position_delete() -> Table {
+    let mut t = parent();
+    t.positions("pos1.parquet", &[("a.parquet", 1)]);
+    t.manifest("d1.avro", &[(1, 1, "pos1.parquet", "PARQUET", 1)]);
+    t.list("parent-pos.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    t
+}
+
+#[test]
+fn position_deletes_remove_exactly_the_rows_they_name() {
+    let mut t = parent();
+    t.positions("pos.parquet", &[("a.parquet", 1)]);
+    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "new.avro").unwrap();
+    assert!(changes.added.is_empty() && changes.removed.is_empty());
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(sorted(&rows.removed), [row(2, "us")]);
+    assert!(rows.added.is_empty());
+    check_operation(Operation::Delete, &rows).unwrap();
+}
+
+#[test]
+fn rows_already_deleted_are_not_removed_again() {
+    let mut t = parent_with_position_delete();
+    // Deletes row 1 again (already gone) and row 0, with a duplicate entry.
+    t.positions(
+        "pos2.parquet",
+        &[("a.parquet", 1), ("a.parquet", 0), ("a.parquet", 0)],
+    );
+    t.manifest("d2.avro", &[(1, 1, "pos2.parquet", "PARQUET", 3)]);
+    t.list(
+        "new.avro",
+        &[("m1.avro", 0), ("d1.avro", 1), ("d2.avro", 1)],
+    );
+    let rows = t
+        .rows(&t.diff(Some("parent-pos.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(sorted(&rows.removed), [row(1, "eu")]);
+    assert!(rows.added.is_empty());
+}
+
+#[test]
+fn a_merge_on_read_update_removes_old_rows_and_adds_new_ones() {
+    let mut t = parent();
+    t.data("c.parquet", &[(2, "eu")]);
+    t.manifest("m2.avro", &[(1, 0, "c.parquet", "PARQUET", 1)]);
+    t.positions("pos.parquet", &[("a.parquet", 1)]);
+    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
+    t.list(
+        "new.avro",
+        &[("m1.avro", 0), ("m2.avro", 0), ("d1.avro", 1)],
+    );
+    let rows = t
+        .rows(&t.diff(Some("parent.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(sorted(&rows.removed), [row(2, "us")]);
+    assert_eq!(sorted(&rows.added), [row(2, "eu")]);
+    check_operation(Operation::Overwrite, &rows).unwrap();
+}
+
+#[test]
+fn compaction_of_a_merge_on_read_table_compares_live_rows() {
+    // a.parquet has (1, eu) live and (2, us) deleted; b.parquet has (3, eu).
+    let mut t = parent_with_position_delete();
+    t.data("ab.parquet", &[(3, "eu"), (1, "eu")]);
+    t.manifest("m2.avro", &[(1, 0, "ab.parquet", "PARQUET", 2)]);
+    t.list("compacted.avro", &[("m2.avro", 0)]);
+    let changes = t.diff(Some("parent-pos.avro"), "compacted.avro").unwrap();
+    assert_eq!(paths(&changes.removed), ["a.parquet", "b.parquet"]);
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(sorted(&rows.removed), [row(1, "eu"), row(3, "eu")]);
+    check_operation(Operation::Replace, &rows).unwrap();
+
+    // A rewrite that brings the deleted row back is not a compaction.
+    t.data("abc.parquet", &[(1, "eu"), (2, "us"), (3, "eu")]);
+    t.manifest("m3.avro", &[(1, 0, "abc.parquet", "PARQUET", 3)]);
+    t.list("resurrected.avro", &[("m3.avro", 0)]);
+    let rows = t
+        .rows(&t.diff(Some("parent-pos.avro"), "resurrected.avro").unwrap())
+        .unwrap();
+    assert!(check_operation(Operation::Replace, &rows).is_err());
+}
+
+#[test]
+fn removing_a_position_delete_file_restores_its_rows() {
+    let t = parent_with_position_delete();
+    let rows = t
+        .rows(&t.diff(Some("parent-pos.avro"), "parent.avro").unwrap())
+        .unwrap();
+    assert_eq!(sorted(&rows.added), [row(2, "us")]);
+    assert!(rows.removed.is_empty());
+}
+
+#[test]
+fn deletes_naming_files_outside_the_table_change_nothing() {
+    let mut t = parent();
+    t.positions("pos.parquet", &[("gone.parquet", 0)]);
+    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let rows = t
+        .rows(&t.diff(Some("parent.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert!(rows.added.is_empty() && rows.removed.is_empty());
+}
+
+#[test]
+fn unprovable_position_deletes_are_unsupported() {
+    // Deletion vectors (v3, Puffin).
+    let mut t = parent();
+    t.manifest("dv.avro", &[(1, 1, "dv.puffin", "PUFFIN", 1)]);
+    t.list("dv-list.avro", &[("m1.avro", 0), ("dv.avro", 1)]);
+    assert!(unsupported(t.diff(Some("parent.avro"), "dv-list.avro")).contains("deletion vectors"));
+
+    // Position and equality deletes in one table.
+    let mut t = parent_with_position_delete();
+    t.id_deletes("eq.parquet", &[3]);
+    t.manifest("d2.avro", &[(1, 2, "eq.parquet", "PARQUET", 1)]);
+    t.list(
+        "mixed.avro",
+        &[("m1.avro", 0), ("d1.avro", 1), ("d2.avro", 1)],
+    );
+    assert!(
+        unsupported(t.diff(Some("parent-pos.avro"), "mixed.avro"))
+            .contains("position and equality deletes")
+    );
+
+    // A position beyond the end of the file.
+    let mut t = parent();
+    t.positions("pos.parquet", &[("b.parquet", 5)]);
+    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "new.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("beyond"));
+
+    // A delete file whose record count lies.
+    let mut t = parent();
+    t.positions("pos.parquet", &[("a.parquet", 0)]);
+    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 7)]);
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "new.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("manifest says"));
 }
 
 #[test]

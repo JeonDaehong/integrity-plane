@@ -125,7 +125,7 @@ pub fn scan(
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?;
         if !changes.equality_deletes.is_empty() {
             return Err(unsupported(format!(
-                "{ident} has delete files; compact it before onboarding"
+                "{ident} has equality delete files; compact it before onboarding"
             )));
         }
         let binding = &bindings[&ident];

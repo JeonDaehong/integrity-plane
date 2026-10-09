@@ -326,6 +326,10 @@ max_inline_validation_bytes = "2GiB"
                 "compat/integrity.polaris.toml",
                 include_str!("../../../compat/integrity.polaris.toml"),
             ),
+            (
+                "compat/integrity.lakekeeper.toml",
+                include_str!("../../../compat/integrity.lakekeeper.toml"),
+            ),
         ] {
             if let Err(e) = Config::from_toml(text) {
                 panic!("{name}: {e}");

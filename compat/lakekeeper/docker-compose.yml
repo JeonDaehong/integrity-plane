@@ -1,0 +1,59 @@
+# Lakekeeper as the upstream catalog for the compatibility tests: Postgres for its metadata,
+# SeaweedFS's S3 gateway for table data (credentials as in deploy/seaweedfs-s3.json).
+services:
+  s3:
+    image: chrislusf/seaweedfs:4.47
+    command: server -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json -dir=/data
+    volumes:
+      - ../../deploy/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    # Lakekeeper hands its storage endpoint (http://s3:8333) to clients: the CI host maps the name
+    # s3 to 127.0.0.1, so the same endpoint works inside and outside the compose network.
+    ports: ["9000:8333", "8333:8333"]
+
+  bucket:
+    image: amazon/aws-cli:2.37.9
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        for i in $$(seq 1 90); do
+          aws --endpoint-url http://s3:8333 s3api head-bucket --bucket warehouse && exit 0;
+          aws --endpoint-url http://s3:8333 s3 mb s3://warehouse && exit 0;
+          sleep 2;
+        done; exit 1
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+
+  migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    command: ["migrate"]
+    environment: &lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: compat-tests-only-not-a-secret
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@db:5432/postgres
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@db:5432/postgres
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+    depends_on:
+      db:
+        condition: service_healthy
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    command: ["serve"]
+    environment: *lakekeeper
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      bucket:
+        condition: service_completed_successfully
+    ports: ["8185:8181"]

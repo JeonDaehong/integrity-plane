@@ -19,7 +19,9 @@ mod parquet_keys;
 pub mod request;
 
 pub use certify::{inject_certificate, snapshot_certificate};
-pub use changes::{FileChanges, InspectError, check_operation, commit_rows, diff_snapshots};
+pub use changes::{
+    FileChanges, InspectError, PositionDeletes, check_operation, commit_rows, diff_snapshots,
+};
 pub use classify::{
     Classification, MainChange, NewSnapshot, Operation, Rejection, check_requirements, classify,
 };

@@ -57,7 +57,8 @@ certificate, including across constraint set versions.
    index), then update the registry (constraint, versions, anchors, degraded cleared) in one
    transaction.
 
-Tables with delete files (position or equality) are refused by the scan in 0.1. A crash between two
+Tables with equality delete files are refused by the scan in 0.1; position deletes are applied
+(ADR 0017). A crash between two
 `replace_all` calls leaves indexes whose contents already equal what the scan derived from the pinned
 snapshots (no commit can run meanwhile), and the registry unchanged; repeating the operation is safe.
 

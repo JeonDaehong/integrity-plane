@@ -14,8 +14,10 @@
 | Several new snapshots on `main` in one commit | Supported; each validated in order | Phase 6 (classification, diff) |
 | Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) | Phase 6 |
 | Equality deletes on other fields, with explicit sequence numbers, or mixed with data-file removal | Rejected | Phase 6 |
-| Position deletes / deletion vectors | Rejected (0.2) | Rejected |
-| Removing delete files; removing data files while delete files exist | Rejected in 0.1 | Rejected (ADR 0008) |
+| Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017) | Yes |
+| Compaction of a merge-on-read table (applying, rewriting or dropping position delete files) | Supported if live rows are unchanged | Yes (ADR 0017) |
+| Deletion vectors (v3, Puffin); position and equality deletes in one table | Rejected | Rejected |
+| Removing equality delete files; removing data files while equality delete files exist | Rejected | Rejected (ADR 0008) |
 | Schema change touching a constrained field | Rejected unless `int→long`, decimal precision widening (and `float→double` for NOT NULL columns) | Phase 6 |
 | Schema/property changes not touching constrained fields | Pass-through | Phase 6 |
 | `remove-snapshots`, properties, sort order, partition spec | Pass-through | Phase 6 |

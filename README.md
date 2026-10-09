@@ -16,10 +16,10 @@ All of these are covered by tests in this repository; none has been run in produ
 - **Constraints** on top-level columns: PRIMARY KEY, UNIQUE (NULLS DISTINCT / NOT DISTINCT),
   NOT NULL, FOREIGN KEY (MATCH SIMPLE / FULL, ON DELETE RESTRICT), checked at commit time against
   the committed data, before the commit reaches the upstream catalog.
-- **Commit shapes** from the capability matrix: append, copy-on-write overwrite and delete,
-  compaction (`replace` with unchanged keys), equality deletes on a key. Anything the Plane cannot
-  prove is refused (`UNSUPPORTED_COMMIT_OPERATION`), including multi-table commits and
-  merge-on-read position deletes.
+- **Commit shapes** from the capability matrix: append, copy-on-write and merge-on-read
+  (position delete) `DELETE` / `UPDATE` / `MERGE`, compaction (`replace` with unchanged rows),
+  equality deletes on a key. Anything the Plane cannot prove is refused
+  (`UNSUPPORTED_COMMIT_OPERATION`), including multi-table commits and v3 deletion vectors.
 - **Certificates** chained through snapshot summaries, and `verify`, which recomputes them from the
   data files and names the first snapshot written around the Plane or tampered with.
 - **Bypass detection** at commit time: a table whose `main` was moved without the Plane puts its
