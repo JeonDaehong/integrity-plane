@@ -60,6 +60,12 @@ jobs:
           ./target/release/integrity verify spark.dvcust
       - name: iceberg-rust
         run: sudo ./compat/iceberg-rust/target/release/integrity-compat-iceberg-rust
+      - name: Every client's snapshots carry valid signatures (RFC 0005)
+        run: |
+          ./target/release/integrity keys
+          for t in pyiceberg.customer pyiceberg.orders spark.customer spark.region spark.mcust spark.dvcust irust.customer; do
+            ./target/release/integrity verify "$t" --require-signatures
+          done
       - name: Appendix A demo
         run: sudo -E env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/demo_test.py
       - name: Logs

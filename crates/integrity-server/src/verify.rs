@@ -38,6 +38,20 @@ pub enum LinkStatus {
     Unverifiable,
 }
 
+/// The signature of a certified snapshot (RFC 0005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SignatureStatus {
+    /// Signed by a trusted key; signature correct.
+    Valid,
+    /// Not signed.
+    Absent,
+    /// Signed by a key the verifier does not trust.
+    UnknownKey,
+    /// Wrong signature, or only one of the two fields present.
+    Invalid,
+}
+
 /// One snapshot of the chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Link {
@@ -47,6 +61,9 @@ pub struct Link {
     pub parent: Option<i64>,
     /// Its `operation`.
     pub operation: Option<String>,
+    /// Signature status of a certified snapshot (RFC 0005).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureStatus>,
     /// The verdict.
     pub status: LinkStatus,
     /// Why, when not `OK`.
@@ -68,6 +85,8 @@ pub struct Report {
     pub first_broken: Option<i64>,
     /// True iff every snapshot is `OK` or `ANCHOR`.
     pub ok: bool,
+    /// True iff every certified snapshot carries a valid signature by a trusted key.
+    pub signed: bool,
 }
 
 /// What the verifier needs from the registry and the catalog.
@@ -82,6 +101,28 @@ pub struct Input {
     pub others: BTreeMap<String, TableMetadata>,
     /// Snapshots that start a chain (current and retired anchors).
     pub anchors: Vec<Option<i64>>,
+    /// Public keys whose signatures are trusted.
+    pub trusted_keys: Vec<[u8; 32]>,
+    /// Unsigned snapshots and unknown keys break the chain.
+    pub require_signatures: bool,
+}
+
+fn signature_status(input: &Input, snapshot: SnapshotId, cert: &Digest) -> SignatureStatus {
+    match integrity_iceberg::snapshot_signature(&input.meta, snapshot) {
+        Err(_) => SignatureStatus::Invalid,
+        Ok(None) => SignatureStatus::Absent,
+        Ok(Some((key_id, signature))) => match input
+            .trusted_keys
+            .iter()
+            .find(|k| integrity_core::signature::key_id(k) == key_id)
+        {
+            None => SignatureStatus::UnknownKey,
+            Some(key) if integrity_core::signature::verify(key, cert, &signature) => {
+                SignatureStatus::Valid
+            }
+            Some(_) => SignatureStatus::Invalid,
+        },
+    }
 }
 
 /// A constraint set version, resolved for this table.
@@ -182,6 +223,7 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
             snapshot: id,
             parent: snap.parent_snapshot_id,
             operation: snap.summary.get("operation").cloned(),
+            signature: None,
             status,
             detail,
         };
@@ -286,7 +328,7 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                 previous,
             }))
         })();
-        chain.push(match recomputed {
+        let mut l = match recomputed {
             Ok(expected) if expected == cert => link(LinkStatus::Ok, None),
             Ok(_) => link(
                 LinkStatus::Mismatch,
@@ -295,7 +337,32 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                 ),
             ),
             Err(e) => link(LinkStatus::Unverifiable, Some(e)),
-        });
+        };
+        let sig = signature_status(input, SnapshotId(id), &cert);
+        l.signature = Some(sig);
+        if l.status == LinkStatus::Ok {
+            match sig {
+                SignatureStatus::Invalid => {
+                    l.status = LinkStatus::Malformed;
+                    l.detail = Some("invalid certificate signature".into());
+                }
+                SignatureStatus::Absent | SignatureStatus::UnknownKey
+                    if input.require_signatures =>
+                {
+                    l.status = LinkStatus::Malformed;
+                    l.detail = Some(
+                        if sig == SignatureStatus::Absent {
+                            "unsigned certificate"
+                        } else {
+                            "certificate signed by an untrusted key"
+                        }
+                        .into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        chain.push(l);
     }
     if let Some(id) = truncated {
         chain.insert(
@@ -304,6 +371,7 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                 snapshot: id,
                 parent: None,
                 operation: None,
+                signature: None,
                 status: LinkStatus::Unverifiable,
                 detail: Some("snapshot expired before the chain start".into()),
             },
@@ -321,11 +389,16 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
     let ok = chain
         .iter()
         .all(|l| matches!(l.status, LinkStatus::Ok | LinkStatus::Anchor));
+    let signed = chain
+        .iter()
+        .filter(|l| l.signature.is_some())
+        .all(|l| l.signature == Some(SignatureStatus::Valid));
     Report {
         table: input.identifier.clone(),
         head,
         chain,
         first_broken,
         ok,
+        signed,
     }
 }

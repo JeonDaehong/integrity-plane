@@ -10,6 +10,11 @@ catalog_uri = "http://127.0.0.1:8182"
 [control_store]
 path = "target/compat-control"
 
+# Certificates are signed (RFC 0005); the workflow checks every client's tables with
+# `integrity verify --require-signatures`.
+[signing]
+key_file = "target/compat-control/signing.key"
+
 # Files are local (/tmp/warehouse); no [storage] section needed.
 
 # customer(customer_id long, name string); orders(order_id long, customer_id long)

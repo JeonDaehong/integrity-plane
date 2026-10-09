@@ -21,8 +21,9 @@ All of these are covered by tests in this repository; none has been run in produ
   (position delete) `DELETE` / `UPDATE` / `MERGE`, compaction (`replace` with unchanged rows),
   equality deletes on a key, format v3 deletion vectors. Anything the Plane cannot prove is refused
   (`UNSUPPORTED_COMMIT_OPERATION`), including multi-table commits.
-- **Certificates** chained through snapshot summaries, and `verify`, which recomputes them from the
-  data files and names the first snapshot written around the Plane or tampered with.
+- **Certificates** chained through snapshot summaries, optionally signed with Ed25519 (RFC 0005),
+  and `verify`, which recomputes them from the data files, checks signatures against pinned or
+  published keys, and names the first snapshot written around the Plane or tampered with.
 - **Bypass detection** at commit time: a table whose `main` was moved without the Plane puts its
   domain in a degraded state until an operator rebuilds it.
 - **Crash recovery** through a durable transaction log, idempotent retries (`Idempotency-Key`),

@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 integrity-types.workspace = true
 blake3.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

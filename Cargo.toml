@@ -33,6 +33,10 @@ serde_json = "1"
 apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
 # Iceberg v3 deletion vectors are 64-bit Roaring bitmaps (ADR 0018). MIT OR Apache-2.0, pure Rust.
 roaring = "0.11.5"
+# Certificate signatures (RFC 0005). BSD-3-Clause, pure Rust.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+# OS randomness for generating signing keys.
+getrandom = "0.3.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

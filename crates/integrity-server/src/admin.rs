@@ -518,7 +518,12 @@ impl Gateway {
 impl Gateway {
     /// `GET /v1/integrity/verify?table=…`: recomputes the certificate chain of `main` from the
     /// data files. A broken chain is a bypass: the domain is degraded until rebuilt (spec §18).
-    pub async fn verify(&self, table: &str) -> Result<Value, ApiError> {
+    pub async fn verify(
+        &self,
+        table: &str,
+        trusted_keys: Option<&str>,
+        require_signatures: bool,
+    ) -> Result<Value, ApiError> {
         let _shared = self.admin.read().await;
         let doc = self.registry.snapshot();
         let history = doc.history.get(table).cloned().unwrap_or_default();
@@ -549,12 +554,31 @@ impl Gateway {
         if let Some(a) = doc.anchors.get(table) {
             anchors.push(a.snapshot);
         }
+        let authoritative = trusted_keys.is_none() && !require_signatures;
+        // Keys given by the caller (pinned), else every key the Plane has published.
+        let trusted_keys = match trusted_keys {
+            Some(list) => list
+                .split(',')
+                .filter(|k| !k.trim().is_empty())
+                .map(|k| {
+                    integrity_core::signature::public_key_from_hex(k.trim())
+                        .ok_or_else(|| invalid(format!("not an Ed25519 public key: {k}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => doc
+                .keys
+                .values()
+                .filter_map(|k| integrity_core::signature::public_key_from_hex(&k.public_key))
+                .collect(),
+        };
         let input = verify::Input {
             identifier: table.to_owned(),
             meta,
             history,
             others,
             anchors,
+            trusted_keys,
+            require_signatures: require_signatures || self.require_signatures,
         };
         let io = Arc::clone(&self.io);
         let report = tokio::task::spawn_blocking(move || verify::verify(io.as_ref(), &input))
@@ -562,7 +586,9 @@ impl Gateway {
             .map_err(|e| {
                 ApiError::new(ErrorCode::IndexDegraded, format!("verify task failed: {e}"))
             })?;
-        if let Some(broken) = report.first_broken {
+        // Only a break found under the Plane's own trust settings degrades the domain; a caller
+        // pinning other keys or demanding more gets a report, not a say over enforcement.
+        if let Some(broken) = report.first_broken.filter(|_| authoritative) {
             let reason = format!("{table}: certificate chain broken at snapshot {broken}");
             let newly = self.registry.update(|d| {
                 Ok::<_, ApiError>(

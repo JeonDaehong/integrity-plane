@@ -20,7 +20,9 @@ commands:
                   --columns COL[,COL...] [--nulls distinct|not_distinct]
                   [--ref-table NS.TABLE --ref-constraint NAME|ID] [--match simple|full]
   constraints drop ID
-  verify NS.TABLE            exit 1 if the certificate chain is broken
+  verify NS.TABLE [--trusted-key HEX]... [--require-signatures]
+                             exit 1 if the certificate chain is broken or incomplete
+  keys                       public keys the Plane signs certificates with
   rebuild CONSTRAINT_ID      rebuild the indexes of the constraint's domain
   domain NS.TABLE
   domain disable NS.TABLE --reason TEXT   forward the domain's commits unchecked until a rebuild
@@ -202,13 +204,34 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
             body: None,
             verify: false,
         },
-        ["verify", table] => Call {
-            verify: true,
-            ..get(format!(
-                "/v1/integrity/verify{}",
-                query(&[("table", Some(table))])
-            ))
-        },
+        ["verify", table, ..] => {
+            let mut trusted = Vec::new();
+            let mut require = false;
+            let mut it = rest[2..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--trusted-key" => trusted.push(
+                        it.next()
+                            .ok_or("--trusted-key needs a public key (hex)")?
+                            .clone(),
+                    ),
+                    "--require-signatures" => require = true,
+                    other => return Err(format!("unexpected argument {other}")),
+                }
+            }
+            let trusted = (!trusted.is_empty()).then(|| trusted.join(","));
+            Call {
+                verify: true,
+                ..get(format!(
+                    "/v1/integrity/verify{}",
+                    query(&[
+                        ("table", Some(table)),
+                        ("trusted_keys", trusted.as_deref()),
+                        ("require_signatures", require.then_some("true")),
+                    ])
+                ))
+            }
+        }
         ["rebuild", id] => Call {
             method: "POST",
             path: format!("/v1/integrity/indexes/{}/rebuild", number(id)?),
@@ -227,6 +250,7 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
             }
         }
         ["domain", table] => get(format!("/v1/integrity/domains/{}", encode(table))),
+        ["keys"] => get("/v1/integrity/keys"),
         ["txn", id] => get(format!("/v1/integrity/transactions/{}", number(id)?)),
         ["audit", ..] => {
             let f = flags(&rest[1..])?;
@@ -272,7 +296,10 @@ fn render_verify(report: &Value) -> (String, bool) {
         let status = link["status"].as_str().unwrap_or("?");
         let snapshot = link["snapshot"].as_i64().unwrap_or_default();
         let operation = link["operation"].as_str().unwrap_or("-");
-        out.push_str(&format!("  {status:<12} {snapshot:>20}  {operation}"));
+        let signature = link["signature"].as_str().unwrap_or("-");
+        out.push_str(&format!(
+            "  {status:<12} {snapshot:>20}  {signature:<11}  {operation}"
+        ));
         if let Some(d) = link["detail"].as_str() {
             out.push_str(&format!("  {d}"));
         }
@@ -397,8 +424,15 @@ mod tests {
             p("constraints drop 7").unwrap().call.path,
             "/v1/integrity/constraints/7"
         );
-        let verify = p("verify db.a b").unwrap_err();
-        assert!(verify.contains("unknown command"), "{verify}");
+        assert!(p("verify db.a b").is_err());
+        let pinned = p("verify db.orders --trusted-key aa --trusted-key bb --require-signatures")
+            .unwrap()
+            .call;
+        assert_eq!(
+            pinned.path,
+            "/v1/integrity/verify?table=db.orders&trusted_keys=aa%2Cbb&require_signatures=true"
+        );
+        assert_eq!(p("keys").unwrap().call.path, "/v1/integrity/keys");
         let v = p("verify db.orders").unwrap().call;
         assert!(v.verify);
         assert_eq!(v.path, "/v1/integrity/verify?table=db.orders");

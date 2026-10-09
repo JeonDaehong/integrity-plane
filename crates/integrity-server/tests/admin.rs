@@ -32,6 +32,7 @@ struct Env {
     up: SocketAddr,
     token: Option<String>,
     redact: bool,
+    seed: Option<[u8; 32]>,
     running: Option<Running>,
 }
 
@@ -46,6 +47,7 @@ async fn start_gateway(
     up: SocketAddr,
     token: Option<&str>,
     redact: bool,
+    seed: Option<[u8; 32]>,
     index_file: &str,
     log_file: &str,
 ) -> (String, Running) {
@@ -80,7 +82,11 @@ async fn start_gateway(
     )
     .unwrap()
     .with_admin_token(token.map(str::to_owned))
-    .with_redact_keys(redact);
+    .with_redact_keys(redact)
+    .with_signer(
+        seed.map(|s| integrity_core::CertSigner::from_seed(&s)),
+        false,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -108,6 +114,10 @@ async fn env(token: Option<&str>) -> Env {
 }
 
 async fn env_with(token: Option<&str>, redact: bool) -> Env {
+    env_full(token, redact, None).await
+}
+
+async fn env_full(token: Option<&str>, redact: bool, seed: Option<[u8; 32]>) -> Env {
     let files = Arc::new(Files {
         dir: Dir::new(),
         next: AtomicI64::new(1),
@@ -131,7 +141,7 @@ async fn env_with(token: Option<&str>, redact: bool) -> Env {
     )
     .await;
     let (gateway, running) =
-        start_gateway(&files, up, token, redact, "indexes.redb", "txn.redb").await;
+        start_gateway(&files, up, token, redact, seed, "indexes.redb", "txn.redb").await;
     Env {
         http: reqwest::Client::new(),
         gateway,
@@ -141,6 +151,7 @@ async fn env_with(token: Option<&str>, redact: bool) -> Env {
         up,
         token: token.map(str::to_owned),
         redact,
+        seed,
         running: Some(running),
     }
 }
@@ -158,6 +169,7 @@ impl Env {
             self.up,
             self.token.as_deref(),
             self.redact,
+            self.seed,
             index_file,
             log_file,
         )
@@ -992,4 +1004,110 @@ async fn verify_without_the_parent_snapshot_is_unverifiable_not_broken() {
     assert_eq!(report["first_broken"], Value::Null);
     let (_, domain) = e.api("GET", "domains/db.customer", None).await;
     assert_eq!(domain["state"], "Healthy", "no false alarm");
+}
+
+fn signatures(report: &Value) -> Vec<&str> {
+    report["chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l["signature"].as_str())
+        .collect()
+}
+
+/// RFC 0005: certificates are signed; verify checks signatures against trusted keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_certificates_verify_and_tampering_is_caught() {
+    let mut e = env_full(None, false, Some([5u8; 32])).await;
+    e.register_demo().await;
+    let (_, body) = e.through_plane("customer", &[(1, None)]).await;
+    let snaps = body["metadata"]["snapshots"].as_array().unwrap();
+    let summary = &snaps.last().unwrap()["summary"];
+    let signer = integrity_core::CertSigner::from_seed(&[5u8; 32]);
+    assert_eq!(summary["integrity.cert-key-id"], signer.key_id());
+    assert_eq!(
+        summary["integrity.cert-signature"].as_str().unwrap().len(),
+        128
+    );
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+
+    let (_, keys) = e.api("GET", "keys", None).await;
+    assert_eq!(keys["keys"][0]["key_id"], signer.key_id());
+    assert_eq!(keys["keys"][0]["active"], true);
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(signatures(&report), ["VALID", "VALID"], "{report}");
+    assert_eq!(report["signed"], true);
+
+    // A verifier that pins another key does not trust these signatures...
+    let other = integrity_core::CertSigner::from_seed(&[6u8; 32]);
+    let pinned = integrity_core::signature::public_key_hex(&other.public_key());
+    let (_, report) = e
+        .api(
+            "GET",
+            &format!("verify?table=db.customer&trusted_keys={pinned}"),
+            None,
+        )
+        .await;
+    assert_eq!(signatures(&report), ["UNKNOWN_KEY", "UNKNOWN_KEY"]);
+    assert_eq!(report["ok"], true, "reported, not a break by default");
+    assert_eq!(report["signed"], false);
+    // ... and requiring signatures makes that a break.
+    let (_, report) = e
+        .api(
+            "GET",
+            &format!("verify?table=db.customer&trusted_keys={pinned}&require_signatures=true"),
+            None,
+        )
+        .await;
+    assert_eq!(report["ok"], false);
+    assert!(report["first_broken"].is_i64());
+
+    // Rotation: a new key signs new snapshots; both keys stay published and trusted.
+    e.seed = Some([8u8; 32]);
+    e.restart("indexes.redb", "txn.redb").await;
+    assert_eq!(e.through_plane("customer", &[(3, None)]).await.0, 200);
+    let (_, keys) = e.api("GET", "keys", None).await;
+    assert_eq!(keys["keys"].as_array().unwrap().len(), 2);
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(signatures(&report), ["VALID", "VALID", "VALID"], "{report}");
+
+    // A tampered signature on a correct certificate breaks the chain.
+    {
+        let mut up = e._shared.lock().unwrap();
+        let meta = up
+            .tables
+            .get_mut("/v1/namespaces/db/tables/customer")
+            .unwrap();
+        let snaps = meta["snapshots"].as_array_mut().unwrap();
+        let sig = snaps[1]["summary"]["integrity.cert-signature"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let flipped = if sig.starts_with('0') { "1" } else { "0" };
+        snaps[1]["summary"]["integrity.cert-signature"] = json!(format!("{flipped}{}", &sig[1..]));
+    }
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(statuses(&report), ["OK", "MALFORMED", "OK"], "{report}");
+    assert_eq!(signatures(&report)[1], "INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requiring_signatures_flags_snapshots_from_before_signing() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    let (_, unsigned) = e.through_plane("customer", &[(1, None)]).await;
+    e.seed = Some([5u8; 32]);
+    e.restart("indexes.redb", "txn.redb").await;
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(signatures(&report), ["ABSENT", "VALID"]);
+    assert_eq!(report["ok"], true);
+    let (_, report) = e
+        .api(
+            "GET",
+            "verify?table=db.customer&require_signatures=true",
+            None,
+        )
+        .await;
+    assert_eq!(report["first_broken"], head_of(&unsigned), "{report}");
 }

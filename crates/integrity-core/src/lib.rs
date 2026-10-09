@@ -10,6 +10,7 @@ pub mod key;
 pub mod logical_type;
 pub mod nulls;
 pub mod rows;
+pub mod signature;
 pub mod verdict;
 
 pub use certificate::{
@@ -28,4 +29,5 @@ pub use key::{
 pub use logical_type::{LogicalType, UnsupportedKeyType};
 pub use nulls::{KeyDisposition, KeyRole, classify};
 pub use rows::{ArityMismatch, CommitRows, Datum, RowBatch};
+pub use signature::{CertSigner, SUMMARY_CERT_KEY_ID, SUMMARY_CERT_SIGNATURE};
 pub use verdict::Violation;

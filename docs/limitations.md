@@ -5,8 +5,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Out of scope for 0.1 (by design)
 
-- CHECK constraints, branch-gated publication, signed certificates (RFC 0005, draft), picking up
-  constraints from engine DDL: planned for 0.2. Merge-on-read position deletes and v3 deletion
+- CHECK constraints, branch-gated publication, picking up constraints from engine DDL: planned
+  for 0.2. Certificates can be signed (RFC 0005). Merge-on-read position deletes and v3 deletion
   vectors are supported (ADR 0017, ADR 0018).
 - Multi-table atomic commits (`/transactions/commit` is refused), high availability: 0.3.
 - Other table formats than Iceberg (ADR 0012); `ON DELETE CASCADE`; per-key locking (ADR 0015).
@@ -38,7 +38,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Certificates and verification
 
-- Certificates are unsigned (`threat-model.md`).
+- Certificates are signed only with `[signing]` configured; the key is a file in the control
+  store (no HSM or KMS integration).
 - A forged certificate copied into a bypassing snapshot passes the commit-time check; only `verify`
   detects it.
 - `verify` cannot recompute snapshots with equality deletes (reported `UNVERIFIABLE`) or chains whose

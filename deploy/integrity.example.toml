@@ -30,6 +30,12 @@ path = "/var/lib/integrity"
 [limits]
 max_inline_validation_bytes = "2GiB"
 
+# Sign certificates (RFC 0005). The key file is created on first start if missing; publish its public
+# key (GET /v1/integrity/keys) to verifiers, who pin it with `integrity verify --trusted-key`.
+# [signing]
+# key_file = "/var/lib/integrity/signing.key"
+# require = false                 # true: verify treats unsigned snapshots as a broken chain
+
 [errors]
 # Keep key values out of violation reports and the audit log (keys can be personal data).
 redact_keys = false

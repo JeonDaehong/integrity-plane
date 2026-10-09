@@ -26,9 +26,23 @@ pub struct Config {
     /// Error reporting.
     #[serde(default)]
     pub errors: ErrorsConfig,
+    /// Certificate signing (RFC 0005); absent = certificates are not signed.
+    #[serde(default)]
+    pub signing: Option<SigningConfig>,
     /// Constraints imported into the registry on first start.
     #[serde(default, rename = "constraint")]
     pub constraints: Vec<ConstraintConfig>,
+}
+
+/// `[signing]` (RFC 0005).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigningConfig {
+    /// File holding the 32-byte Ed25519 seed; generated (owner-only) if it does not exist.
+    pub key_file: PathBuf,
+    /// `verify` treats unsigned snapshots and unknown keys as a broken chain.
+    #[serde(default)]
+    pub require: bool,
 }
 
 /// `[errors]` (spec §24, §26).

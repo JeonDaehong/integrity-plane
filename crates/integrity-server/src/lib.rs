@@ -14,6 +14,7 @@ pub mod onboard;
 pub mod pipeline;
 pub mod registry;
 pub mod report;
+pub mod signing;
 pub mod store;
 pub mod verify;
 
@@ -45,6 +46,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/integrity/domains/{table}", get(domain))
         .route("/v1/integrity/domains/{table}/disable", post(disable))
         .route("/metrics", get(metrics))
+        .route("/v1/integrity/keys", get(keys))
         .fallback(catalog)
         .with_state(gateway)
 }
@@ -155,7 +157,13 @@ async fn verify(
         )
             .into_response();
     };
-    reply(g.verify(table).await)
+    let require = q
+        .get("require_signatures")
+        .is_some_and(|v| v == "true" || v == "1");
+    reply(
+        g.verify(table, q.get("trusted_keys").map(String::as_str), require)
+            .await,
+    )
 }
 
 fn not_found(what: &str) -> Response {
@@ -206,6 +214,10 @@ async fn disable(
         .and_then(|v| v["reason"].as_str().map(str::to_owned))
         .unwrap_or_default();
     reply(g.disable(&table, &reason, &headers).await)
+}
+
+async fn keys(State(g): State<Arc<Gateway>>) -> Response {
+    axum::Json(g.keys()).into_response()
 }
 
 async fn metrics(State(g): State<Arc<Gateway>>) -> Response {

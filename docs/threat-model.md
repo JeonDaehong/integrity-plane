@@ -100,8 +100,11 @@ The Plane reads table metadata from the upstream catalog and trusts it to apply 
 it forwarded. A compromised catalog can publish arbitrary snapshots; without certificates,
 `verify` reports them as `MISSING`. Certificates are unsigned in 0.1 and everything they cover is
 public, so an attacker who controls the catalog can also compute certificates that `verify`
-accepts, including for data the Plane never validated. Signed certificates (planned for 0.2) are
-the mitigation; until then a certificate proves consistency of the chain, not who produced it.
+accepts, including for data the Plane never validated. With `[signing]` enabled (RFC 0005) every
+certificate is also signed with an Ed25519 key only the Plane holds: verifiers that pin the Plane's
+public key (`integrity verify --trusted-key … --require-signatures`) reject such forgeries. Protect
+the key file like the rest of the control store; without signing, a certificate proves consistency
+of the chain, not who produced it.
 
 ## Key values and PII
 

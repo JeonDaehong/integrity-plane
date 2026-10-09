@@ -139,6 +139,10 @@ constraint; the structured error is stored with the audit event and served with 
 commits are then forwarded unchecked and uncertified until a rebuild. Configuration comes from TOML
 with `INTEGRITY__SECTION__KEY` environment overrides.
 
+With `[signing]`, every certificate is also signed (Ed25519, RFC 0005; summary fields
+`integrity.cert-signature` and `integrity.cert-key-id`), public keys are published at
+`GET /v1/integrity/keys`, and `verify` reports a signature status per snapshot.
+
 Also served: `GET /v1/integrity/transactions/{id}` (the log's records, decision and structured error),
 `GET /v1/integrity/domains/{table}` (`Healthy`, `Degraded` with reasons, or `RecoveryRequired`),
 `GET /v1/integrity/audit?table=&since=`, and Prometheus text at `/metrics` (commit verdicts,

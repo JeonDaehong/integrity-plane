@@ -272,6 +272,10 @@ pub struct Gateway {
     upstream_token: Mutex<Option<(String, std::time::Instant)>>,
     /// Leave key values out of violation reports.
     pub(crate) redact_keys: bool,
+    /// Certificate signer (RFC 0005), if signing is enabled.
+    pub(crate) signer: Option<integrity_core::CertSigner>,
+    /// `verify` requires signatures.
+    pub(crate) require_signatures: bool,
     /// Held shared by every commit request, exclusively by constraint changes and rebuilds
     /// (ADR 0011).
     pub(crate) admin: tokio::sync::RwLock<()>,
@@ -314,6 +318,8 @@ impl Gateway {
             upstream_auth: None,
             upstream_token: Mutex::new(None),
             redact_keys: false,
+            signer: None,
+            require_signatures: false,
             admin: tokio::sync::RwLock::new(()),
             domains: std::sync::Mutex::new(BTreeMap::new()),
             transient: std::sync::Mutex::new(BTreeMap::new()),
@@ -490,6 +496,55 @@ impl Gateway {
             token.to_owned(),
             body["expires_in"].as_u64().unwrap_or(3600),
         ))
+    }
+
+    /// Signs certificates with `signer` (RFC 0005) and records its public key in the registry;
+    /// `require` makes `verify` treat unsigned snapshots as a broken chain.
+    pub fn with_signer(
+        mut self,
+        signer: Option<integrity_core::CertSigner>,
+        require: bool,
+    ) -> Self {
+        if let Some(s) = &signer {
+            let id = s.key_id().to_owned();
+            let public = integrity_core::signature::public_key_hex(&s.public_key());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let recorded = self.registry.update(|d| {
+                d.keys.entry(id.clone()).or_insert(crate::store::KeyRecord {
+                    public_key: public.clone(),
+                    first_used_ms: now,
+                });
+                d.active_key = Some(id.clone());
+                Ok::<_, StoreError>(())
+            });
+            if let Err(e) = recorded {
+                tracing::error!("cannot record the signing key: {e}");
+            }
+        }
+        self.signer = signer;
+        self.require_signatures = require;
+        self
+    }
+
+    /// `GET /v1/integrity/keys`: every public key the Plane has signed with (RFC 0005).
+    pub fn keys(&self) -> Value {
+        let doc = self.registry.snapshot();
+        let keys: Vec<Value> = doc
+            .keys
+            .iter()
+            .map(|(id, k)| {
+                serde_json::json!({
+                    "key_id": id,
+                    "algorithm": "ed25519",
+                    "public_key": k.public_key,
+                    "active": doc.active_key.as_deref() == Some(id.as_str()),
+                    "first_used_ms": k.first_used_ms,
+                })
+            })
+            .collect();
+        serde_json::json!({ "keys": keys })
     }
 
     /// Leaves sample key values out of violation reports (`errors.redact_keys`).
@@ -1258,6 +1313,20 @@ impl Gateway {
                     TxnState::Aborted,
                 )
             })?;
+            if let Some(signer) = &self.signer {
+                integrity_iceberg::inject_signature(
+                    &mut request,
+                    &plan.step,
+                    signer.key_id(),
+                    &signer.sign(&cert),
+                )
+                .map_err(|e| {
+                    abort(
+                        ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()),
+                        TxnState::Aborted,
+                    )
+                })?;
+            }
             certificates.push(cert.to_hex());
             previous = cert;
         }

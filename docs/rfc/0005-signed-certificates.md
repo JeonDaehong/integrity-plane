@@ -1,6 +1,6 @@
 # RFC 0005: Signed integrity certificates
 
-- Status: Draft
+- Status: Implemented
 - Date: 2026-10-09
 - Affects: certificate format (adds fields; RFC 0002 certificates are unchanged)
 
@@ -59,6 +59,13 @@ fields or neither; one without the other is malformed.
   a new seed.
 - `GET /v1/integrity/keys` lists them:
   `{"keys": [{"key_id": "…", "algorithm": "ed25519", "public_key": "<hex>", "active": true}]}`.
+
+### Who decides about breaks
+
+A `verify` run with the Plane's own settings (its published keys, `[signing] require`) is
+authoritative: a break degrades the domain, as for unsigned bypasses. A run with caller-supplied
+trust (`trusted_keys`, `require_signatures`) only reports; a caller's choice of keys must not switch
+off enforcement.
 
 ### Verification
 

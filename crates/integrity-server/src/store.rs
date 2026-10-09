@@ -51,6 +51,12 @@ pub struct RegistryDoc {
     /// uncertified until the domain is rebuilt. Value: the reason given.
     #[serde(default)]
     pub disabled: BTreeMap<String, String>,
+    /// Every certificate signing key the Plane has used, by key id (RFC 0005). Never removed.
+    #[serde(default)]
+    pub keys: BTreeMap<String, KeyRecord>,
+    /// The key id currently signing.
+    #[serde(default)]
+    pub active_key: Option<String>,
     /// Identity of the index store the anchors were built with: a different one means the index
     /// file was lost and recreated empty.
     #[serde(default)]
@@ -147,6 +153,15 @@ impl RegistryDoc {
             .insert(v, set);
         v
     }
+}
+
+/// A certificate signing key the Plane has used (RFC 0005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRecord {
+    /// Ed25519 public key, hex.
+    pub public_key: String,
+    /// First use, milliseconds since the epoch.
+    pub first_used_ms: u64,
 }
 
 /// One audit event (spec §25). Never contains key values.

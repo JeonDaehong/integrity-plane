@@ -57,6 +57,13 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     .with_admin_token(config.server.admin_token.clone())
     .with_redact_keys(config.errors.redact_keys)
     .with_upstream_auth(config.upstream.auth.clone());
+    let gateway = match &config.signing {
+        Some(s) => gateway.with_signer(
+            Some(integrity_server::signing::load_or_create(&s.key_file)?),
+            s.require,
+        ),
+        None => gateway,
+    };
     if let Err(e) = gateway.recover_on_start().await {
         tracing::warn!("recovery pending until upstream answers: {e}");
     }
