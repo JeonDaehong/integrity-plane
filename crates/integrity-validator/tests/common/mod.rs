@@ -136,6 +136,14 @@ impl Engine {
         match self.validator.validate(&rows, &self.indexes)? {
             Decision::Rejected(v) => Ok(Verdict::Rejected(v)),
             Decision::Accepted(deltas) => {
+                // `verify` recomputes certificates from rows alone; it must agree with validation.
+                if rows.equality_deletes.is_none() {
+                    assert_eq!(
+                        &self.validator.net_key_deltas(&rows)?,
+                        deltas.key_deltas(),
+                        "net_key_deltas disagrees with validate"
+                    );
+                }
                 let staged = deltas.stage(&self.indexes)?;
                 self.epoch += 1;
                 for (id, s) in staged {

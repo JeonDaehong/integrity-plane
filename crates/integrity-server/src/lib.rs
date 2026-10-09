@@ -9,10 +9,12 @@ pub mod config;
 pub mod error;
 pub mod fileio;
 pub mod gateway;
+pub mod metrics;
 pub mod onboard;
 pub mod pipeline;
 pub mod registry;
 pub mod store;
+pub mod verify;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,6 +39,10 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/integrity/constraints/{id}", delete(drop_constraint))
         .route("/v1/integrity/indexes/{id}/rebuild", post(rebuild))
         .route("/v1/integrity/audit", get(audit))
+        .route("/v1/integrity/verify", get(verify))
+        .route("/v1/integrity/transactions/{id}", get(transaction))
+        .route("/v1/integrity/domains/{table}", get(domain))
+        .route("/metrics", get(metrics))
         .fallback(catalog)
         .with_state(gateway)
 }
@@ -130,6 +136,69 @@ async fn audit(
     }
     let since = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
     reply(g.audit_events(q.get("table").map(String::as_str), since))
+}
+
+async fn verify(
+    State(g): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Response {
+    if !authorized(&g, &headers) {
+        return unauthorized();
+    }
+    let Some(table) = q.get("table") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "verify needs ?table=namespace.table",
+        )
+            .into_response();
+    };
+    reply(g.verify(table, &headers).await)
+}
+
+fn not_found(what: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": format!("no such {what}") })),
+    )
+        .into_response()
+}
+
+async fn transaction(
+    State(g): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> Response {
+    if !authorized(&g, &headers) {
+        return unauthorized();
+    }
+    g.transaction(id).map_or_else(
+        || not_found("transaction"),
+        |v| axum::Json(v).into_response(),
+    )
+}
+
+async fn domain(
+    State(g): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Path(table): Path<String>,
+) -> Response {
+    if !authorized(&g, &headers) {
+        return unauthorized();
+    }
+    g.domain_state(&table)
+        .map_or_else(|| not_found("domain"), |v| axum::Json(v).into_response())
+}
+
+async fn metrics(State(g): State<Arc<Gateway>>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        g.metrics_text(),
+    )
+        .into_response()
 }
 
 async fn catalog(State(g): State<Arc<Gateway>>, request: Request) -> Response {

@@ -90,6 +90,18 @@ async fn env(token: Option<&str>) -> Env {
 impl Env {
     /// Appends `rows` to `table` through `base` (the gateway, or upstream for a bypass).
     async fn append(&self, base: &str, table: &str, rows: &[Row]) -> (u16, Value) {
+        self.append_with(base, table, rows, |_| json!({"operation": "append"}))
+            .await
+    }
+
+    /// Like `append`, with the new snapshot's summary computed from the current metadata.
+    async fn append_with(
+        &self,
+        base: &str,
+        table: &str,
+        rows: &[Row],
+        summary: impl Fn(&Value) -> Value,
+    ) -> (u16, Value) {
         let url = format!("{base}/v1/namespaces/db/tables/{table}");
         let meta: Value = self
             .http
@@ -111,7 +123,7 @@ impl Env {
             "updates": [
                 {"action": "add-snapshot", "snapshot": {"snapshot-id": id, "parent-snapshot-id": head,
                     "sequence-number": id, "timestamp-ms": id, "manifest-list": list,
-                    "summary": {"operation": "append"}}},
+                    "summary": summary(&meta["metadata"])}},
                 {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": id, "type": "branch"}
             ]
         });
@@ -440,4 +452,174 @@ async fn the_api_requires_the_admin_token_when_configured() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+}
+
+fn head_of(meta: &Value) -> i64 {
+    meta["metadata"]["refs"]["main"]["snapshot-id"]
+        .as_i64()
+        .unwrap()
+}
+
+fn statuses(report: &Value) -> Vec<&str> {
+    report["chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["status"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_pinpoints_the_snapshot_written_around_the_plane() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    assert_eq!(e.through_plane("orders", &[(10, Some(1))]).await.0, 200);
+    assert_eq!(e.through_plane("orders", &[(11, Some(1))]).await.0, 200);
+    let (_, report) = e.api("GET", "verify?table=db.orders", None).await;
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(statuses(&report), ["OK", "OK"]);
+
+    let (status, bypass) = e.bypassing("orders", &[(12, Some(999))]).await;
+    assert_eq!(status, 200);
+    let bypassed = head_of(&bypass);
+    let (status, report) = e.api("GET", "verify?table=db.orders", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["first_broken"], bypassed, "{report}");
+    assert_eq!(statuses(&report), ["OK", "OK", "MISSING"]);
+    // Verification found a bypass: the domain stops accepting commits until rebuilt.
+    let (_, domain) = e.api("GET", "domains/db.customer", None).await;
+    assert_eq!(domain["state"], "Degraded", "{domain}");
+    assert_eq!(domain["tables"], json!(["db.customer", "db.orders"]));
+    assert!(
+        e.audit_kinds()
+            .await
+            .contains(&"BYPASS_DETECTED".to_owned())
+    );
+    let (_, customer) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(customer["ok"], true, "{customer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_recomputes_certificates_instead_of_trusting_them() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    // A bypassing writer copies the head's certificate fields into its own snapshot.
+    let (status, forged) = e
+        .append_with(&e.upstream.clone(), "customer", &[(2, None)], |meta| {
+            let head = meta["refs"]["main"]["snapshot-id"].clone();
+            let snap = meta["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["snapshot-id"] == head)
+                .unwrap()
+                .clone();
+            let mut summary = snap["summary"].clone();
+            summary["operation"] = json!("append");
+            summary
+        })
+        .await;
+    assert_eq!(status, 200);
+    // The head looks certified, so commit-time checks let the next commit through ...
+    let (status, body) = e.through_plane("customer", &[(3, None)]).await;
+    assert_eq!(status, 200, "{body}");
+    // ... but verify recomputes every certificate from the data files.
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(statuses(&report), ["OK", "MISMATCH", "OK"], "{report}");
+    assert_eq!(report["first_broken"], head_of(&forged));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_follows_onboarding_anchors_and_constraint_set_versions() {
+    let e = env(None).await;
+    assert_eq!(e.bypassing("customer", &[(1, Some(5))]).await.0, 200);
+    let (s, _) = e
+        .register(
+            json!({"table": "db.customer", "name": "pk", "type": "PRIMARY_KEY", "columns": ["id"]}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(e.through_plane("customer", &[(2, Some(6))]).await.0, 200);
+    // Version 2 adds a UNIQUE on another column; the chain continues across versions.
+    let (s, _) = e
+        .register(
+            json!({"table": "db.customer", "name": "uq_ref", "type": "UNIQUE", "columns": ["ref"]}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (status, body) = e.through_plane("customer", &[(3, Some(6))]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-004"), "{body}");
+    assert_eq!(e.through_plane("customer", &[(3, Some(7))]).await.0, 200);
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(statuses(&report), ["ANCHOR", "OK", "OK"], "{report}");
+    assert_eq!(report["ok"], true);
+    let (s, _) = e.api("GET", "verify?table=db.orders", None).await;
+    assert_eq!(s, 404, "never constrained");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transactions_domains_and_metrics() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    assert_eq!(e.through_plane("orders", &[(10, Some(9))]).await.0, 400);
+
+    let (_, audit) = e.api("GET", "audit?table=db.orders", None).await;
+    let rejected = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ev| ev["kind"] == "COMMIT_REJECTED")
+        .unwrap()
+        .clone();
+    assert_eq!(rejected["verdict"], "INT-005");
+    let (status, txn) = e
+        .api("GET", &format!("transactions/{}", rejected["txn"]), None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(txn["state"], "REJECTED");
+    assert_eq!(txn["table"], "db.orders");
+    assert_eq!(txn["decision"]["status"], 400);
+    assert!(
+        txn["decision"]["body"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("INT-005")
+    );
+    assert_eq!(e.api("GET", "transactions/999999", None).await.0, 404);
+
+    let (_, domain) = e.api("GET", "domains/db.orders", None).await;
+    assert_eq!(domain["state"], "Healthy");
+    assert_eq!(domain["id"], "db.customer");
+    assert_eq!(domain["constraints"], json!([1, 2, 3]));
+    assert_eq!(e.api("GET", "domains/db.nothing", None).await.0, 404);
+
+    let text = e
+        .http
+        .get(format!("{}/metrics", e.gateway))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("integrity_commits_total{verdict=\"accepted\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("integrity_commits_total{verdict=\"rejected\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("integrity_domain_state{state=\"healthy\"} 2\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("integrity_domain_queue_wait_seconds_count 2\n"),
+        "{text}"
+    );
 }

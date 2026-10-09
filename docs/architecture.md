@@ -122,6 +122,23 @@ constraint (not a key an FK still references); `POST /v1/integrity/indexes/{id}/
 domain of a constraint and re-anchors it, clearing a degraded state if the data is valid. These
 operations take a lock that every commit holds shared, so they never interleave with commits.
 
+## Verification and observability (spec §18, §23, §25)
+
+`GET /v1/integrity/verify?table=` walks `main` back from its head to the chain start (an uncertified
+current or retired anchor, or the first snapshot) and recomputes every certificate from the data:
+the constraint set of the version named in the snapshot summary (from the registry's version
+history), the key delta of the snapshot's file changes (`Validator::net_key_deltas`, checked against
+validation in the differential tests), and the parent's certificate. Each snapshot is `OK`,
+`ANCHOR`, `MISSING` (written without the Plane), `MISMATCH` (forged or tampered), `MALFORMED` or
+`UNVERIFIABLE` (equality deletes; expired history). A broken chain degrades the domain like a
+bypass detected at commit time.
+
+Also served: `GET /v1/integrity/transactions/{id}` (the log's records and decision),
+`GET /v1/integrity/domains/{table}` (`Healthy`, `Degraded` with reasons, or `RecoveryRequired`),
+`GET /v1/integrity/audit?table=&since=`, and Prometheus text at `/metrics` (commit verdicts,
+validation and queue wait time, recovery outcomes, bypasses, domain states). Metrics carry no table
+names or key values.
+
 ## Integrity domains and concurrency (spec §11)
 
 A domain is the FK-connected component of a table among the configured constraints. Each domain

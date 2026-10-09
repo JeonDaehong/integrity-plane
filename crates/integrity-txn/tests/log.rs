@@ -130,6 +130,12 @@ fn a_commit_survives_reopen_with_its_decision() {
     assert_eq!(log.decision_for("req-1"), Some(ok(200)));
     assert_eq!(log.decision_for("other"), None);
     assert!(log.unresolved().unwrap().is_empty());
+    let summary = log.summary(txn).unwrap();
+    assert_eq!(summary.state, TxnState::Committed);
+    assert_eq!(summary.prepared, prepared(Some("req-1")));
+    assert_eq!(summary.validated, Some(validated()));
+    assert_eq!(summary.decision, Some(ok(200)));
+    assert_eq!(log.summary(TxnId(txn.0 + 100)), None);
     // Ids keep increasing after reopen.
     let next = log.begin(prepared(None)).unwrap();
     assert!(next > txn);

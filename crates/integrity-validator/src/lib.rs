@@ -255,6 +255,27 @@ impl Validator {
         cols.into_iter().collect()
     }
 
+    /// The net key change of every PK/UNIQUE/FK constraint on the commit's table, computed from
+    /// the rows alone: what an accepted commit's certificate covers (RFC 0002). `verify` uses it to
+    /// recompute certificates from data files. Commits with equality deletes are unsupported: which
+    /// keys they remove depends on index state.
+    pub fn net_key_deltas(
+        &self,
+        commit: &CommitRows,
+    ) -> Result<BTreeMap<ConstraintId, NetDelta>, ValidationError> {
+        if commit.equality_deletes.is_some() {
+            return Err(ValidationError::Unsupported(
+                "key deltas of equality deletes depend on index state",
+            ));
+        }
+        let plan = Plan::build(commit, self.on_table(&commit.table))?;
+        Ok(plan
+            .deltas
+            .into_iter()
+            .map(|(id, d)| (id, d.net()))
+            .collect())
+    }
+
     /// Decides a single-table commit. Reads indexes; never writes them.
     pub fn validate(
         &self,

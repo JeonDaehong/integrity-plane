@@ -5,12 +5,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::http::HeaderMap;
 use integrity_core::EncodedKey;
 use integrity_iceberg::TableMetadata;
 use integrity_iceberg::metadata::FieldLookup;
 use integrity_index::{IndexEpoch, IndexKind, IndexValue, KeyIndex};
+use integrity_txn::TxnId;
 use integrity_types::{ConstraintId, ErrorCode, FieldId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,6 +23,7 @@ use crate::gateway::{Gateway, Loaded, TablePath};
 use crate::onboard::{self, Member, ScanOutcome};
 use crate::registry;
 use crate::store::{Anchor, AuditEvent, StoreError};
+use crate::verify;
 
 /// A column given by name or by Iceberg field id.
 #[derive(Debug, Clone, Deserialize)]
@@ -332,7 +335,7 @@ impl Gateway {
                     snapshot: *snapshot,
                     version: d.version(ident),
                 };
-                d.anchors.insert(ident.clone(), anchor);
+                d.set_anchor(ident, anchor);
                 d.degraded.remove(ident);
             }
             Ok::<_, ApiError>(())
@@ -374,7 +377,7 @@ impl Gateway {
                 d.bump(&t);
                 if !d.is_constrained(&t) {
                     // Re-registering later onboards the table again.
-                    d.anchors.remove(&t);
+                    d.remove_anchor(&t);
                     d.degraded.remove(&t);
                 }
             }
@@ -426,7 +429,7 @@ impl Gateway {
                     snapshot: *snapshot,
                     version: d.version(ident),
                 };
-                d.anchors.insert(ident.clone(), anchor);
+                d.set_anchor(ident, anchor);
                 d.degraded.remove(ident);
             }
             Ok::<_, ApiError>(())
@@ -466,6 +469,160 @@ impl Gateway {
     pub fn audit_events(&self, table: Option<&str>, since: u64) -> Result<Value, ApiError> {
         let events = self.registry.audit_since(table, since)?;
         Ok(json!({ "events": events }))
+    }
+}
+
+/// Read-only views: verification, transactions, domains, metrics (spec §18, §23, §25).
+impl Gateway {
+    /// `GET /v1/integrity/verify?table=…`: recomputes the certificate chain of `main` from the
+    /// data files. A broken chain is a bypass: the domain is degraded until rebuilt (spec §18).
+    pub async fn verify(&self, table: &str, headers: &HeaderMap) -> Result<Value, ApiError> {
+        let _shared = self.admin.read().await;
+        let doc = self.registry.snapshot();
+        let history = doc.history.get(table).cloned().unwrap_or_default();
+        if history.is_empty() {
+            return Err(ApiError::new(
+                ErrorCode::ConstraintNotFound,
+                format!("{table} has never had constraints"),
+            ));
+        }
+        let meta = self.load_member(table, headers).await?;
+        let mut others = BTreeMap::new();
+        for c in history.values().flatten() {
+            let mut names = vec![c.table.clone()];
+            if let Some(r) = &c.references {
+                names.push(r.table.clone());
+            }
+            for name in names {
+                if name != table && !others.contains_key(&name) {
+                    // A table that cannot be loaded makes its versions unverifiable, not an error.
+                    if let Ok(m) = self.load_member(&name, headers).await {
+                        others.insert(name, m);
+                    }
+                }
+            }
+        }
+        let mut anchors: Vec<Option<i64>> =
+            doc.retired_anchors.get(table).cloned().unwrap_or_default();
+        if let Some(a) = doc.anchors.get(table) {
+            anchors.push(a.snapshot);
+        }
+        let input = verify::Input {
+            identifier: table.to_owned(),
+            meta,
+            history,
+            others,
+            anchors,
+        };
+        let io = Arc::clone(&self.io);
+        let report = tokio::task::spawn_blocking(move || verify::verify(io.as_ref(), &input))
+            .await
+            .map_err(|e| {
+                ApiError::new(ErrorCode::IndexDegraded, format!("verify task failed: {e}"))
+            })?;
+        if let Some(broken) = report.first_broken {
+            let reason = format!("{table}: certificate chain broken at snapshot {broken}");
+            let newly = self.registry.update(|d| {
+                Ok::<_, ApiError>(
+                    d.degraded
+                        .insert(table.to_owned(), reason.clone())
+                        .is_none(),
+                )
+            })?;
+            if newly {
+                self.metrics.bypass_detected.fetch_add(1, Ordering::Relaxed);
+                let mut event = AuditEvent::new("BYPASS_DETECTED", Some(table));
+                event.result_snapshot = Some(broken);
+                event.detail = Some(reason);
+                self.audit(event);
+            }
+        }
+        Ok(json!(report))
+    }
+
+    /// `GET /v1/integrity/transactions/{id}`: everything the log recorded, including the
+    /// structured error of a refused commit (spec §22).
+    pub fn transaction(&self, id: u64) -> Option<Value> {
+        let t = self.log.summary(TxnId(id))?;
+        Some(json!({
+            "txn": id,
+            "state": format!("{:?}", t.state).to_ascii_uppercase(),
+            "table": t.prepared.identifier,
+            "table_uuid": t.prepared.table,
+            "request_id": t.prepared.request_id,
+            "validated": t.validated,
+            "decision": t.decision,
+        }))
+    }
+
+    /// `GET /v1/integrity/domains/{table}`: the domain `table` belongs to (spec §19).
+    pub fn domain_state(&self, table: &str) -> Option<Value> {
+        let doc = self.registry.snapshot();
+        if !doc.is_constrained(table) {
+            return None;
+        }
+        let constraints = doc.list();
+        let members = registry::component(&constraints, table);
+        let transient = self.transient.lock().map(|t| t.clone()).unwrap_or_default();
+        let reasons: BTreeMap<&String, &String> = members
+            .iter()
+            .filter_map(|m| {
+                doc.degraded
+                    .get(m)
+                    .or_else(|| transient.get(m))
+                    .map(|r| (m, r))
+            })
+            .collect();
+        let unresolved = self
+            .log
+            .unresolved()
+            .map(|u| {
+                u.iter()
+                    .filter(|t| members.contains(&t.prepared.identifier))
+                    .count()
+            })
+            .unwrap_or(usize::MAX);
+        let state = if !reasons.is_empty() {
+            "Degraded"
+        } else if unresolved > 0 {
+            "RecoveryRequired"
+        } else {
+            "Healthy"
+        };
+        let ids: Vec<u64> = constraints
+            .iter()
+            .filter(|c| members.contains(&c.table))
+            .map(|c| c.id)
+            .collect();
+        let anchors: BTreeMap<&String, &Anchor> = members
+            .iter()
+            .filter_map(|m| doc.anchors.get(m).map(|a| (m, a)))
+            .collect();
+        let versions: BTreeMap<&String, u64> =
+            members.iter().map(|m| (m, doc.version(m))).collect();
+        Some(json!({
+            "id": members.first(),
+            "tables": members,
+            "state": state,
+            "reasons": reasons,
+            "constraints": ids,
+            "anchors": anchors,
+            "constraint_set_versions": versions,
+        }))
+    }
+
+    /// `GET /metrics`.
+    pub fn metrics_text(&self) -> String {
+        let doc = self.registry.snapshot();
+        let transient = self.transient.lock().map(|t| t.clone()).unwrap_or_default();
+        let degraded = doc
+            .anchors
+            .keys()
+            .filter(|t| doc.degraded.contains_key(*t) || transient.contains_key(*t))
+            .count();
+        let unresolved = self.log.unresolved().map(|u| u.len()).unwrap_or(0);
+        self.metrics
+            .render(doc.anchors.len() - degraded, degraded, unresolved)
     }
 }
 

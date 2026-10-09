@@ -41,6 +41,9 @@ pub struct RegistryDoc {
     pub history: BTreeMap<String, BTreeMap<u64, Vec<ConstraintConfig>>>,
     /// Latest chain anchor per table identifier.
     pub anchors: BTreeMap<String, Anchor>,
+    /// Earlier anchor snapshots per table (same table UUID): `verify` stops at any of them.
+    #[serde(default)]
+    pub retired_anchors: BTreeMap<String, Vec<Option<i64>>>,
     /// Tables whose domain is degraded until rebuilt, with the reason (spec §19).
     #[serde(default)]
     pub degraded: BTreeMap<String, String>,
@@ -79,6 +82,43 @@ impl RegistryDoc {
         ids.iter()
             .filter_map(|id| self.constraints.get(id).cloned())
             .collect()
+    }
+
+    /// Records a new anchor, retiring the previous one of the same table.
+    pub fn set_anchor(&mut self, identifier: &str, anchor: Anchor) {
+        let uuid = anchor.table_uuid.clone();
+        if let Some(old) = self.anchors.insert(identifier.to_owned(), anchor) {
+            let retired = self
+                .retired_anchors
+                .entry(identifier.to_owned())
+                .or_default();
+            if old.table_uuid == uuid {
+                retired.push(old.snapshot);
+            } else {
+                retired.clear();
+            }
+        }
+    }
+
+    /// Removes a table's anchor (it is no longer constrained), retiring it.
+    pub fn remove_anchor(&mut self, identifier: &str) {
+        if let Some(old) = self.anchors.remove(identifier) {
+            self.retired_anchors
+                .entry(identifier.to_owned())
+                .or_default()
+                .push(old.snapshot);
+        }
+    }
+
+    /// Whether `snapshot` is, or was, where the table's certificate chain starts.
+    pub fn is_anchor(&self, identifier: &str, snapshot: Option<i64>) -> bool {
+        self.anchors
+            .get(identifier)
+            .is_some_and(|a| a.snapshot == snapshot)
+            || self
+                .retired_anchors
+                .get(identifier)
+                .is_some_and(|r| r.contains(&snapshot))
     }
 
     /// Whether any constraint governs `identifier`.

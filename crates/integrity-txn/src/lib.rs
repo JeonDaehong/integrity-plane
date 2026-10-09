@@ -6,7 +6,7 @@ pub mod log;
 use std::fmt;
 
 pub use fault::FaultPoint;
-pub use log::{Decision, Prepared, TxnLog, Unresolved, Validated};
+pub use log::{Decision, Prepared, TxnLog, TxnSummary, Unresolved, Validated};
 
 /// A transaction id, allocated by the log, never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

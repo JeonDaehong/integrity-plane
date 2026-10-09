@@ -71,6 +71,19 @@ pub struct Unresolved {
     pub staged: Vec<(ConstraintId, StagedDelta)>,
 }
 
+/// Everything recorded about one transaction (`GET /v1/integrity/transactions/{id}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxnSummary {
+    /// Its latest state.
+    pub state: TxnState,
+    /// The prepared record.
+    pub prepared: Prepared,
+    /// The validated record, if it got that far.
+    pub validated: Option<Validated>,
+    /// The recorded response, once terminal.
+    pub decision: Option<Decision>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Txn {
     state: Option<TxnState>,
@@ -380,6 +393,18 @@ impl TxnLog {
     /// The current state of a transaction.
     pub fn state(&self, txn: TxnId) -> Option<TxnState> {
         self.index.lock().ok()?.txns.get(&txn.0)?.state
+    }
+
+    /// Everything recorded about a transaction.
+    pub fn summary(&self, txn: TxnId) -> Option<TxnSummary> {
+        let index = self.index.lock().ok()?;
+        let t = index.txns.get(&txn.0)?;
+        Some(TxnSummary {
+            state: t.state?,
+            prepared: t.prepared.clone()?,
+            validated: t.validated.clone(),
+            decision: t.decision.clone(),
+        })
     }
 
     /// The recorded decision of a finished transaction.

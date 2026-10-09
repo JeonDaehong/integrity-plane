@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
@@ -30,6 +32,7 @@ use tokio::sync::Mutex;
 
 use crate::config::ConstraintConfig;
 use crate::error::ApiError;
+use crate::metrics::Metrics;
 use crate::pipeline::{self, Job, Outcome};
 use crate::registry;
 use crate::store::{Anchor, AuditEvent, Registry, RegistryDoc, StoreError};
@@ -271,6 +274,8 @@ pub struct Gateway {
     pub(crate) transient: std::sync::Mutex<BTreeMap<String, String>>,
     /// Commit requests received per table identifier (observability; detects retry storms).
     commit_requests: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Prometheus metrics.
+    pub(crate) metrics: Metrics,
 }
 
 pub(crate) enum Loaded {
@@ -303,6 +308,7 @@ impl Gateway {
             domains: std::sync::Mutex::new(BTreeMap::new()),
             transient: std::sync::Mutex::new(BTreeMap::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
+            metrics: Metrics::default(),
         })
     }
 
@@ -655,6 +661,9 @@ impl Gateway {
                                 )
                                 .map_err(log_error)?;
                             recovered.verdict = Some("COMMITTED".into());
+                            self.metrics
+                                .recovered_committed
+                                .fetch_add(1, Ordering::Relaxed);
                             recovered.result_snapshot = Some(v.final_snapshot);
                             recovered.certificate = v.certificates.last().cloned();
                             self.audit(recovered);
@@ -664,6 +673,9 @@ impl Gateway {
                                 .finish(u.txn, TxnState::Aborted, interrupted("upstream"))
                                 .map_err(log_error)?;
                             recovered.verdict = Some("ABORTED".into());
+                            self.metrics
+                                .recovered_aborted
+                                .fetch_add(1, Ordering::Relaxed);
                             self.audit(recovered);
                         }
                     }
@@ -695,7 +707,7 @@ impl Gateway {
                             snapshot: None,
                             version: d.version(identifier),
                         };
-                        d.anchors.insert(identifier.to_owned(), anchor);
+                        d.set_anchor(identifier, anchor);
                         Ok::<_, StoreError>(d.clone())
                     })
                     .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
@@ -725,6 +737,7 @@ impl Gateway {
                     }) {
                         *doc = d;
                     }
+                    self.metrics.bypass_detected.fetch_add(1, Ordering::Relaxed);
                     let mut event = AuditEvent::new("BYPASS_DETECTED", Some(identifier));
                     event.result_snapshot = head.map(|h| h.0);
                     event.detail = Some(reason.clone());
@@ -742,10 +755,16 @@ impl Gateway {
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
-        match self
+        let outcome = self
             .commit_inner(table, path_and_query, headers, body)
-            .await
-        {
+            .await;
+        let counter = match &outcome {
+            Ok(r) if r.status().is_success() => &self.metrics.accepted,
+            Err(e) if is_violation(e.code) => &self.metrics.rejected,
+            _ => &self.metrics.aborted,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        match outcome {
             Ok(r) => r,
             Err(e) => e.into_response(),
         }
@@ -775,7 +794,9 @@ impl Gateway {
         let mut doc = self.registry.snapshot();
         let constraints = doc.list();
         let (queue, members) = self.domain(&constraints, &identifier);
+        let waiting = Instant::now();
         let _queue = queue.lock().await;
+        self.metrics.queue_wait.observe(waiting.elapsed());
         self.recover(&headers, Some(&members)).await?;
         if let Some(d) = request_id.as_deref().and_then(|r| self.log.decision_for(r)) {
             return Ok(replay(&d));
@@ -946,8 +967,10 @@ impl Gateway {
             validator,
             indexes: indexes.clone(),
         };
+        let validating = Instant::now();
         let outcome = tokio::task::spawn_blocking(move || pipeline::run(&job))
             .await
+            .inspect(|_| self.metrics.validation.observe(validating.elapsed()))
             .map_err(|e| {
                 ApiError::new(
                     ErrorCode::IndexDegraded,
@@ -1079,6 +1102,19 @@ impl Gateway {
             }
         }
     }
+}
+
+/// Whether `code` is a constraint verdict (as opposed to a refusal for another reason).
+fn is_violation(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::DuplicatePrimaryKey
+            | ErrorCode::DuplicateUniqueKey
+            | ErrorCode::ForeignKeyViolation
+            | ErrorCode::ReferencedRowDelete
+            | ErrorCode::NotNullViolation
+            | ErrorCode::CheckViolation
+    )
 }
 
 fn rejection(r: Rejection) -> ApiError {
