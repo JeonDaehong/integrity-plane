@@ -8,10 +8,21 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only: makes `fault::hit` abort the process at the point named by OIP_FAULT.
+fault-injection = []
+
 [dependencies]
 integrity-types.workspace = true
 integrity-core.workspace = true
 integrity-index.workspace = true
+redb.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+redb.workspace = true
 
 [lints]
 workspace = true

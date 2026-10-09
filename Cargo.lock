@@ -1182,9 +1182,13 @@ dependencies = [
 name = "integrity-txn"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "integrity-core",
  "integrity-index",
  "integrity-types",
+ "redb",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

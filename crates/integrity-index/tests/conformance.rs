@@ -307,3 +307,32 @@ proptest! {
         check_model(Backend::Persistent, kind, &steps)?;
     }
 }
+
+#[test]
+fn staged_deltas_round_trip_and_reject_corruption() {
+    for kind in [IndexKind::Unique, IndexKind::Reference] {
+        let index = make(Backend::Memory, kind);
+        commit(&*index, &delta(1, &[(1, 1), (2, 1)])).unwrap();
+        let staged = index.stage(&delta(2, &[(1, -1), (3, 1), (4, 1)])).unwrap();
+        let bytes = staged.encode();
+        let decoded = integrity_index::StagedDelta::decode(&bytes).unwrap();
+        assert_eq!(decoded, staged);
+        assert_eq!(decoded.digest(), staged.digest());
+        // The decoded delta replays as the same apply.
+        index.apply(staged, IndexEpoch(2)).unwrap();
+        index.apply(decoded, IndexEpoch(2)).unwrap();
+
+        assert!(integrity_index::StagedDelta::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(integrity_index::StagedDelta::decode(&longer).is_err());
+        for i in 0..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[i] ^= 0x80;
+            // Either rejected, or (for bits inside values) a different delta: never the same.
+            if let Ok(d) = integrity_index::StagedDelta::decode(&flipped) {
+                assert_ne!(d.encode(), bytes, "byte {i}");
+            }
+        }
+    }
+}

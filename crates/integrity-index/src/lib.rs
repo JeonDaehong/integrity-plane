@@ -82,6 +82,69 @@ impl StagedDelta {
         self.writes.iter().map(|(k, v)| (k, v.as_ref()))
     }
 
+    /// Serializes the delta for the transaction log (RFC 0004), so that recovery can replay the
+    /// identical apply after a crash.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![STAGED_VERSION];
+        out.extend_from_slice(&self.base_epoch.0.to_be_bytes());
+        out.extend_from_slice(&(self.writes.len() as u64).to_be_bytes());
+        for (key, value) in &self.writes {
+            out.extend_from_slice(&(key.as_bytes().len() as u32).to_be_bytes());
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(&encode_value(value.as_ref()));
+        }
+        out
+    }
+
+    /// Parses [`StagedDelta::encode`] output. Anything else, including keys out of order or
+    /// trailing bytes, is [`IndexError::Corrupt`].
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            if b.len() < n {
+                return Err(IndexError::Corrupt);
+            }
+            let (head, rest) = b.split_at(n);
+            *b = rest;
+            Ok(head)
+        }
+        fn u64_at(b: &mut &[u8]) -> Result<u64> {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(take(b, 8)?);
+            Ok(u64::from_be_bytes(a))
+        }
+        let mut b = bytes;
+        if take(&mut b, 1)? != [STAGED_VERSION] {
+            return Err(IndexError::Corrupt);
+        }
+        let base_epoch = IndexEpoch(u64_at(&mut b)?);
+        let n = u64_at(&mut b)?;
+        let mut writes = BTreeMap::new();
+        let mut previous: Option<EncodedKey> = None;
+        for _ in 0..n {
+            let mut len = [0u8; 4];
+            len.copy_from_slice(take(&mut b, 4)?);
+            let key = EncodedKey::from_bytes(take(&mut b, u32::from_be_bytes(len) as usize)?)
+                .map_err(|_| IndexError::Corrupt)?;
+            if previous.as_ref().is_some_and(|p| *p >= key) {
+                return Err(IndexError::Corrupt);
+            }
+            let value = match take(&mut b, 1)?[0] {
+                VALUE_ABSENT => None,
+                tag => {
+                    let mut v = vec![tag];
+                    v.extend_from_slice(take(&mut b, 8)?);
+                    Some(decode_value(&v)?)
+                }
+            };
+            previous = Some(key.clone());
+            writes.insert(key, value);
+        }
+        if !b.is_empty() {
+            return Err(IndexError::Corrupt);
+        }
+        Ok(Self { base_epoch, writes })
+    }
+
     /// BLAKE3 digest of the canonical encoding: the identity used to recognize a replayed
     /// `apply` (ADR 0003).
     pub fn digest(&self) -> [u8; 32] {
@@ -266,6 +329,7 @@ pub(crate) fn decide_apply(
     Ok(ApplyAction::Write)
 }
 
+const STAGED_VERSION: u8 = 1;
 const VALUE_ABSENT: u8 = 0x00;
 const VALUE_UNIQUE: u8 = 0x01;
 const VALUE_REFERENCE: u8 = 0x02;
