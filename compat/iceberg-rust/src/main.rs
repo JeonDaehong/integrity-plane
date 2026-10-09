@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -88,7 +89,9 @@ fn strings(v: &[Option<&str>]) -> ArrayRef {
 
 #[tokio::main]
 async fn main() -> Res<()> {
+    // The compatibility warehouse is a local filesystem path shared with the catalog.
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
         .load("gw", HashMap::from([(REST_CATALOG_PROP_URI.to_string(), GATEWAY.to_string())]))
         .await?;
     let ns = NamespaceIdent::new(NS.to_string());
