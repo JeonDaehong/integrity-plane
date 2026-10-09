@@ -1,0 +1,4 @@
+target
+fuzz
+compat/iceberg-rust/target
+.git

@@ -6,6 +6,9 @@ points straight at the upstream catalog to play a writer that bypasses the Plane
 
 Step 8 restarts the gateway with kill -9 between commits; kills in the middle of a commit, at every
 fault point, are covered by crates/integrity-server/tests/crash.rs.
+
+With DEMO_S3=1 it runs against deploy/docker-compose.yml instead (MinIO): clients write through
+S3FileIO, and INTEGRITY_RESTART is the shell command that kill -9s and restarts the Plane.
 """
 
 import json
@@ -23,6 +26,8 @@ NS = "demo"
 ICEBERG = os.environ.get("ICEBERG_VERSION", "1.10.0")
 CLI = os.environ.get("INTEGRITY_CLI", "./target/release/integrity")
 SERVER = os.environ.get("INTEGRITY_SERVER", "./target/release/integrity-server")
+S3 = os.environ.get("DEMO_S3") == "1"
+RESTART = os.environ.get("INTEGRITY_RESTART")
 
 
 def cli(*args, expect=0):
@@ -63,19 +68,30 @@ def head_summary(spark, catalog, table):
 
 
 def catalog(builder, name, uri):
-    return (
+    builder = (
         builder.config(f"spark.sql.catalog.{name}", "org.apache.iceberg.spark.SparkCatalog")
         .config(f"spark.sql.catalog.{name}.type", "rest")
         .config(f"spark.sql.catalog.{name}.uri", uri)
         .config(f"spark.sql.catalog.{name}.cache-enabled", "false")
     )
+    if S3:
+        builder = (
+            builder.config(f"spark.sql.catalog.{name}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+            .config(f"spark.sql.catalog.{name}.s3.endpoint", "http://127.0.0.1:9000")
+            .config(f"spark.sql.catalog.{name}.s3.path-style-access", "true")
+            .config(f"spark.sql.catalog.{name}.client.region", "us-east-1")
+        )
+    return builder
 
 
 def restart_gateway():
-    subprocess.run(["pkill", "-9", "-f", SERVER.lstrip("./")], check=False)
-    time.sleep(1)
-    log = open("gateway-restarted.log", "w")  # noqa: SIM115 - kept open for the child
-    subprocess.Popen([SERVER, "compat/integrity.toml"], stdout=log, stderr=log, start_new_session=True)
+    if RESTART:
+        subprocess.run(RESTART, shell=True, check=True)
+    else:
+        subprocess.run(["pkill", "-9", "-f", SERVER.lstrip("./")], check=False)
+        time.sleep(1)
+        log = open("gateway-restarted.log", "w")  # noqa: SIM115 - kept open for the child
+        subprocess.Popen([SERVER, "compat/integrity.toml"], stdout=log, stderr=log, start_new_session=True)
     for _ in range(60):
         try:
             return status()
@@ -85,8 +101,11 @@ def restart_gateway():
 
 
 def main():
+    packages = f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG}"
+    if S3:
+        packages += f",org.apache.iceberg:iceberg-aws-bundle:{ICEBERG}"
     builder = SparkSession.builder.appName("integrity-demo").config(
-        "spark.jars.packages", f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG}"
+        "spark.jars.packages", packages
     ).config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
     builder = catalog(builder, "gw", GATEWAY)
     builder = catalog(builder, "up", UPSTREAM)
