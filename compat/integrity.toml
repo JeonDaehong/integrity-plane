@@ -149,3 +149,11 @@ name = "fk_morders_mcust"
 type = "foreign_key"
 columns = [2]
 references = { table = "spark.mcust", constraint = 28 }
+
+# Format v3 with deletion vectors (Spark): dvcust(customer_id long, name string).
+[[constraint]]
+id = 41
+table = "spark.dvcust"
+name = "pk_dvcust"
+type = "primary_key"
+columns = [1]

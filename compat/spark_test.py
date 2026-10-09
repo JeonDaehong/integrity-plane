@@ -141,6 +141,26 @@ def main():
     ).collect()[0]
     assert certified["n"] == certified["c"], certified
     print("ok   compaction applying deletes certified; every snapshot certified")
+
+    # Format v3 (skipped for catalogs that do not create v3 tables: SKIP_V3=1).
+    if os.environ.get("SKIP_V3") != "1":
+        # Format v3: merge-on-read deletes are deletion vectors in Puffin files (ADR 0018).
+        v3 = ("TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read', "
+              "'write.update.mode'='merge-on-read', 'write.merge.mode'='merge-on-read')")
+        spark.sql(f"CREATE TABLE gw.{NS}.dvcust (customer_id BIGINT, name STRING) USING iceberg {v3}")
+        spark.sql(
+            f"INSERT INTO gw.{NS}.dvcust SELECT /*+ COALESCE(1) */ * FROM VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+        )
+        spark.sql(f"DELETE FROM gw.{NS}.dvcust WHERE customer_id = 3")
+        formats = [r["file_format"] for r in spark.sql(f"SELECT file_format FROM gw.{NS}.dvcust.delete_files").collect()]
+        assert formats and all(f.upper() == "PUFFIN" for f in formats), formats
+        spark.sql(f"DELETE FROM gw.{NS}.dvcust WHERE customer_id = 2")  # replaces the vector
+        expect_rejection(spark, "INT-003", "dvcust", f"INSERT INTO gw.{NS}.dvcust VALUES (1, 'dup')")
+        spark.sql(f"INSERT INTO gw.{NS}.dvcust VALUES (2, 'y'), (3, 'z')")
+        spark.sql(f"UPDATE gw.{NS}.dvcust SET name = 'q' WHERE customer_id = 1")
+        ids = sorted(r["customer_id"] for r in spark.sql(f"SELECT customer_id FROM gw.{NS}.dvcust").collect())
+        assert ids == [1, 2, 3], ids
+        print("ok   format v3 deletion vectors validated")
     spark.stop()
 
 

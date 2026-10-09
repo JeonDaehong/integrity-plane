@@ -31,6 +31,8 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
+# Iceberg v3 deletion vectors are 64-bit Roaring bitmaps (ADR 0018). MIT OR Apache-2.0, pure Rust.
+roaring = "0.11.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

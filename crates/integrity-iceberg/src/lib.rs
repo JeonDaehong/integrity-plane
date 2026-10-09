@@ -12,6 +12,7 @@
 pub mod certify;
 pub mod changes;
 pub mod classify;
+pub mod deletion_vector;
 pub mod io;
 pub mod manifest;
 pub mod metadata;

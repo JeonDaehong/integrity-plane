@@ -12,14 +12,15 @@ All of these are covered by tests in this repository; none has been run in produ
 
 - **Proxy REST catalog.** Writers use the gateway (`integrity-server`) as their Iceberg REST catalog;
   it forwards to an upstream REST catalog. Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg
-  0.12, iceberg-rust 0.10 ([`docs/compatibility.md`](docs/compatibility.md)).
+  0.12, iceberg-rust 0.10; verified catalogs: the Iceberg REST reference catalog, Apache Polaris,
+  Lakekeeper, Nessie ([`docs/compatibility.md`](docs/compatibility.md)).
 - **Constraints** on top-level columns: PRIMARY KEY, UNIQUE (NULLS DISTINCT / NOT DISTINCT),
   NOT NULL, FOREIGN KEY (MATCH SIMPLE / FULL, ON DELETE RESTRICT), checked at commit time against
   the committed data, before the commit reaches the upstream catalog.
 - **Commit shapes** from the capability matrix: append, copy-on-write and merge-on-read
   (position delete) `DELETE` / `UPDATE` / `MERGE`, compaction (`replace` with unchanged rows),
-  equality deletes on a key. Anything the Plane cannot prove is refused
-  (`UNSUPPORTED_COMMIT_OPERATION`), including multi-table commits and v3 deletion vectors.
+  equality deletes on a key, format v3 deletion vectors. Anything the Plane cannot prove is refused
+  (`UNSUPPORTED_COMMIT_OPERATION`), including multi-table commits.
 - **Certificates** chained through snapshot summaries, and `verify`, which recomputes them from the
   data files and names the first snapshot written around the Plane or tampered with.
 - **Bypass detection** at commit time: a table whose `main` was moved without the Plane puts its

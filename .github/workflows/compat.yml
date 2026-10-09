@@ -57,6 +57,7 @@ jobs:
         run: |
           cargo build --release --locked -p integrity-cli
           ./target/release/integrity verify spark.mcust
+          ./target/release/integrity verify spark.dvcust
       - name: iceberg-rust
         run: sudo ./compat/iceberg-rust/target/release/integrity-compat-iceberg-rust
       - name: Appendix A demo
@@ -141,6 +142,7 @@ jobs:
           ./target/release/integrity verify pyiceberg.customer
           ./target/release/integrity verify spark.region
           ./target/release/integrity verify spark.mcust
+          ./target/release/integrity verify spark.dvcust
       - name: Logs
         if: always()
         run: |
@@ -190,8 +192,63 @@ jobs:
           ./target/release/integrity verify spark.customer
           ./target/release/integrity verify spark.region
           ./target/release/integrity verify spark.mcust
+          ./target/release/integrity verify spark.dvcust
       - name: Logs
         if: always()
         run: |
           echo "--- gateway"; cat gateway.log || true
           echo "--- lakekeeper"; docker compose -f compat/lakekeeper/docker-compose.yml logs --tail 200 || true
+
+  # Project Nessie as the upstream catalog: its Iceberg REST endpoint, a branch-and-warehouse
+  # catalog prefix, table data in S3.
+  nessie:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CATALOG_PROPS: '{"warehouse": "warehouse", "io-impl": "org.apache.iceberg.aws.s3.S3FileIO", "s3.endpoint": "http://127.0.0.1:9000", "s3.path-style-access": "true", "client.region": "us-east-1"}'
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      # Nessie 0.108 creates format v2 tables even when v3 is requested.
+      SKIP_V3: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build gateway and CLI
+        run: cargo build --release --locked -p integrity-server -p integrity-cli
+      - name: Start Nessie
+        run: |
+          echo "127.0.0.1 s3" | sudo tee -a /etc/hosts
+          prefix=$(bash compat/nessie_setup.sh | tail -1)
+          test -n "$prefix"
+          echo "INTEGRITY__UPSTREAM__PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Start gateway
+        run: |
+          echo "prefix: $INTEGRITY__UPSTREAM__PREFIX"
+          ./target/release/integrity-server compat/integrity.nessie.toml > gateway.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8181/v1/integrity/status && break; sleep 1; done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Spark
+        run: pip install "pyspark==3.5.6"
+      - name: Spark
+        run: python compat/spark_test.py
+      # Nessie serves only the current snapshot of a table: verify cannot recompute certificates
+      # (UNVERIFIABLE) but must never report a break.
+      - name: verify
+        run: |
+          for t in spark.customer spark.region spark.mcust; do
+            ./target/release/integrity verify "$t" | tee verify.txt || true
+            if grep -q BROKEN verify.txt; then exit 1; fi
+          done
+      - name: Logs
+        if: always()
+        run: |
+          echo "--- gateway"; cat gateway.log || true
+          echo "--- nessie"; docker compose -f compat/nessie/docker-compose.yml logs --tail 200 || true

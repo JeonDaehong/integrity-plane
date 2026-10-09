@@ -5,17 +5,16 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Out of scope for 0.1 (by design)
 
-- CHECK constraints, deletion vectors (v3), branch-gated publication, signed certificates, picking
-  up constraints from engine DDL: planned for 0.2. Merge-on-read position deletes (v2) are supported
-  (ADR 0017).
+- CHECK constraints, branch-gated publication, signed certificates (RFC 0005, draft), picking up
+  constraints from engine DDL: planned for 0.2. Merge-on-read position deletes and v3 deletion
+  vectors are supported (ADR 0017, ADR 0018).
 - Multi-table atomic commits (`/transactions/commit` is refused), high availability: 0.3.
 - Other table formats than Iceberg (ADR 0012); `ON DELETE CASCADE`; per-key locking (ADR 0015).
 
 ## Commits
 
 - Anything outside the capability matrix in [`compatibility.md`](compatibility.md) is refused with
-  `UNSUPPORTED_COMMIT_OPERATION`, including deletion vectors, position and equality deletes in the
-  same table, removing equality delete files, rollbacks of `main` to an existing snapshot,
+  `UNSUPPORTED_COMMIT_OPERATION`, including position and equality deletes in the same table, removing equality delete files, rollbacks of `main` to an existing snapshot,
   non-Parquet data files and key columns nested in structs.
 - On tables with position deletes, each commit reads all manifests of both snapshots and every live
   position delete file.
@@ -58,6 +57,7 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - A disabled domain (spec §19) accepts anything, uncertified, until it is rebuilt.
 - Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg 0.12, iceberg-rust 0.10, against the
   Iceberg REST fixture catalog; Spark and PyIceberg also against Apache Polaris 1.7 (OAuth2,
-  catalog prefix). Lakekeeper and Nessie as upstream are untested. S3 is tested
+  catalog prefix), Lakekeeper 0.13 and Nessie 0.108. On Nessie, `verify` cannot recompute
+  certificates (the catalog serves only the current snapshot). S3 is tested
   against SeaweedFS (MinIO no longer publishes container images), not against AWS S3.
 - Not tested: power loss (only process kills), Linux and Windows only.

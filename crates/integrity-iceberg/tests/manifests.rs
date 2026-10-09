@@ -14,7 +14,8 @@ use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use integrity_core::{Datum, KeyValue, LogicalType};
 use integrity_iceberg::{
-    FileChanges, InspectError, MemoryIo, Operation, check_operation, commit_rows, diff_snapshots,
+    FileChanges, FileIo, InspectError, MemoryIo, Operation, check_operation, commit_rows,
+    diff_snapshots,
 };
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -36,7 +37,10 @@ const ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", "fiel
         {"name": "file_path", "type": "string"},
         {"name": "file_format", "type": "string"},
         {"name": "record_count", "type": "long"},
-        {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}]}
+        {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}]},
+        {"name": "referenced_data_file", "type": ["null", "string"], "default": null},
+        {"name": "content_offset", "type": ["null", "long"], "default": null},
+        {"name": "content_size_in_bytes", "type": ["null", "long"], "default": null}
     ]}}
 ]}"#;
 
@@ -109,6 +113,18 @@ impl Table {
                                     Avro::Union(0, Box::new(Avro::Null))
                                 },
                             ),
+                            (
+                                "referenced_data_file".into(),
+                                Avro::Union(0, Box::new(Avro::Null)),
+                            ),
+                            (
+                                "content_offset".into(),
+                                Avro::Union(0, Box::new(Avro::Null)),
+                            ),
+                            (
+                                "content_size_in_bytes".into(),
+                                Avro::Union(0, Box::new(Avro::Null)),
+                            ),
                         ]),
                     ),
                 ]
@@ -160,6 +176,56 @@ impl Table {
         w.write(&batch).unwrap();
         w.close().unwrap();
         self.io.insert(path, out);
+    }
+
+    /// A Puffin file holding one deletion vector for `data` (positions), behind a few bytes of
+    /// other content; returns the manifest entry fields `(offset, size)`.
+    fn dv(&mut self, path: &str, positions: &[u64]) -> (i64, i64) {
+        let blob = integrity_iceberg::deletion_vector::encode(positions);
+        let mut file = b"PFA1....".to_vec();
+        let offset = file.len() as i64;
+        file.extend_from_slice(&blob);
+        file.extend_from_slice(b"footer");
+        self.io.insert(path, file);
+        (offset, blob.len() as i64)
+    }
+
+    /// A delete manifest of deletion vectors:
+    /// `(status, puffin path, referenced data file, offset, size, deleted rows)`.
+    fn dv_manifest(&mut self, path: &str, entries: &[(i32, &str, &str, i64, i64, i64)]) {
+        let records = entries
+            .iter()
+            .map(|&(status, file, target, offset, size, count)| {
+                vec![
+                    ("status", Avro::Int(status)),
+                    ("snapshot_id", Avro::Union(1, Box::new(Avro::Long(1)))),
+                    ("sequence_number", Avro::Union(0, Box::new(Avro::Null))),
+                    (
+                        "data_file",
+                        Avro::Record(vec![
+                            ("content".into(), Avro::Int(1)),
+                            ("file_path".into(), Avro::String(file.into())),
+                            ("file_format".into(), Avro::String("PUFFIN".into())),
+                            ("record_count".into(), Avro::Long(count)),
+                            ("equality_ids".into(), Avro::Union(0, Box::new(Avro::Null))),
+                            (
+                                "referenced_data_file".into(),
+                                Avro::Union(1, Box::new(Avro::String(target.into()))),
+                            ),
+                            (
+                                "content_offset".into(),
+                                Avro::Union(1, Box::new(Avro::Long(offset))),
+                            ),
+                            (
+                                "content_size_in_bytes".into(),
+                                Avro::Union(1, Box::new(Avro::Long(size))),
+                            ),
+                        ]),
+                    ),
+                ]
+            })
+            .collect();
+        self.io.insert(path, Self::avro(ENTRY_SCHEMA, records));
     }
 
     /// A manifest list of `(manifest path, content)`.
@@ -515,7 +581,7 @@ fn unprovable_position_deletes_are_unsupported() {
     let mut t = parent();
     t.manifest("dv.avro", &[(1, 1, "dv.puffin", "PUFFIN", 1)]);
     t.list("dv-list.avro", &[("m1.avro", 0), ("dv.avro", 1)]);
-    assert!(unsupported(t.diff(Some("parent.avro"), "dv-list.avro")).contains("deletion vectors"));
+    assert!(unsupported(t.diff(Some("parent.avro"), "dv-list.avro")).contains("deletion vector"));
 
     // Position and equality deletes in one table.
     let mut t = parent_with_position_delete();
@@ -667,4 +733,78 @@ fn declared_operation_must_match_the_files() {
     assert!(unsupported(check_operation(Operation::Append, &rows)).contains("append"));
     assert!(unsupported(check_operation(Operation::Delete, &rows)).contains("delete"));
     check_operation(Operation::Overwrite, &rows).unwrap();
+}
+
+// ---------- v3 deletion vectors ----------
+
+#[test]
+fn deletion_vectors_remove_the_rows_they_mark() {
+    let mut t = parent();
+    let (offset, size) = t.dv("dv1.puffin", &[1]);
+    t.dv_manifest(
+        "d1.avro",
+        &[(1, "dv1.puffin", "a.parquet", offset, size, 1)],
+    );
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let rows = t
+        .rows(&t.diff(Some("parent.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(sorted(&rows.removed), [row(2, "us")]);
+    assert!(rows.added.is_empty());
+}
+
+#[test]
+fn a_replaced_deletion_vector_removes_only_the_newly_marked_rows() {
+    // v3 keeps one vector per data file: a delete replaces it with a superset.
+    let mut t = parent();
+    let (o1, s1) = t.dv("dv1.puffin", &[1]);
+    t.dv_manifest("d1.avro", &[(1, "dv1.puffin", "a.parquet", o1, s1, 1)]);
+    t.list("parent-dv.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let (o2, s2) = t.dv("dv2.puffin", &[0, 1]);
+    t.dv_manifest(
+        "d2.avro",
+        &[
+            (2, "dv1.puffin", "a.parquet", o1, s1, 1),
+            (1, "dv2.puffin", "a.parquet", o2, s2, 2),
+        ],
+    );
+    t.list("new.avro", &[("m1.avro", 0), ("d2.avro", 1)]);
+    let rows = t
+        .rows(&t.diff(Some("parent-dv.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(sorted(&rows.removed), [row(1, "eu")]);
+    assert!(rows.added.is_empty());
+}
+
+#[test]
+fn invalid_deletion_vectors_are_unsupported() {
+    // A corrupted blob.
+    let mut t = parent();
+    let (offset, size) = t.dv("dv1.puffin", &[1]);
+    t.io.insert("bad.puffin", {
+        let mut bytes = t.io.read("dv1.puffin").unwrap().to_vec();
+        bytes[offset as usize + 9] ^= 0xFF;
+        bytes
+    });
+    t.dv_manifest(
+        "d1.avro",
+        &[(1, "bad.puffin", "a.parquet", offset, size, 1)],
+    );
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "new.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("deletion vector"));
+    // A row count that disagrees with the vector.
+    t.dv_manifest(
+        "d2.avro",
+        &[(1, "dv1.puffin", "a.parquet", offset, size, 5)],
+    );
+    t.list("new2.avro", &[("m1.avro", 0), ("d2.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "new2.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("manifest says"));
+    // A position beyond the data file.
+    let (o3, s3) = t.dv("dv3.puffin", &[9]);
+    t.dv_manifest("d3.avro", &[(1, "dv3.puffin", "b.parquet", o3, s3, 1)]);
+    t.list("new3.avro", &[("m1.avro", 0), ("d3.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "new3.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("beyond"));
 }

@@ -138,7 +138,7 @@ async fn the_plane_authenticates_itself_and_never_leaks_the_admin_token() {
             "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": parent}],
             "updates": [
                 {"action": "add-snapshot", "snapshot": {"snapshot-id": id, "parent-snapshot-id": parent,
-                    "sequence-number": id,
+                    "sequence-number": if parent.is_some() { 2 } else { 1 },
                     "timestamp-ms": id, "manifest-list": list, "summary": {"operation": "append"}}},
                 {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": id, "type": "branch"}
             ]

@@ -70,6 +70,12 @@ pub struct DataFile {
     pub record_count: i64,
     /// Field ids of an equality delete.
     pub equality_ids: Option<Vec<i32>>,
+    /// v3 deletion vector: the one data file it applies to.
+    pub referenced_data_file: Option<String>,
+    /// v3 deletion vector: offset of its blob in the Puffin file.
+    pub content_offset: Option<i64>,
+    /// v3 deletion vector: size of its blob.
+    pub content_size_in_bytes: Option<i64>,
 }
 
 /// A manifest entry.
@@ -207,6 +213,15 @@ pub fn read_manifest(bytes: &Bytes) -> Result<Vec<ManifestEntry>, ManifestError>
                     format: string(df, "file_format")?,
                     record_count: required_int(df, "record_count")?,
                     equality_ids,
+                    referenced_data_file: match get(df, "referenced_data_file") {
+                        None => None,
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(other) => {
+                            return Err(err(format!("referenced_data_file {other:?}")));
+                        }
+                    },
+                    content_offset: int(df, "content_offset")?,
+                    content_size_in_bytes: int(df, "content_size_in_bytes")?,
                 },
             })
         })

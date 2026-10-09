@@ -263,10 +263,10 @@ pub fn diff_snapshots(
         if let Some(f) = positions_before
             .iter()
             .chain(&positions_after)
-            .find(|f| !f.format.eq_ignore_ascii_case("parquet"))
+            .find(|f| !f.format.eq_ignore_ascii_case("parquet") && !is_deletion_vector(f))
         {
             return Err(unsupported(format!(
-                "position deletes in {} format (deletion vectors are not supported)",
+                "position deletes in {} format without a complete deletion vector reference",
                 f.format
             )));
         }
@@ -472,11 +472,37 @@ pub fn commit_rows(
 const DELETE_FILE_PATH: FieldId = FieldId(2_147_483_546);
 const DELETE_POS: FieldId = FieldId(2_147_483_545);
 
-/// Reads a position delete file: deleted positions per data file path.
+/// A v3 deletion vector: a Puffin blob for exactly one data file.
+fn is_deletion_vector(f: &DataFile) -> bool {
+    f.format.eq_ignore_ascii_case("puffin")
+        && f.referenced_data_file.is_some()
+        && f.content_offset.is_some()
+        && f.content_size_in_bytes.is_some()
+}
+
+/// Reads a position delete file or deletion vector: deleted positions per data file path.
 fn position_deletes(
     io: &impl FileIo,
     file: &DataFile,
 ) -> Result<BTreeMap<String, BTreeSet<i64>>, InspectError> {
+    if let (true, Some(target), Some(offset), Some(size)) = (
+        is_deletion_vector(file),
+        &file.referenced_data_file,
+        file.content_offset,
+        file.content_size_in_bytes,
+    ) {
+        let positions = crate::deletion_vector::read(&io.read(&file.path)?, offset, size)
+            .map_err(|e| unsupported(format!("{}: {e}", file.path)))?;
+        if positions.len() as i64 != file.record_count {
+            return Err(unsupported(format!(
+                "{} deletes {} rows but its manifest says {}",
+                file.path,
+                positions.len(),
+                file.record_count
+            )));
+        }
+        return Ok(BTreeMap::from([(target.clone(), positions)]));
+    }
     let rows = extract_rows(
         io.read(&file.path)?,
         &[

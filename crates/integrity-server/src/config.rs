@@ -330,6 +330,10 @@ max_inline_validation_bytes = "2GiB"
                 "compat/integrity.lakekeeper.toml",
                 include_str!("../../../compat/integrity.lakekeeper.toml"),
             ),
+            (
+                "compat/integrity.nessie.toml",
+                include_str!("../../../compat/integrity.nessie.toml"),
+            ),
         ] {
             if let Err(e) = Config::from_toml(text) {
                 panic!("{name}: {e}");

@@ -191,6 +191,13 @@ impl Env {
             .await
             .unwrap();
         let head = meta["metadata"]["refs"]["main"]["snapshot-id"].as_i64();
+        // Sequence numbers as Iceberg assigns them: one more than the table's last.
+        let seq = meta["metadata"]["snapshots"].as_array().map_or(0, |s| {
+            s.iter()
+                .filter_map(|s| s["sequence-number"].as_i64())
+                .max()
+                .unwrap_or(0)
+        }) + 1;
         let mut manifests = head
             .map(|h| self.files.manifests_of.lock().unwrap()[&h].clone())
             .unwrap_or_default();
@@ -200,7 +207,7 @@ impl Env {
             "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": head}],
             "updates": [
                 {"action": "add-snapshot", "snapshot": {"snapshot-id": id, "parent-snapshot-id": head,
-                    "sequence-number": id, "timestamp-ms": id, "manifest-list": list,
+                    "sequence-number": seq, "timestamp-ms": id, "manifest-list": list,
                     "summary": summary(&meta["metadata"])}},
                 {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": id, "type": "branch"}
             ]
@@ -955,4 +962,34 @@ async fn audit_events_name_their_actor() {
     assert_eq!(actor("CONSTRAINT_REGISTERED"), "alice");
     // Without the header, the client's User-Agent (reqwest sends none by default: "unknown").
     assert!(actor("COMMIT_ACCEPTED").is_string());
+}
+
+/// A catalog that serves only recent snapshots (Nessie) or expired history: `verify` cannot
+/// recompute a certificate without the parent, and must say so instead of reporting a bypass.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_without_the_parent_snapshot_is_unverifiable_not_broken() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    let (_, body) = e.through_plane("customer", &[(2, None)]).await;
+    let head = head_of(&body);
+    // Trim the catalog's metadata to the head snapshot without its parent link, as Nessie does.
+    {
+        let mut up = e._shared.lock().unwrap();
+        let meta = up
+            .tables
+            .get_mut("/v1/namespaces/db/tables/customer")
+            .unwrap();
+        let snaps = meta["snapshots"].as_array_mut().unwrap();
+        snaps.retain(|s| s["snapshot-id"] == head);
+        snaps[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("parent-snapshot-id");
+    }
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(statuses(&report), ["UNVERIFIABLE"], "{report}");
+    assert_eq!(report["first_broken"], Value::Null);
+    let (_, domain) = e.api("GET", "domains/db.customer", None).await;
+    assert_eq!(domain["state"], "Healthy", "no false alarm");
 }

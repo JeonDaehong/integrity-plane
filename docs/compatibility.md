@@ -16,7 +16,8 @@
 | Equality deletes on other fields, with explicit sequence numbers, or mixed with data-file removal | Rejected | Phase 6 |
 | Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017) | Yes |
 | Compaction of a merge-on-read table (applying, rewriting or dropping position delete files) | Supported if live rows are unchanged | Yes (ADR 0017) |
-| Deletion vectors (v3, Puffin); position and equality deletes in one table | Rejected | Rejected |
+| Deletion vectors (v3, Puffin) | Supported, as position deletes (ADR 0018) | Yes |
+| Position and equality deletes in one table | Rejected | Rejected |
 | Removing equality delete files; removing data files while equality delete files exist | Rejected | Rejected (ADR 0008) |
 | Schema change touching a constrained field | Rejected unless `int→long`, decimal precision widening (and `float→double` for NOT NULL columns) | Phase 6 |
 | Schema/property changes not touching constrained fields | Pass-through | Phase 6 |
@@ -86,6 +87,16 @@ OAuth2 client credentials through the gateway (the token endpoint is proxied), t
 comes from `/v1/config?warehouse=…`, and the Plane uses its own client credentials
 (`[upstream.auth]`) to read tables for validation, onboarding and `verify`. PyIceberg and Spark run
 the same scenarios as above, then `integrity verify` succeeds on their tables.
+
+### Lakekeeper and Nessie (CI jobs `lakekeeper`, `nessie`)
+
+Lakekeeper 0.13.6 (Postgres, S3 warehouse; the catalog prefix is the warehouse id) and Nessie
+0.108.8 (Iceberg REST endpoint, in-memory version store, S3 warehouse; prefix `main|warehouse`): Spark
+runs the full scenario through the gateway, merge-on-read included, and format v3 on Lakekeeper
+(Nessie 0.108 creates v2 tables when v3 is requested). Nessie serves only
+the current snapshot of a table, without its parent, so `verify` cannot recompute certificates there
+and reports them `UNVERIFIABLE` (never a break); commit-time validation and bypass detection are
+unaffected.
 
 For every client each violation reaches the gateway exactly once (no retry storm), the statement
 fails with the integrity code in its message, and every snapshot on `main` carries a certificate.

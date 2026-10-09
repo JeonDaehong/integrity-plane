@@ -227,6 +227,20 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                 continue;
             }
         };
+        // The certificate covers the change from the parent: without the parent's metadata (it
+        // expired, or the catalog serves only recent snapshots, as Nessie does) it cannot be
+        // recomputed. That is not evidence of a bypass.
+        let parent_missing = match snap.parent_snapshot_id {
+            Some(p) => meta.snapshot(SnapshotId(p)).is_none(),
+            None => snap.sequence_number.is_some_and(|n| n > 1),
+        };
+        if parent_missing {
+            chain.push(link(
+                LinkStatus::Unverifiable,
+                Some("the catalog does not serve the parent snapshot".into()),
+            ));
+            continue;
+        }
         let previous = match snap.parent_snapshot_id {
             None => Digest::ZERO,
             Some(p) => match meta

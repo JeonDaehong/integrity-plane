@@ -91,6 +91,9 @@ pub struct Snapshot {
     /// Parent on the branch it was committed to.
     #[serde(default)]
     pub parent_snapshot_id: Option<i64>,
+    /// Data sequence number (v2+; the first snapshot of a table has 1).
+    #[serde(default)]
+    pub sequence_number: Option<i64>,
     /// Location of the manifest list (absent only in old v1 metadata, which is unsupported).
     #[serde(default)]
     pub manifest_list: Option<String>,
