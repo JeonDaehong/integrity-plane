@@ -50,12 +50,15 @@ type Entry = (i32, i32, &'static str, &'static str, i64);
 
 struct Table {
     io: MemoryIo,
+    /// Rows per Parquet row group of data files (`None`: the writer's default, one group).
+    row_group: Option<usize>,
 }
 
 impl Table {
     fn new() -> Self {
         Self {
             io: MemoryIo::new(),
+            row_group: None,
         }
     }
 
@@ -266,7 +269,12 @@ impl Table {
         )
         .unwrap();
         let mut out = Vec::new();
-        let mut w = ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        let props = self.row_group.map(|r| {
+            parquet::file::properties::WriterProperties::builder()
+                .set_max_row_group_row_count(Some(r))
+                .build()
+        });
+        let mut w = ArrowWriter::try_new(&mut out, schema, props).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
         self.io.insert(path, out);
@@ -979,8 +987,10 @@ proptest::proptest! {
         parent_deletes in proptest::collection::vec((0usize..4, 0i64..6), 0..4),
         new_deletes in proptest::collection::vec((0usize..4, 0i64..6), 0..4),
         keep_parent_deletes in proptest::bool::ANY,
+        row_group in proptest::option::of(1usize..4),
     ) {
         let mut t = Table::new();
+        t.row_group = row_group;
         let names = ["f0.parquet", "f1.parquet", "f2.parquet", "f3.parquet"];
         for (i, n) in rows.iter().enumerate() {
             let data: Vec<(i64, &str)> =

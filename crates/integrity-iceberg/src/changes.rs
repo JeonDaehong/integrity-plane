@@ -536,14 +536,21 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
     ] {
         for file in files {
             let gone = gone.get(&file.path).unwrap_or(&empty);
-            stream_file(io, file, columns, &[gone], &mut |batch, start| {
-                let live = without(batch, start, gone, columns)?;
-                if live.is_empty() {
-                    Ok(())
-                } else {
-                    f(side, live).map_err(Failed::Caller)
-                }
-            })?;
+            stream_file(
+                io,
+                file,
+                columns,
+                &[gone],
+                &|_, _| true,
+                &mut |batch, start| {
+                    let live = without(batch, start, gone, columns)?;
+                    if live.is_empty() {
+                        Ok(())
+                    } else {
+                        f(side, live).map_err(Failed::Caller)
+                    }
+                },
+            )?;
         }
     }
     // Kept data files whose deleted positions the commit changes.
@@ -556,7 +563,12 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
             }
             let newly: BTreeSet<i64> = a.difference(b).copied().collect();
             let restored: BTreeSet<i64> = b.difference(a).copied().collect();
-            stream_file(io, file, columns, &[a, b], &mut |batch, start| {
+            // Only the row groups holding a changed position are read.
+            let changed = |start: i64, rows: i64| {
+                newly.range(start..start + rows).next().is_some()
+                    || restored.range(start..start + rows).next().is_some()
+            };
+            stream_file(io, file, columns, &[a, b], &changed, &mut |batch, start| {
                 let removed = only(&batch, start, &newly, columns)?;
                 let added = only(&batch, start, &restored, columns)?;
                 if !removed.is_empty() {
@@ -590,26 +602,29 @@ impl<E> From<InspectError> for Failed<E> {
     }
 }
 
-/// Streams one data file to `g(batch, position of its first row)`, then checks its row count
-/// against the manifest and that every position of every set in `deleted` is within the file.
+/// Streams the row groups of one data file that `wanted(first position, rows)` accepts to
+/// `g(batch, position of its first row)`, then checks the file's row count against the manifest
+/// and that every position of every set in `deleted` is within the file.
 fn stream_file<E: From<InspectError>>(
     io: &impl FileIo,
     file: &DataFile,
     columns: &[(FieldId, LogicalType)],
     deleted: &[&BTreeSet<i64>],
+    wanted: &dyn Fn(i64, i64) -> bool,
     g: &mut dyn FnMut(RowBatch, i64) -> Result<(), Failed<E>>,
 ) -> Result<(), E> {
-    let mut rows: usize = 0;
-    let read = crate::parquet_keys::for_each_batch_from(io, &file.path, columns, |batch| {
-        let start = rows as i64;
-        rows += batch.len();
-        g(batch, start)
-    });
-    match read {
-        Ok(()) => {}
+    let read = crate::parquet_keys::for_each_batch_where(
+        io,
+        &file.path,
+        columns,
+        |start, rows| wanted(start as i64, rows as i64),
+        |batch, start| g(batch, start as i64),
+    );
+    let rows = match read {
+        Ok(rows) => usize::try_from(rows).unwrap_or(usize::MAX),
         Err(Failed::Inspect(e)) => return Err(e.into()),
         Err(Failed::Caller(e)) => return Err(e),
-    }
+    };
     if rows as i64 != file.record_count {
         return Err(unsupported(format!(
             "{} has {rows} rows but its manifest says {}",

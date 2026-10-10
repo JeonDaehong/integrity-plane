@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 62d5f7e311baae5635ec7615824a8a68c61b847017d0d5858ceaeff247521337 # shrinks to rows = [1, 1, 1, 1], parent_files = [false, false, false, true], new_files = [false, false, false, true], parent_deletes = [(3, 0)], new_deletes = [], keep_parent_deletes = false, row_group = None
+cc 16fa4f2f13a82d0cac2782e46b18d10449287a999de443278e9f17b6232afc87 # shrinks to rows = [1, 2, 1, 3], parent_files = [false, false, false, true], new_files = [false, false, false, true], parent_deletes = [], new_deletes = [(3, 2)], keep_parent_deletes = false, row_group = Some(1)

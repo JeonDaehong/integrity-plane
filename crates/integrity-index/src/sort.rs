@@ -19,8 +19,8 @@ use crate::{IndexError, Result};
 
 /// Runs merged at once.
 const FAN_IN: usize = 64;
-/// Bytes accounted per buffered key on top of its length (allocation and vector overhead).
-const PER_KEY: usize = 48;
+/// Bytes accounted per buffered key on top of its length (its span).
+const PER_KEY: usize = std::mem::size_of::<(usize, u32)>();
 /// Write and read buffer of each run file.
 const IO_BUFFER: usize = 64 * 1024;
 
@@ -56,14 +56,18 @@ impl Spill {
     }
 
     /// Writes sorted, distinct `(key, count)` records to a new run file.
-    fn write(&mut self, records: impl Iterator<Item = Result<(Vec<u8>, u64)>>) -> Result<PathBuf> {
+    fn write<K: AsRef<[u8]>>(
+        &mut self,
+        records: impl Iterator<Item = Result<(K, u64)>>,
+    ) -> Result<PathBuf> {
         let path = self.run_path();
         let mut w = BufWriter::with_capacity(IO_BUFFER, File::create(&path).map_err(io)?);
         for record in records {
             let (key, count) = record?;
+            let key = key.as_ref();
             let len = u32::try_from(key.len()).map_err(|_| IndexError::Corrupt)?;
             w.write_all(&len.to_le_bytes()).map_err(io)?;
-            w.write_all(&key).map_err(io)?;
+            w.write_all(key).map_err(io)?;
             w.write_all(&count.to_le_bytes()).map_err(io)?;
         }
         w.flush().map_err(io)?;
@@ -77,14 +81,77 @@ impl Drop for Spill {
     }
 }
 
+/// Keys packed into one allocation: their bytes back to back, and an `(offset, length)` span
+/// per key. Millions of keys cost two allocations, not one each.
+#[derive(Debug, Default)]
+struct Packed {
+    data: Vec<u8>,
+    spans: Vec<(usize, u32)>,
+}
+
+impl Packed {
+    fn push(&mut self, bytes: &[u8]) -> Result<()> {
+        let len = u32::try_from(bytes.len()).map_err(|_| IndexError::Corrupt)?;
+        self.spans.push((self.data.len(), len));
+        self.data.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Bytes accounted against the budget.
+    fn used(&self) -> usize {
+        self.data.len() + self.spans.len() * PER_KEY
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    fn key(&self, (offset, len): (usize, u32)) -> &[u8] {
+        &self.data[offset..offset + len as usize]
+    }
+
+    fn sort(&mut self) {
+        let data = &self.data;
+        self.spans.sort_unstable_by(|&(a, la), &(b, lb)| {
+            data[a..a + la as usize].cmp(&data[b..b + lb as usize])
+        });
+    }
+
+    /// The distinct keys from span `at` on, collapsed: the next key and its count, and where the
+    /// following key starts. The spans must be sorted.
+    fn next_from(&self, at: usize) -> Option<(&[u8], u64, usize)> {
+        let first = *self.spans.get(at)?;
+        let key = self.key(first);
+        let mut end = at + 1;
+        while end < self.spans.len() && self.key(self.spans[end]) == key {
+            end += 1;
+        }
+        Some((key, (end - at) as u64, end))
+    }
+
+    /// Sorted, collapsed records, for a run file.
+    fn records(&self) -> impl Iterator<Item = Result<(&[u8], u64)>> {
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            let (key, count, next) = self.next_from(at)?;
+            at = next;
+            Some(Ok((key, count)))
+        })
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.spans.clear();
+    }
+}
+
 /// Sorts keys within a memory budget, spilling sorted runs to disk.
 #[derive(Debug)]
 pub struct KeySorter {
     parent: PathBuf,
     spill: Option<Spill>,
     budget: usize,
-    buffer: Vec<Vec<u8>>,
-    used: usize,
+    buffer: Packed,
     runs: Vec<PathBuf>,
 }
 
@@ -96,8 +163,7 @@ impl KeySorter {
             parent: parent.into(),
             spill: None,
             budget: budget.max(1),
-            buffer: Vec::new(),
-            used: 0,
+            buffer: Packed::default(),
             runs: Vec::new(),
         }
     }
@@ -110,10 +176,8 @@ impl KeySorter {
     /// Adds one occurrence of an arbitrary byte string (read back with
     /// [`KeySorter::finish_bytes`]).
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let bytes = bytes.to_vec();
-        self.used += bytes.len() + PER_KEY;
-        self.buffer.push(bytes);
-        if self.used >= self.budget {
+        self.buffer.push(bytes)?;
+        if self.buffer.used() >= self.budget {
             self.spill_buffer()?;
         }
         Ok(())
@@ -124,18 +188,19 @@ impl KeySorter {
         self.runs.len()
     }
 
+    /// Sorts the buffer into a new run file and empties it (keeping its allocation for reuse).
     fn spill_buffer(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let records = collapse(std::mem::take(&mut self.buffer));
-        self.used = 0;
+        self.buffer.sort();
         let spill = match &mut self.spill {
             Some(s) => s,
             None => self.spill.insert(Spill::new(&self.parent)?),
         };
-        let path = spill.write(records.into_iter().map(Ok))?;
+        let path = spill.write(self.buffer.records())?;
         self.runs.push(path);
+        self.buffer.clear();
         Ok(())
     }
 
@@ -146,16 +211,20 @@ impl KeySorter {
 
     /// Every distinct byte string pushed, in byte order, with its number of occurrences.
     pub fn finish_bytes(mut self) -> Result<SortedBytes> {
-        let Some(mut spill) = self.spill.take() else {
+        if self.spill.is_none() {
+            let mut packed = std::mem::take(&mut self.buffer);
+            packed.sort();
             return Ok(SortedBytes {
-                inner: Inner::Memory(collapse(std::mem::take(&mut self.buffer)).into_iter()),
+                inner: Inner::Memory { packed, at: 0 },
                 _spill: None,
             });
-        };
-        if !self.buffer.is_empty() {
-            let records = collapse(std::mem::take(&mut self.buffer));
-            self.runs.push(spill.write(records.into_iter().map(Ok))?);
         }
+        self.spill_buffer()?;
+        let Some(mut spill) = self.spill.take() else {
+            return Err(IndexError::Corrupt);
+        };
+        // The buffer is not needed any more: free it before merging.
+        self.buffer = Packed::default();
         let mut runs = std::mem::take(&mut self.runs);
         while runs.len() > FAN_IN {
             let mut merged = Vec::new();
@@ -173,19 +242,6 @@ impl KeySorter {
             _spill: Some(spill),
         })
     }
-}
-
-/// Sorts keys and collapses equal ones into `(key, count)`.
-fn collapse(mut keys: Vec<Vec<u8>>) -> Vec<(Vec<u8>, u64)> {
-    keys.sort_unstable();
-    let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
-    for key in keys {
-        match out.last_mut() {
-            Some((last, count)) if *last == key => *count += 1,
-            _ => out.push((key, 1)),
-        }
-    }
-    out
 }
 
 /// Reads the records of one run file.
@@ -266,7 +322,7 @@ impl Iterator for Merge {
 }
 
 enum Inner {
-    Memory(std::vec::IntoIter<(Vec<u8>, u64)>),
+    Memory { packed: Packed, at: usize },
     Merge(Merge),
 }
 
@@ -288,7 +344,12 @@ impl Iterator for SortedBytes {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            Inner::Memory(it) => it.next().map(Ok),
+            Inner::Memory { packed, at } => {
+                let (key, count, next) = packed.next_from(*at)?;
+                let key = key.to_vec();
+                *at = next;
+                Some(Ok((key, count)))
+            }
             Inner::Merge(m) => m.next(),
         }
     }

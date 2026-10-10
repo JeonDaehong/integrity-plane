@@ -175,18 +175,45 @@ pub fn for_each_batch_from<E: From<ExtractError>>(
     columns: &[(FieldId, LogicalType)],
     mut f: impl FnMut(RowBatch) -> Result<(), E>,
 ) -> Result<(), E> {
+    for_each_batch_where(io, location, columns, |_, _| true, |batch, _| f(batch)).map(|_| ())
+}
+
+/// Like [`for_each_batch_from`], reading only the row groups for which `wanted(position of their
+/// first row, number of rows)` holds, and handing each batch to `f` with the file position of its
+/// first row. Returns the number of rows of the whole file (from the footer); each row group read
+/// must decode to exactly the rows its metadata declares. Merge-on-read deletes in large files
+/// only need the row groups holding the changed positions.
+pub fn for_each_batch_where<E: From<ExtractError>>(
+    io: &(impl crate::io::FileIo + ?Sized),
+    location: &str,
+    columns: &[(FieldId, LogicalType)],
+    wanted: impl Fn(u64, u64) -> bool,
+    mut f: impl FnMut(RowBatch, u64) -> Result<(), E>,
+) -> Result<u64, E> {
     let footer = guarded(|| Footer::read(io, location, columns))?;
+    let mut start = 0u64;
     for rg in 0..footer.metadata.metadata().num_row_groups() {
-        let mut reader = guarded(|| footer.row_group(io, location, rg))?;
-        loop {
-            let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
-            if !guarded(|| reader.next_into(columns, &mut batch))? {
-                break;
+        let rows = u64::try_from(footer.metadata.metadata().row_group(rg).num_rows())
+            .map_err(|_| parquet_err("negative row count in a row group"))?;
+        if wanted(start, rows) {
+            let mut reader = guarded(|| footer.row_group(io, location, rg))?;
+            let mut at = start;
+            loop {
+                let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
+                if !guarded(|| reader.next_into(columns, &mut batch))? {
+                    break;
+                }
+                let n = batch.len() as u64;
+                f(batch, at)?;
+                at += n;
             }
-            f(batch)?;
+            if at - start != rows {
+                return Err(parquet_err("a row group decodes to another number of rows").into());
+            }
         }
+        start += rows;
     }
-    Ok(())
+    Ok(start)
 }
 
 /// Runs a decoding step. The file is client-written: a panic in the decoder (footer or pages) on
