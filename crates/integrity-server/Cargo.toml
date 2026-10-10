@@ -41,6 +41,7 @@ name = "integrity-server"
 path = "src/main.rs"
 
 [dev-dependencies]
+proptest.workspace = true
 apache-avro.workspace = true
 integrity-txn.workspace = true
 arrow-array.workspace = true

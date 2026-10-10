@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -27,7 +28,10 @@ use arrow_schema::{DataType, TimeUnit};
 use bytes::Bytes;
 use integrity_core::{Datum, KeyValue, LogicalType, RowBatch, TypeFamily};
 use integrity_types::{ErrorCode, FieldId};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::Type;
 
@@ -153,75 +157,157 @@ pub fn extract_rows_from(
     location: &str,
     columns: &[(FieldId, LogicalType)],
 ) -> Result<RowBatch, ExtractError> {
-    // The file is client-written: a panic in the decoder (footer or pages) on malformed input is
-    // an error, never a crash (spec §28).
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        extract(fetch(io, location, columns)?, columns)
-    }))
-    .unwrap_or_else(|_| Err(parquet_err("malformed Parquet file (decoder panicked)")))
+    let footer = guarded(|| Footer::read(io, location, columns))?;
+    let mut all = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
+    for rg in 0..footer.metadata.metadata().num_row_groups() {
+        let mut reader = guarded(|| footer.row_group(io, location, rg))?;
+        while guarded(|| reader.next_into(columns, &mut all))? {}
+    }
+    Ok(all)
+}
+
+/// Like [`extract_rows_from`], handing the rows to `f` in file order, a few thousand at a time,
+/// and reading one row group's key column chunks at a time: memory stays bounded by the largest
+/// row group, whatever the file size (onboarding, ADR 0011).
+pub fn for_each_batch_from<E: From<ExtractError>>(
+    io: &(impl crate::io::FileIo + ?Sized),
+    location: &str,
+    columns: &[(FieldId, LogicalType)],
+    mut f: impl FnMut(RowBatch) -> Result<(), E>,
+) -> Result<(), E> {
+    let footer = guarded(|| Footer::read(io, location, columns))?;
+    for rg in 0..footer.metadata.metadata().num_row_groups() {
+        let mut reader = guarded(|| footer.row_group(io, location, rg))?;
+        loop {
+            let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
+            if !guarded(|| reader.next_into(columns, &mut batch))? {
+                break;
+            }
+            f(batch)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs a decoding step. The file is client-written: a panic in the decoder (footer or pages) on
+/// malformed input is an error, never a crash (spec §28).
+fn guarded<T>(step: impl FnOnce() -> Result<T, ExtractError>) -> Result<T, ExtractError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(step))
+        .unwrap_or_else(|_| Err(parquet_err("malformed Parquet file (decoder panicked)")))
 }
 
 /// Initial tail read: the footer of most files fits.
 const TAIL: u64 = 64 * 1024;
 
-/// Reads the footer and the column chunks of the requested root columns.
-fn fetch(
-    io: &(impl crate::io::FileIo + ?Sized),
-    location: &str,
-    columns: &[(FieldId, LogicalType)],
-) -> Result<Sparse, ExtractError> {
-    let read =
-        |range: std::ops::Range<u64>| io.read_range(location, range).map_err(ExtractError::Read);
-    let len = io.size(location).map_err(ExtractError::Read)?;
-    if len < 12 {
-        return Err(parquet_err("file too small to be Parquet"));
-    }
-    let mut tail_start = len.saturating_sub(TAIL);
-    let mut tail = read(tail_start..len)?;
-    let footer: [u8; 8] = tail[tail.len() - 8..]
-        .try_into()
-        .map_err(|_| parquet_err("short footer"))?;
-    let metadata_len = parquet::file::metadata::FooterTail::try_new(&footer)
-        .map_err(parquet_err)?
-        .metadata_length() as u64;
-    if metadata_len + 8 > len {
-        return Err(parquet_err("footer length beyond the file"));
-    }
-    if metadata_len + 8 > tail.len() as u64 {
-        tail_start = len - metadata_len - 8;
-        tail = read(tail_start..len)?;
-    }
-    let meta_start = (tail.len() as u64 - 8 - metadata_len) as usize;
-    let metadata = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(
-        &tail[meta_start..tail.len() - 8],
-    )
-    .map_err(parquet_err)?;
+/// A file's footer and where the requested columns are.
+struct Footer {
+    len: u64,
+    tail: (u64, Bytes),
+    metadata: ArrowReaderMetadata,
+    /// Parquet leaf columns of the requested root columns.
+    leaves: Vec<usize>,
+    /// Arrow projection of the requested root columns.
+    mask: ProjectionMask,
+}
 
-    let wanted: std::collections::BTreeSet<i32> = columns.iter().map(|(f, _)| f.0).collect();
-    let schema = metadata.file_metadata().schema_descr();
-    let leaves: Vec<usize> = (0..schema.num_columns())
-        .filter(|&i| {
-            let info = schema.get_column_root(i).get_basic_info();
-            info.has_id() && wanted.contains(&info.id())
-        })
-        .collect();
-    let mut sparse = Sparse {
-        len,
-        ranges: vec![(tail_start, tail)],
-    };
-    for rg in metadata.row_groups() {
-        for &i in &leaves {
-            let (start, size) = rg.column(i).byte_range();
-            let end = start
-                .checked_add(size)
-                .filter(|&e| e <= len)
-                .ok_or_else(|| parquet_err("column chunk beyond the file"))?;
-            if !sparse.covers(start, end) {
-                sparse.ranges.push((start, read(start..end)?));
+impl Footer {
+    /// Reads and decodes the footer.
+    fn read(
+        io: &(impl crate::io::FileIo + ?Sized),
+        location: &str,
+        columns: &[(FieldId, LogicalType)],
+    ) -> Result<Self, ExtractError> {
+        let read = |range: std::ops::Range<u64>| {
+            io.read_range(location, range).map_err(ExtractError::Read)
+        };
+        let len = io.size(location).map_err(ExtractError::Read)?;
+        if len < 12 {
+            return Err(parquet_err("file too small to be Parquet"));
+        }
+        let mut tail_start = len.saturating_sub(TAIL);
+        let mut tail = read(tail_start..len)?;
+        let footer: [u8; 8] = tail[tail.len() - 8..]
+            .try_into()
+            .map_err(|_| parquet_err("short footer"))?;
+        let metadata_len = parquet::file::metadata::FooterTail::try_new(&footer)
+            .map_err(parquet_err)?
+            .metadata_length() as u64;
+        if metadata_len + 8 > len {
+            return Err(parquet_err("footer length beyond the file"));
+        }
+        if metadata_len + 8 > tail.len() as u64 {
+            tail_start = len - metadata_len - 8;
+            tail = read(tail_start..len)?;
+        }
+        let meta_start = (tail.len() as u64 - 8 - metadata_len) as usize;
+        let decoded = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(
+            &tail[meta_start..tail.len() - 8],
+        )
+        .map_err(parquet_err)?;
+        let metadata = ArrowReaderMetadata::try_new(Arc::new(decoded), ArrowReaderOptions::new())
+            .map_err(parquet_err)?;
+
+        let schema = metadata.metadata().file_metadata().schema_descr();
+        let locations = locate(schema.root_schema())?;
+        let mut roots = Vec::new();
+        for (field, _) in columns {
+            match locations.get(&field.0) {
+                Some(Location::Root(i)) => roots.push(*i),
+                Some(Location::Nested) => return Err(ExtractError::NestedField(*field)),
+                None => {}
             }
         }
+        let wanted: std::collections::BTreeSet<i32> = columns.iter().map(|(f, _)| f.0).collect();
+        let leaves: Vec<usize> = (0..schema.num_columns())
+            .filter(|&i| {
+                let info = schema.get_column_root(i).get_basic_info();
+                info.has_id() && wanted.contains(&info.id())
+            })
+            .collect();
+        let mask = ProjectionMask::roots(schema, roots);
+        Ok(Self {
+            len,
+            tail: (tail_start, tail),
+            metadata,
+            leaves,
+            mask,
+        })
     }
-    Ok(sparse)
+
+    /// Reads the requested column chunks of row group `rg` and opens a reader over them.
+    fn row_group(
+        &self,
+        io: &(impl crate::io::FileIo + ?Sized),
+        location: &str,
+        rg: usize,
+    ) -> Result<RowGroupReader, ExtractError> {
+        let mut sparse = Sparse {
+            len: self.len,
+            ranges: vec![self.tail.clone()],
+        };
+        let group = self.metadata.metadata().row_group(rg);
+        for &i in &self.leaves {
+            let (start, size) = group.column(i).byte_range();
+            let end = start
+                .checked_add(size)
+                .filter(|&e| e <= self.len)
+                .ok_or_else(|| parquet_err("column chunk beyond the file"))?;
+            if !sparse.covers(start, end) {
+                let bytes = io
+                    .read_range(location, start..end)
+                    .map_err(ExtractError::Read)?;
+                sparse.ranges.push((start, bytes));
+            }
+        }
+        let reader =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(sparse, self.metadata.clone())
+                .with_projection(self.mask.clone())
+                .with_row_groups(vec![rg])
+                .with_batch_size(BATCH_SIZE)
+                .build()
+                .map_err(parquet_err)?;
+        Ok(RowGroupReader(reader))
+    }
 }
 
 /// The parts of a file that were read, as a Parquet [`ChunkReader`]. Asking for anything else is
@@ -273,27 +359,20 @@ impl parquet::file::reader::ChunkReader for Sparse {
     }
 }
 
-fn extract(data: Sparse, columns: &[(FieldId, LogicalType)]) -> Result<RowBatch, ExtractError> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(data).map_err(parquet_err)?;
-    let locations = locate(builder.parquet_schema().root_schema())?;
+/// Decodes one row group, a batch at a time.
+struct RowGroupReader(ParquetRecordBatchReader);
 
-    let mut roots = Vec::new();
-    for (field, _) in columns {
-        match locations.get(&field.0) {
-            Some(Location::Root(i)) => roots.push(*i),
-            Some(Location::Nested) => return Err(ExtractError::NestedField(*field)),
-            None => {}
-        }
-    }
-    let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
-    let reader = builder
-        .with_projection(mask)
-        .with_batch_size(BATCH_SIZE)
-        .build()
-        .map_err(parquet_err)?;
-
-    let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
-    for record_batch in reader {
+impl RowGroupReader {
+    /// Appends the next rows, projected to `columns` in that order, to `out`; `false` at the end
+    /// of the row group.
+    fn next_into(
+        &mut self,
+        columns: &[(FieldId, LogicalType)],
+        out: &mut RowBatch,
+    ) -> Result<bool, ExtractError> {
+        let Some(record_batch) = self.0.next() else {
+            return Ok(false);
+        };
         let record_batch = record_batch.map_err(parquet_err)?;
         // Output columns of this record batch, by field ID.
         let mut by_id: BTreeMap<i32, &ArrayRef> = BTreeMap::new();
@@ -319,10 +398,10 @@ fn extract(data: Sparse, columns: &[(FieldId, LogicalType)]) -> Result<RowBatch,
             .collect::<Result<_, _>>()?;
         for row in 0..record_batch.num_rows() {
             let row: Vec<Datum> = cells.iter().map(|col| col[row].clone()).collect();
-            batch.push(row).map_err(parquet_err)?;
+            out.push(row).map_err(parquet_err)?;
         }
+        Ok(true)
     }
-    Ok(batch)
 }
 
 fn mismatch(field: FieldId, expected: &LogicalType, array: &ArrayRef) -> ExtractError {

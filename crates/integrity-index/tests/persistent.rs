@@ -112,48 +112,98 @@ fn corrupted_file_is_never_served_silently() {
 }
 
 #[test]
-fn replace_all_swaps_contents_atomically_and_survives_reopen() {
-    let dir = TempDir::new("replace");
+fn builds_are_installed_atomically_beside_the_live_contents() {
+    let dir = TempDir::new("build");
     let path = dir.path().join("index.redb");
+    let n = 120_000; // more than one build transaction
     {
         let store = PersistentStore::open(&path).unwrap();
-        let index = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
-        commit(&index, &delta(1, &[(1, 2), (2, 1)])).unwrap();
-        let fresh = vec![(k(7), IndexValue::Reference { child_count: 4 })];
-        // Older or equal epochs are refused.
-        assert!(index.replace_all(&fresh, IndexEpoch(1)).is_err());
-        // Values of the wrong kind are refused, and nothing changes.
+        let refs = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
+        commit(&refs, &delta(1, &[(1, 2), (2, 1)])).unwrap();
+        let mut a = store.build(ConstraintId(3), IndexKind::Reference).unwrap();
+        let mut b = store.build(ConstraintId(4), IndexKind::Unique).unwrap();
+        // Values of the wrong kind are refused.
         assert_eq!(
-            index.replace_all(
-                &[(
-                    k(7),
-                    IndexValue::Unique {
-                        last_snapshot: SnapshotId(1)
-                    }
-                )],
-                IndexEpoch(5)
+            a.push(
+                k(7),
+                IndexValue::Unique {
+                    last_snapshot: SnapshotId(1)
+                }
             ),
             Err(IndexError::Corrupt)
         );
-        assert_eq!(index.entries().unwrap().len(), 2);
-        index.replace_all(&fresh, IndexEpoch(5)).unwrap();
+        a.push(k(7), IndexValue::Reference { child_count: 4 })
+            .unwrap();
+        for i in 0..n {
+            b.push(
+                k(i),
+                IndexValue::Unique {
+                    last_snapshot: SnapshotId(9),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            b.get_many(&[k(5), k(n)]).unwrap(),
+            vec![
+                Some(IndexValue::Unique {
+                    last_snapshot: SnapshotId(9)
+                }),
+                None
+            ]
+        );
+        // Until installed, readers see the live contents.
+        assert_eq!(refs.entries().unwrap().len(), 2);
+        let unique = store.index(ConstraintId(4), IndexKind::Unique).unwrap();
+        assert!(unique.entries().unwrap().is_empty());
+        // One epoch above every index's current one.
+        assert_eq!(store.install(vec![a, b]).unwrap(), IndexEpoch(2));
     }
     let store = PersistentStore::open(&path).unwrap();
-    let index = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
-    assert_eq!(index.epoch().unwrap(), IndexEpoch(5));
+    let refs = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
+    let unique = store.index(ConstraintId(4), IndexKind::Unique).unwrap();
+    assert_eq!(refs.epoch().unwrap(), IndexEpoch(2));
+    assert_eq!(unique.epoch().unwrap(), IndexEpoch(2));
     assert_eq!(
-        index.entries().unwrap(),
+        refs.entries().unwrap(),
         vec![(k(7), IndexValue::Reference { child_count: 4 })]
     );
+    assert_eq!(unique.entries().unwrap().len(), n as usize);
     // Normal applies continue after the swap.
-    commit(&index, &delta(6, &[(7, -1), (8, 1)])).unwrap();
+    commit(&refs, &delta(6, &[(7, -1), (8, 1)])).unwrap();
     assert_eq!(
-        index.get_many(&[k(7), k(8)]).unwrap(),
+        refs.get_many(&[k(7), k(8)]).unwrap(),
         vec![
             Some(IndexValue::Reference { child_count: 3 }),
             Some(IndexValue::Reference { child_count: 1 })
         ]
     );
+
+    // A build that is never installed (the process died) changes nothing; the next build of the
+    // same index starts empty.
+    let mut stale = store.build(ConstraintId(3), IndexKind::Reference).unwrap();
+    stale
+        .push(k(9), IndexValue::Reference { child_count: 1 })
+        .unwrap();
+    stale.flush().unwrap();
+    drop(stale);
+    assert_eq!(refs.entries().unwrap().len(), 2);
+    let empty = store.build(ConstraintId(3), IndexKind::Reference).unwrap();
+    assert_eq!(store.install(vec![empty]).unwrap(), IndexEpoch(4));
+    assert!(refs.entries().unwrap().is_empty());
+    // A discarded build leaves the index alone.
+    let mut gone = store.build(ConstraintId(4), IndexKind::Unique).unwrap();
+    gone.push(
+        k(-1),
+        IndexValue::Unique {
+            last_snapshot: SnapshotId(1),
+        },
+    )
+    .unwrap();
+    gone.discard().unwrap();
+    assert_eq!(unique.entries().unwrap().len(), n as usize);
+    // A build of an existing index with another kind is refused.
+    assert!(store.build(ConstraintId(4), IndexKind::Reference).is_err());
 }
 
 #[test]

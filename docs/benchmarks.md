@@ -68,43 +68,76 @@ target), multi-node anything.
 
 ## Large tables (local, `--scale`)
 
-`integrity-bench --scale N --file-rows 1000000` loads N rows in 1 M-row files straight to the
-catalog, onboards a PRIMARY KEY, then measures through the Plane: a copy-on-write delete of one row
-(its 1 M-row file rewritten), compaction of 10 files, and 50 merge-on-read deletes of one row each.
-Peak memory is the benchmark process's peak working set (the Plane runs in it).
+`integrity-bench --scale N --file-rows 1000000 --settle 120` loads N rows in 1 M-row files straight
+to the catalog, onboards a PRIMARY KEY, then measures through the Plane: a copy-on-write delete of
+one row (its 1 M-row file rewritten), compaction of 10 files, and 50 merge-on-read deletes of one row
+each. `--settle 120` waits two minutes after the load and after onboarding: on the benchmark machine
+(Windows, real-time antivirus on) measurements taken right after gigabytes of new files were
+written ran up to 2–3 times slower and varied widely. Memory is the benchmark process's working set
+(the Plane runs in it), sampled every second by an external script; "during onboarding" is the
+highest sample between the start and end of the registration request.
 
-### 30 M rows (peak memory 10.2 GB)
+### Onboarding before and after the bounded-memory scan (ADR 0011 amendment)
+
+Same machine, same day, same options; "before" is commit 0f0d373.
+
+| Rows | Onboarding before | Onboarding after | Memory during onboarding, before | after |
+|---|---|---|---|---|
+| 30 M | 141.25 s | 49.13 s | 10.3 GB | 965 MB |
+| 60 M | 365.79 s | 174.78 s | 14.1 GB | 1.2 GB |
+| 100 M | not run (about 25 GB needed) | 170.35 s | | 1.3 GB |
+
+Before, the scan held every key of the domain in memory (about 250–340 bytes per key), so 100 M
+keys would have needed about 25–34 GB. Now the keys are sorted externally within
+`limits.scan_memory` (512 MiB by default); what remains is that budget plus the index store's
+page cache (redb, 1 GiB at most), so memory stays near 1.3 GB whatever the table size. The scan is
+also faster: sorting runs of keys and appending them in order beats inserting each key into an
+in-memory B-tree and then copying it into the store.
+
+### 100 M rows, after (peak memory of the whole run 5.4 GB)
 
 | Scenario | Time | Data | Notes |
 |---|---|---|---|
-| Load 30000000 rows in 30 files of 1000000 rows (no Plane) | 1.76 s | | |
-| Onboarding scan of 30000000 keys | 154.73 s | 193892 keys/s | |
-| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.83 s; validation 2.77 s | read 15.9 MiB | status 200 |
-| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 269.8 ms / validation 259.3 ms; last: 161.5 ms / 150.1 ms | read first 8.0 MiB, last 8.1 MiB | |
-| Compaction | skipped: fewer than 10 untouched files | | |
+| Load 100000000 rows in 100 files of 1000000 rows (no Plane) | 4.45 s | | |
+| Onboarding scan of 100000000 keys | 170.35 s | 587023 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.58 s; validation 2.55 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 38.08 s; validation 38.07 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 245.3 ms / validation 235.6 ms; last: 140.9 ms / 130.2 ms | read first 8.0 MiB, last 8.1 MiB | |
 
-### 60 M rows (peak memory 15.2 GB)
+### 60 M rows, after (peak memory of the whole run 5.4 GB)
 
 | Scenario | Time | Data | Notes |
 |---|---|---|---|
-| Load 60000000 rows in 60 files of 1000000 rows (no Plane) | 2.80 s | | |
-| Onboarding scan of 60000000 keys | 433.47 s | 138416 keys/s | |
-| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.97 s; validation 2.95 s | read 15.9 MiB | status 200 |
-| Compaction of 10 files (10000000 rows) into one | end-to-end 52.33 s; validation 52.32 s | read 158.4 MiB | status 200 |
-| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 149.9 ms / validation 139.1 ms; last: 1.68 s / 1.67 s | read first 8.0 MiB, last 79.1 MiB | |
+| Load 60000000 rows in 60 files of 1000000 rows (no Plane) | 9.01 s | | |
+| Onboarding scan of 60000000 keys | 174.78 s | 343285 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.59 s; validation 2.58 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 38.84 s; validation 38.83 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 161.1 ms / validation 150.6 ms; last: 1.26 s / 1.24 s | read first 8.0 MiB, last 79.1 MiB | |
+
+### 60 M rows, before (peak memory of the whole run 14.1 GB)
+
+| Scenario | Time | Data | Notes |
+|---|---|---|---|
+| Load 60000000 rows in 60 files of 1000000 rows (no Plane) | 3.09 s | | |
+| Onboarding scan of 60000000 keys | 365.79 s | 164027 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.71 s; validation 2.68 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 51.08 s; validation 51.07 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 197.2 ms / validation 185.9 ms; last: 1.70 s / 1.69 s | read first 8.0 MiB, last 79.1 MiB | |
 
 What this shows:
 
-- **Onboarding and rebuild hold every key in memory** (about 250–340 bytes per key): 60 M keys need
-  about 15 GB, so a single node of this size cannot onboard much more than 100 M keys. They need a
-  streaming / external-sort build.
+- **Onboarding and rebuild** now need about 1.3 GB whatever the table size, and scratch disk for
+  the sorted runs and the new index; their time grows with the number of keys (about 170 s for
+  100 M keys here).
+- **The commit path is unchanged** by the new scan; differences between the runs above are within
+  run-to-run noise (copy-on-write 2.6–2.7 s, compaction 38–80 s across runs on this machine).
 - **Copy-on-write work follows the rewritten file, not the change:** deleting one row of a 1 M-row
-  file validates 2 M keys (before and after), about 3 s.
-- **Compaction** validates about 200 K keys/s on one thread (10 M rows in 52 s), comparable to the
-  engine's own rewrite time for the same data, and needs a larger validation budget than the
-  default for big rewrites.
-- **Merge-on-read** deletes stay at 150–300 ms while the deleted rows sit in 1 M-row files; a delete
-  in a large file reads that file's whole key column (79 MB for a 10 M-row file, 1.7 s).
+  file validates 2 M keys (before and after), about 2.6 s.
+- **Compaction** holds both sides of the rewrite in memory while validating: the peak memory of
+  the whole run (about 5 GB) is the 10 M-row compaction, not onboarding. Streaming it is the next
+  step.
+- **Merge-on-read** deletes stay at 120–250 ms while the deleted rows sit in 1 M-row files; a delete
+  in a large file reads that file's whole key column (79 MB for a 10 M-row file, 1.2–1.7 s).
 
 ## What the Plane adds to Iceberg
 

@@ -132,16 +132,28 @@ pub struct LimitsConfig {
     /// Maximum bytes read from storage to validate one commit.
     #[serde(default = "default_budget", deserialize_with = "byte_size")]
     pub max_inline_validation_bytes: u64,
+    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table; beyond it, sorted
+    /// runs spill to the control store directory.
+    #[serde(default = "default_scan_memory", deserialize_with = "byte_size")]
+    pub scan_memory: u64,
 }
 
 fn default_budget() -> u64 {
     2 << 30
 }
 
+/// Default `limits.scan_memory`: 512 MiB.
+pub const DEFAULT_SCAN_MEMORY: u64 = 512 << 20;
+
+fn default_scan_memory() -> u64 {
+    DEFAULT_SCAN_MEMORY
+}
+
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_inline_validation_bytes: default_budget(),
+            scan_memory: default_scan_memory(),
         }
     }
 }

@@ -472,6 +472,84 @@ pub fn commit_rows(
     })
 }
 
+/// Hands every live row of a whole table to `f`: the rows [`commit_rows`] would put in `added` for
+/// a snapshot diffed against no parent (`diff_snapshots(io, None, list)`), in the same order, a
+/// few thousand at a time. Unlike `commit_rows` it never holds the table: memory is one row group
+/// of key columns plus the table's deleted positions (onboarding and rebuild, ADR 0011).
+pub fn for_each_live_batch<E: From<InspectError>>(
+    io: &impl FileIo,
+    changes: &FileChanges,
+    columns: &[(FieldId, LogicalType)],
+    mut f: impl FnMut(RowBatch) -> Result<(), E>,
+) -> Result<(), E> {
+    if !changes.removed.is_empty()
+        || !changes.equality_deletes.is_empty()
+        || changes
+            .positions
+            .as_ref()
+            .is_some_and(|p| !p.before.is_empty() || !p.kept.is_empty())
+    {
+        return Err(
+            unsupported("a whole-table scan needs a snapshot diffed against no parent").into(),
+        );
+    }
+    let mut deleted: HashMap<String, BTreeSet<i64>> = HashMap::new();
+    if let Some(pd) = &changes.positions {
+        for d in &pd.after {
+            for (path, positions) in position_deletes(io, d)? {
+                deleted.entry(path).or_default().extend(positions);
+            }
+        }
+    }
+    /// The caller's error, or one of reading the file.
+    enum Failed<E> {
+        Inspect(InspectError),
+        Caller(E),
+    }
+    impl<E> From<ExtractError> for Failed<E> {
+        fn from(e: ExtractError) -> Self {
+            Failed::Inspect(e.into())
+        }
+    }
+    let fields: Vec<FieldId> = columns.iter().map(|(f, _)| *f).collect();
+    let empty = BTreeSet::new();
+    for file in &changes.added {
+        let gone = deleted.get(&file.path).unwrap_or(&empty);
+        let mut rows: usize = 0;
+        let read = crate::parquet_keys::for_each_batch_from(io, &file.path, columns, |batch| {
+            let start = rows as i64;
+            rows += batch.len();
+            let batch = if gone.range(start..rows as i64).next().is_none() {
+                batch
+            } else {
+                let mut live = RowBatch::new(fields.clone());
+                for (i, row) in batch.rows().iter().enumerate() {
+                    if !gone.contains(&(start + i as i64)) {
+                        live.push(row.clone())
+                            .map_err(|e| Failed::Inspect(unsupported(e.to_string())))?;
+                    }
+                }
+                live
+            };
+            f(batch).map_err(Failed::Caller)
+        });
+        match read {
+            Ok(()) => {}
+            Err(Failed::Inspect(e)) => return Err(e.into()),
+            Err(Failed::Caller(e)) => return Err(e),
+        }
+        if rows as i64 != file.record_count {
+            return Err(unsupported(format!(
+                "{} has {rows} rows but its manifest says {}",
+                file.path, file.record_count
+            ))
+            .into());
+        }
+        check_positions(file, gone, rows)?;
+    }
+    Ok(())
+}
+
 /// Field ids of `file_path` and `pos` in position delete files (Iceberg spec, reserved ids).
 const DELETE_FILE_PATH: FieldId = FieldId(2_147_483_546);
 const DELETE_POS: FieldId = FieldId(2_147_483_545);

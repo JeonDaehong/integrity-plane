@@ -5,12 +5,17 @@
 //! epoch and last applied `(epoch, digest)`. Every `apply` is one redb write transaction that
 //! updates entries and metadata together, committed durably with two-phase commit.
 //!
+//! Rebuilds (spec §19) write new contents into a build table beside the live one, in many small
+//! transactions, then [`PersistentStore::install`] swaps the build tables of all indexes in one
+//! durable transaction: readers see the old or the new indexes, never a mix, and a crash before the
+//! swap leaves the old ones untouched.
+//!
 //! redb can panic (`unreachable!`) on some corrupted files instead of returning an error. Every
 //! call into redb therefore runs under `catch_unwind`: a panic becomes [`IndexError::Corrupt`] and
 //! poisons the store, so all later calls fail closed too. This requires `panic = "unwind"`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,6 +48,7 @@ struct Shared {
     db: Database,
     poisoned: AtomicBool,
     id: String,
+    scratch: PathBuf,
 }
 
 impl Shared {
@@ -86,12 +92,88 @@ impl PersistentStore {
         let db = opened.map_err(|_| IndexError::Corrupt)??;
         let id = catch_unwind(AssertUnwindSafe(|| store_id(&db, path)))
             .map_err(|_| IndexError::Corrupt)??;
+        let mut scratch = path.as_os_str().to_owned();
+        scratch.push(".scratch");
+        let scratch = PathBuf::from(scratch);
+        // Sort runs of a scan that did not finish (the process died).
+        let _ = std::fs::remove_dir_all(&scratch);
         Ok(Self {
             shared: Arc::new(Shared {
                 db,
                 poisoned: AtomicBool::new(false),
                 id,
+                scratch,
             }),
+        })
+    }
+
+    /// A directory for the temporary files of scans (sort runs), next to the store file and
+    /// emptied when the store is opened.
+    pub fn scratch_dir(&self) -> &Path {
+        &self.shared.scratch
+    }
+
+    /// Starts new contents for the index of constraint `id` (creating the index if needed) in a
+    /// build table beside the live one (spec §19). Readers keep seeing the live contents until
+    /// [`PersistentStore::install`]. A build of `id` left over from a crash is discarded.
+    pub fn build(&self, id: ConstraintId, kind: IndexKind) -> Result<IndexBuild> {
+        self.index(id, kind)?;
+        let build = IndexBuild {
+            shared: Arc::clone(&self.shared),
+            id: id.0,
+            table: format!("oip/index-build/v1/{}", id.0),
+            kind,
+            pending: Vec::new(),
+            len: 0,
+        };
+        self.shared.guard(|db| {
+            let txn = db.begin_write().map_err(storage)?;
+            txn.delete_table(build.table()).map_err(storage)?;
+            txn.open_table(build.table()).map_err(storage)?;
+            txn.commit().map_err(storage)
+        })?;
+        Ok(build)
+    }
+
+    /// Makes every build the contents of its index, all at one epoch above the current epoch of
+    /// every one of them, in one atomic, durable transaction (spec §19 step 5): either every index
+    /// switches or none does. Returns that epoch. Clears the replay identity of each index: the
+    /// next apply must be a new epoch.
+    pub fn install(&self, builds: Vec<IndexBuild>) -> Result<IndexEpoch> {
+        let mut builds = builds;
+        for b in &mut builds {
+            if !Arc::ptr_eq(&b.shared, &self.shared) {
+                return Err(IndexError::Storage("build of another store".into()));
+            }
+            b.flush()?;
+        }
+        self.shared.guard(|db| {
+            let mut txn = db.begin_write().map_err(storage)?;
+            txn.set_two_phase_commit(true);
+            let epoch = {
+                let mut meta_table = txn.open_table(META).map_err(storage)?;
+                let mut current = 0;
+                for b in &builds {
+                    current = current.max(b.live().read_meta(&meta_table)?.epoch.0);
+                }
+                let epoch = IndexEpoch(current + 1);
+                for b in &builds {
+                    let live = b.live();
+                    txn.delete_table(live.table()).map_err(storage)?;
+                    txn.rename_table(b.table(), live.table()).map_err(storage)?;
+                    let updated = Meta {
+                        kind: b.kind,
+                        epoch,
+                        last_applied: None,
+                    };
+                    meta_table
+                        .insert(b.id, updated.encode().as_slice())
+                        .map_err(storage)?;
+                }
+                epoch
+            };
+            txn.commit().map_err(storage)?;
+            Ok(epoch)
         })
     }
 
@@ -172,6 +254,109 @@ fn store_id(db: &Database, path: &Path) -> Result<String> {
     };
     txn.commit().map_err(storage)?;
     Ok(id.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Entries written per transaction while building.
+const BUILD_BATCH: usize = 100_000;
+
+/// New contents of one index, written beside the live contents until installed
+/// ([`PersistentStore::build`]). Dropping it without installing leaves the build table, which the
+/// next build of the same index discards.
+#[derive(Debug)]
+pub struct IndexBuild {
+    shared: Arc<Shared>,
+    id: u64,
+    table: String,
+    kind: IndexKind,
+    pending: Vec<(EncodedKey, IndexValue)>,
+    len: u64,
+}
+
+impl IndexBuild {
+    fn table(&self) -> TableDefinition<'_, &'static [u8], &'static [u8]> {
+        TableDefinition::new(&self.table)
+    }
+
+    fn live(&self) -> PersistentIndex {
+        PersistentIndex {
+            shared: Arc::clone(&self.shared),
+            id: self.id,
+            table: format!("oip/index/v1/{}", self.id),
+            kind: self.kind,
+        }
+    }
+
+    /// The constraint whose index this builds.
+    pub fn constraint(&self) -> ConstraintId {
+        ConstraintId(self.id)
+    }
+
+    /// Entries added so far.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether no entry was added.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Adds an entry (keys in order write fastest). A key added twice keeps the last value.
+    pub fn push(&mut self, key: EncodedKey, value: IndexValue) -> Result<()> {
+        if value.kind() != Some(self.kind) {
+            return Err(IndexError::Corrupt);
+        }
+        self.pending.push((key, value));
+        self.len += 1;
+        if self.pending.len() >= BUILD_BATCH {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the pending entries to the build table.
+    pub fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.shared.guard(|db| {
+            let txn = db.begin_write().map_err(storage)?;
+            {
+                let mut table = txn.open_table(self.table()).map_err(storage)?;
+                for (key, value) in &pending {
+                    table
+                        .insert(key.as_bytes(), encode_value(Some(value)).as_slice())
+                        .map_err(storage)?;
+                }
+            }
+            txn.commit().map_err(storage)
+        })
+    }
+
+    /// The values of `keys` in the build so far (FK parents during a scan).
+    pub fn get_many(&mut self, keys: &[EncodedKey]) -> Result<Vec<Option<IndexValue>>> {
+        self.flush()?;
+        self.shared.guard(|db| {
+            let txn = db.begin_read().map_err(storage)?;
+            let table = txn.open_table(self.table()).map_err(storage)?;
+            keys.iter()
+                .map(|k| match table.get(k.as_bytes()).map_err(storage)? {
+                    Some(g) => decode_value(g.value()).map(Some),
+                    None => Ok(None),
+                })
+                .collect()
+        })
+    }
+
+    /// Deletes the build table.
+    pub fn discard(self) -> Result<()> {
+        self.shared.guard(|db| {
+            let txn = db.begin_write().map_err(storage)?;
+            txn.delete_table(self.table()).map_err(storage)?;
+            txn.commit().map_err(storage)
+        })
+    }
 }
 
 /// The persistent index of one constraint.
@@ -311,49 +496,6 @@ impl PersistentIndex {
             Some(g) => decode_value(g.value()).map(Some),
             None => Ok(None),
         }
-    }
-
-    /// Replaces the whole contents with `entries` and moves to `epoch`, in one durable transaction
-    /// (spec §19 rebuild: readers see either the old or the new index, never a mix). Clears the
-    /// replay identity: the next apply must be a new epoch.
-    pub fn replace_all(
-        &self,
-        entries: &[(EncodedKey, IndexValue)],
-        epoch: IndexEpoch,
-    ) -> Result<()> {
-        self.shared.guard(|db| {
-            let mut txn = db.begin_write().map_err(storage)?;
-            txn.set_two_phase_commit(true);
-            {
-                let mut meta_table = txn.open_table(META).map_err(storage)?;
-                let meta = self.read_meta(&meta_table)?;
-                if epoch <= meta.epoch {
-                    return Err(IndexError::EpochConflict {
-                        requested: epoch,
-                        current: meta.epoch,
-                    });
-                }
-                txn.delete_table(self.table()).map_err(storage)?;
-                let mut table = txn.open_table(self.table()).map_err(storage)?;
-                for (key, value) in entries {
-                    if value.kind() != Some(self.kind) {
-                        return Err(IndexError::Corrupt);
-                    }
-                    table
-                        .insert(key.as_bytes(), encode_value(Some(value)).as_slice())
-                        .map_err(storage)?;
-                }
-                let updated = Meta {
-                    kind: self.kind,
-                    epoch,
-                    last_applied: None,
-                };
-                meta_table
-                    .insert(self.id, updated.encode().as_slice())
-                    .map_err(storage)?;
-            }
-            txn.commit().map_err(storage)
-        })
     }
 
     fn apply_in(&self, db: &Database, staged: &StagedDelta, epoch: IndexEpoch) -> Result<()> {

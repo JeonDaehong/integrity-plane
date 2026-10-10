@@ -52,6 +52,9 @@ struct Options {
     file_rows: i64,
     /// Merge-on-read deletes in large-table mode.
     mor_deletes: usize,
+    /// Large-table mode: seconds to wait after writing many files (the load, onboarding) before
+    /// the next measurement, so that background file scanners (antivirus) have settled.
+    settle: u64,
 }
 
 fn options() -> Result<Options, String> {
@@ -65,6 +68,7 @@ fn options() -> Result<Options, String> {
         scale: 0,
         file_rows: 1_000_000,
         mor_deletes: 50,
+        settle: 0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -85,6 +89,7 @@ fn options() -> Result<Options, String> {
             "--scale" => o.scale = n()?,
             "--file-rows" => o.file_rows = n()?,
             "--mor-deletes" => o.mor_deletes = n()? as usize,
+            "--settle" => o.settle = n()? as u64,
             other => return Err(format!("unknown option {other}")),
         }
     }

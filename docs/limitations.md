@@ -31,7 +31,10 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Constraints are on top-level columns only; NOT NULL on one column.
 - Registering, dropping and rebuilding pause commits in all domains while they run.
 - Tables with equality delete files cannot be onboarded or rebuilt; compact them first. Position
-  deletes are applied.
+  deletes are applied; their deleted positions are held in memory during the scan (a few bytes
+  each).
+- Onboarding and rebuild run on one thread and read one table at a time; they need scratch disk
+  space in the control store for sorted key runs and the new indexes (ADR 0011).
 - Foreign keys that form a cycle between different tables are refused (a self-reference is fine).
 - Violation reports give counts and up to ten sample keys per constraint, but not the files the
   offending rows are in.

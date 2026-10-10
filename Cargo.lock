@@ -1255,6 +1255,7 @@ dependencies = [
  "integrity-validator",
  "object_store",
  "parquet",
+ "proptest",
  "redb",
  "reqwest",
  "serde",

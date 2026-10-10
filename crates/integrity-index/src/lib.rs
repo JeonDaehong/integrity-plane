@@ -15,6 +15,7 @@
 mod memory;
 mod overlay;
 mod persistent;
+mod sort;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,7 +25,8 @@ use integrity_types::SnapshotId;
 
 pub use memory::MemoryIndex;
 pub use overlay::Overlay;
-pub use persistent::{PersistentIndex, PersistentStore};
+pub use persistent::{IndexBuild, PersistentIndex, PersistentStore};
+pub use sort::{KeySorter, SortedKeys};
 
 /// Monotonically increasing version of an index's contents. A new index starts at epoch 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

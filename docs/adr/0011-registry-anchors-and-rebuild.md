@@ -49,18 +49,19 @@ certificate, including across constraint set versions.
 2. load every table of the domain and pin its `main`;
 3. order tables so that FK parents come before children (a cycle between distinct tables is refused;
    a self-reference is allowed);
-4. read every live data file's constrained columns and validate each table as one insert against
-   in-memory indexes, so a parent's keys are present when its children are checked;
+4. read every live data file's constrained columns and validate each table as one insert into
+   empty indexes, so a parent's keys are present when its children are checked (with bounded
+   memory, see the amendment below);
 5. on violations: registration fails with `ONBOARDING_VIOLATIONS` (400) and a report naming each
    violated constraint; a failed rebuild leaves the domain degraded;
-6. otherwise replace each persistent index's contents at a new epoch (`replace_all`, atomic per
-   index), then update the registry (constraint, versions, anchors, degraded cleared) in one
-   transaction.
+6. otherwise install every index's new contents at one new epoch in one transaction, then update
+   the registry (constraint, versions, anchors, degraded cleared) in one transaction.
 
 Tables with equality delete files are refused by the scan in 0.1; position deletes are applied
-(ADR 0017). A crash between two
-`replace_all` calls leaves indexes whose contents already equal what the scan derived from the pinned
-snapshots (no commit can run meanwhile), and the registry unchanged; repeating the operation is safe.
+(ADR 0017). A crash before the install leaves the live indexes and the registry unchanged; a crash
+between the install and the registry update leaves indexes whose contents already equal what the
+scan derived from the pinned snapshots (no commit can run meanwhile). Repeating the operation is
+safe either way.
 
 **Rebuild re-certification.** The audit event `INDEX_REBUILT` records each table's previous anchor
 and new anchor, linking the old chain to the new one.
@@ -82,3 +83,41 @@ and new anchor, linking the old chain to the new one.
   which snapshot the index reflects; anchors do.
 - **Per-domain admin locks.** Needed when onboarding large tables must not stall unrelated domains;
   deferred because domain membership changes during registration make lock ordering subtle.
+
+## Amendment: bounded-memory scan (2026-10-10)
+
+The first scan validated each table against in-memory indexes and handed every index's full
+contents to `replace_all`. It needed about 250–340 bytes of memory per key (15 GB for 60 M keys),
+so one node could not onboard much more than 100 M keys. The scan now keeps memory bounded whatever
+the table size:
+
+- **Rows** are read a row group at a time (`for_each_live_batch`, `for_each_batch_from`): the key
+  column chunks of one row group, plus the deleted positions of the table's position delete files
+  and deletion vectors.
+- **Validation** is split (`Validator::table_scan`, `TableScan`): the index-free part (NULL rules,
+  spec §7) runs on each batch and emits every key; the keys of each PK/UNIQUE/FK constraint go to an
+  external sorter (`KeySorter`) that keeps at most `limits.scan_memory` bytes (default 512 MiB,
+  shared by the table's constraints) in memory and spills sorted, collapsed `(key, count)` runs to
+  the index store's scratch directory, merging at most 64 runs at a time.
+- **Checks on sorted keys:** a PK/UNIQUE key that occurs more than once is a duplicate; an FK key is
+  looked up in the parent's new contents, in batches; the others become index entries
+  (`last_snapshot` = the pinned snapshot, `child_count` = occurrences). Each offending key is
+  reported once, in key order, so violation reports (counts and samples) are exactly those of
+  validating the table as one commit.
+- **Index contents** are written in key order into build tables beside the live tables, in
+  transactions of 100 000 entries (`PersistentStore::build`). `PersistentStore::install` then
+  renames every build table over its live table and moves all indexes to one new epoch in a single
+  durable transaction (spec §19: "build index-v{n+1} beside index-v{n}, atomic pointer swap"),
+  replacing `replace_all`, which was atomic only per index. Readers see the old indexes until then.
+  Violations or errors discard the builds; a build left by a crash is discarded by the next build
+  of the same index, and sort runs left by a crash are deleted when the store is opened.
+
+The previous scan is kept as `onboard::scan_in_memory`, the reference: a property test
+(`tests/onboard_scan.rs`) runs both on random domains written as real Parquet and Avro files, with
+several row groups per file and budgets small enough to spill many runs, and requires identical
+reports or identical installed indexes. `TableScan` is checked the same way against
+`validate_with_details` (`integrity-validator/tests/table_scan.rs`).
+
+Disk: the scratch directory needs about the key bytes plus 12 bytes per distinct key per
+constraint while a table is scanned; build tables need about the size of the new index until the
+install frees the old one. Sort runs hold key values (spec §24) and are deleted after each table.

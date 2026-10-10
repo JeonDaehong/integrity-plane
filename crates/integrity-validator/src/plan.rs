@@ -31,6 +31,18 @@ impl Plan {
         self.details.entry(v).or_default().add_key(key);
     }
 
+    /// Records `key` as violating `(constraint, code)`; the caller reports each key at most once.
+    pub fn record_distinct_key(
+        &mut self,
+        constraint: ConstraintId,
+        code: ErrorCode,
+        key: &EncodedKey,
+    ) {
+        let v = Violation { constraint, code };
+        self.violations.insert(v);
+        self.details.entry(v).or_default().add_distinct_key(key);
+    }
+
     /// Records a row that violates `(constraint, code)` without forming a key (NULLs), with the
     /// key tuple if there is one.
     pub fn record_row(&mut self, constraint: ConstraintId, code: ErrorCode, tuple: Option<Tuple>) {
@@ -48,15 +60,7 @@ impl Plan {
         for rc in constraints {
             let c = &rc.constraint;
             match &c.kind {
-                ConstraintKind::NotNull(field) => {
-                    if let Some(i) = column(&commit.added, *field)? {
-                        for row in commit.added.rows() {
-                            if row[i] == Datum::Null {
-                                plan.record_row(c.id, ErrorCode::NotNullViolation, None);
-                            }
-                        }
-                    }
-                }
+                ConstraintKind::NotNull(field) => plan.not_null(c.id, *field, &commit.added)?,
                 ConstraintKind::PrimaryKey(key)
                 | ConstraintKind::Unique(integrity_core::UniqueSpec { key, .. })
                 | ConstraintKind::ForeignKey(integrity_core::ForeignKeySpec {
@@ -83,6 +87,47 @@ impl Plan {
         Ok(plan)
     }
 
+    /// Records a NOT NULL violation for every row of `added` that is NULL in `field`.
+    pub fn not_null(
+        &mut self,
+        id: ConstraintId,
+        field: FieldId,
+        added: &RowBatch,
+    ) -> Result<(), ValidationError> {
+        if let Some(i) = column(added, field)? {
+            for row in added.rows() {
+                if row[i] == Datum::Null {
+                    self.record_row(id, ErrorCode::NotNullViolation, None);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Classifies the key tuple of every row of `added` (spec §7): keys go to `key`, rows whose
+    /// NULLs violate the constraint are recorded.
+    pub fn added_keys(
+        &mut self,
+        rc: &ResolvedConstraint,
+        key: &KeySpec,
+        added: &RowBatch,
+        mut emit: impl FnMut(EncodedKey) -> Result<(), ValidationError>,
+    ) -> Result<(), ValidationError> {
+        let c = &rc.constraint;
+        let (Some(schema), Some(role)) = (&rc.schema, c.kind.key_role()) else {
+            return Err(ValidationError::Unprovable(c.id));
+        };
+        for tuple in tuples(added, key)? {
+            let tuple = tuple?;
+            match classify(role, schema, &tuple).map_err(|e| malformed(e, key))? {
+                KeyDisposition::Key(k) => emit(k)?,
+                KeyDisposition::Exempt => {}
+                KeyDisposition::Violation(code) => self.record_row(c.id, code, Some(tuple)),
+            }
+        }
+        Ok(())
+    }
+
     fn key_delta(
         &mut self,
         rc: &ResolvedConstraint,
@@ -95,14 +140,9 @@ impl Plan {
         };
 
         let mut added = KeyMultiset::new();
-        for tuple in tuples(&commit.added, key)? {
-            let tuple = tuple?;
-            match classify(role, schema, &tuple).map_err(|e| malformed(e, key))? {
-                KeyDisposition::Key(k) => added.insert(k).map_err(ValidationError::Delta)?,
-                KeyDisposition::Exempt => {}
-                KeyDisposition::Violation(code) => self.record_row(c.id, code, Some(tuple)),
-            }
-        }
+        self.added_keys(rc, key, &commit.added, |k| {
+            added.insert(k).map_err(ValidationError::Delta)
+        })?;
 
         let mut removed = KeyMultiset::new();
         for tuple in tuples(&commit.removed, key)? {

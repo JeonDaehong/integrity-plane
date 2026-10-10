@@ -79,12 +79,23 @@ impl<I: KeyIndex> IndexSet for BTreeMap<ConstraintId, I> {
 /// What violates one `(constraint, code)` in a rejected commit: how many offending keys (or rows,
 /// for NULL violations) and up to [`SAMPLE_LIMIT`] of them. Key values can be personal data;
 /// callers decide whether to expose them (spec §24).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ViolationDetail {
     keys: BTreeSet<EncodedKey>,
+    /// Keys reported once each by a [`TableScan`] caller, counted instead of kept.
+    distinct: u64,
     rows: u64,
     samples: Vec<Vec<Option<KeyValue>>>,
 }
+
+/// Equal when they report the same count and samples, however the keys were counted.
+impl PartialEq for ViolationDetail {
+    fn eq(&self, other: &Self) -> bool {
+        self.count() == other.count() && self.samples == other.samples
+    }
+}
+
+impl Eq for ViolationDetail {}
 
 /// Maximum number of sample keys kept per violation (spec §24).
 pub const SAMPLE_LIMIT: usize = 10;
@@ -93,6 +104,15 @@ impl ViolationDetail {
     fn add_key(&mut self, key: &EncodedKey) {
         if self.keys.insert(key.clone())
             && self.samples.len() < SAMPLE_LIMIT
+            && let Ok((_, tuple)) = key.decode()
+        {
+            self.samples.push(tuple);
+        }
+    }
+
+    fn add_distinct_key(&mut self, key: &EncodedKey) {
+        self.distinct += 1;
+        if self.samples.len() < SAMPLE_LIMIT
             && let Ok((_, tuple)) = key.decode()
         {
             self.samples.push(tuple);
@@ -110,7 +130,7 @@ impl ViolationDetail {
 
     /// Distinct offending keys plus offending rows that form no key.
     pub fn count(&self) -> u64 {
-        self.keys.len() as u64 + self.rows
+        self.keys.len() as u64 + self.distinct + self.rows
     }
 
     /// Up to [`SAMPLE_LIMIT`] offending key tuples, in key-column order (`None` = NULL). Empty for
@@ -594,11 +614,121 @@ impl Validator {
         Ok(())
     }
 
+    /// Starts validating every row of `table` as one insert, a batch at a time (see
+    /// [`TableScan`]). Fails like [`Validator::validate`] on constraints it cannot prove.
+    pub fn table_scan(&self, table: &TableId) -> Result<TableScan<'_>, ValidationError> {
+        let own: Vec<&ResolvedConstraint> = self
+            .constraints
+            .values()
+            .filter(|rc| rc.enforced() && rc.constraint.table == *table)
+            .collect();
+        for rc in &own {
+            if let ConstraintKind::ForeignKey(fk) = &rc.constraint.kind {
+                self.require_enforced(fk.parent_constraint, rc.constraint.id)?;
+            }
+            if rc.constraint.kind.key().is_some()
+                && (rc.schema.is_none() || rc.constraint.kind.key_role().is_none())
+            {
+                return Err(ValidationError::Unprovable(rc.constraint.id));
+            }
+        }
+        for rc in self.constraints.values().filter(|rc| rc.enforced()) {
+            if let ConstraintKind::ForeignKey(fk) = &rc.constraint.kind
+                && fk.parent_table == *table
+            {
+                self.require_enforced(fk.parent_constraint, rc.constraint.id)?;
+            }
+        }
+        Ok(TableScan {
+            own,
+            plan: Plan::default(),
+        })
+    }
+
     fn require_enforced(&self, id: ConstraintId, by: ConstraintId) -> Result<(), ValidationError> {
         match self.constraints.get(&id) {
             Some(rc) if rc.enforced() && rc.schema.is_some() => Ok(()),
             _ => Err(ValidationError::Unprovable(by)),
         }
+    }
+}
+
+/// How the keys of one constraint are checked once a [`TableScan`] caller has sorted them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheck {
+    /// PK/UNIQUE: a key that occurs more than once violates `(constraint, code)`.
+    Unique(ErrorCode),
+    /// FK: a key absent from the index of this parent constraint is a
+    /// `FOREIGN_KEY_VIOLATION`; the others are indexed with their number of occurrences.
+    Parent(ConstraintId),
+}
+
+/// [`Validator::validate`] of one commit that adds every row of a table to empty indexes of the
+/// table's own constraints, fed a batch at a time, so that tables larger than memory can be
+/// onboarded and rebuilt (spec §19, §20, ADR 0011).
+///
+/// [`TableScan::feed`] does the index-free part (NULL rules, spec §7) and emits every key. The
+/// caller sorts the keys of each constraint of [`TableScan::checks`] and reports with
+/// [`TableScan::record_key`], once and in key order, each key that occurs more than once
+/// ([`KeyCheck::Unique`]) or has no parent ([`KeyCheck::Parent`]). [`TableScan::finish`] then
+/// returns exactly the violations and details `validate_with_details` returns for that commit.
+#[derive(Debug)]
+pub struct TableScan<'v> {
+    own: Vec<&'v ResolvedConstraint>,
+    plan: Plan,
+}
+
+impl TableScan<'_> {
+    /// The constraints whose keys [`TableScan::feed`] emits, and how to check them.
+    pub fn checks(&self) -> Vec<(ConstraintId, KeyCheck)> {
+        self.own
+            .iter()
+            .filter_map(|rc| {
+                let check = match &rc.constraint.kind {
+                    ConstraintKind::PrimaryKey(_) => {
+                        KeyCheck::Unique(ErrorCode::DuplicatePrimaryKey)
+                    }
+                    ConstraintKind::Unique(_) => KeyCheck::Unique(ErrorCode::DuplicateUniqueKey),
+                    ConstraintKind::ForeignKey(fk) => KeyCheck::Parent(fk.parent_constraint),
+                    ConstraintKind::NotNull(_) => return None,
+                };
+                Some((rc.constraint.id, check))
+            })
+            .collect()
+    }
+
+    /// Checks the NULL rules of `rows` and hands every key to `emit` with its constraint.
+    pub fn feed(
+        &mut self,
+        rows: &RowBatch,
+        mut emit: impl FnMut(ConstraintId, EncodedKey) -> Result<(), ValidationError>,
+    ) -> Result<(), ValidationError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for rc in &self.own {
+            let id = rc.constraint.id;
+            match &rc.constraint.kind {
+                ConstraintKind::NotNull(field) => self.plan.not_null(id, *field, rows)?,
+                kind => {
+                    let Some(key) = kind.key() else {
+                        return Err(ValidationError::Unprovable(id));
+                    };
+                    self.plan.added_keys(rc, key, rows, |k| emit(id, k))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Records that `key` violates `(constraint, code)` (see [`TableScan`]).
+    pub fn record_key(&mut self, constraint: ConstraintId, code: ErrorCode, key: &EncodedKey) {
+        self.plan.record_distinct_key(constraint, code, key);
+    }
+
+    /// Every violated `(constraint, code)` and what violates it; empty if the table is valid.
+    pub fn finish(self) -> (BTreeSet<Violation>, BTreeMap<Violation, ViolationDetail>) {
+        (self.plan.violations, self.plan.details)
     }
 }
 

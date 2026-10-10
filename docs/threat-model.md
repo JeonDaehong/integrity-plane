@@ -119,3 +119,5 @@ Primary and foreign keys can be personal data (emails, national ids).
   log (staged index deltas). Protect the control-store directory like the tables themselves, and
   include it in data-deletion procedures: deleting a row from a table removes its key from the
   indexes, but older transaction log records keep it (the log is not truncated in 0.1).
+- Onboarding and rebuild spill sorted key runs to `indexes.redb.scratch/` in the control store
+  while a table is scanned; they are deleted after each table and when the Plane starts.

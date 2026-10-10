@@ -116,8 +116,10 @@ Constraints live in `registry.redb` in the control store, with per-table constra
 constraint set of every version, anchors, degraded domains and the audit log
 ([ADR 0011](adr/0011-registry-anchors-and-rebuild.md)). Constraints in the configuration file are imported
 once, when the registry is created. `POST /v1/integrity/constraints` resolves column names to field ids,
-scans the whole domain at its current snapshots (FK parents first) and either installs the resulting
-index contents and anchors or refuses with `ONBOARDING_VIOLATIONS` and a report. `DELETE` drops a
+scans the whole domain at its current snapshots (FK parents first, with bounded memory: row groups
+streamed, keys sorted externally, new contents built beside the live indexes) and either installs
+the resulting index contents in one transaction and records the anchors, or refuses with
+`ONBOARDING_VIOLATIONS` and a report. `DELETE` drops a
 constraint (not a key an FK still references); `POST /v1/integrity/indexes/{id}/rebuild` rescans the
 domain of a constraint and re-anchors it, clearing a degraded state if the data is valid. These
 operations take a lock that every commit holds shared, so they never interleave with commits.

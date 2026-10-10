@@ -69,16 +69,20 @@ that found violations. `POST /v1/integrity/indexes/{id}/rebuild`:
 
 1. resolves the unfinished transactions of every domain;
 2. loads every table of the domain of constraint `id` and pins its `main`;
-3. validates all data, FK parents first, against in-memory indexes;
-4. on violations, leaves the domain degraded and returns `ONBOARDING_VIOLATIONS` with a report;
-5. otherwise replaces each index's contents at a new epoch (`replace_all`, one atomic transaction
-   per index), then records the new anchors and clears the degraded state in one registry
-   transaction, and audits `INDEX_REBUILT` with the previous and new anchors.
+3. validates all data, FK parents first, with bounded memory (external sort), writing the new
+   index contents into build tables beside the live ones;
+4. on violations, discards the builds, leaves the domain degraded and returns
+   `ONBOARDING_VIOLATIONS` with a report;
+5. otherwise installs every build at one new epoch in one atomic transaction, then records the new
+   anchors and clears the degraded state in one registry transaction, and audits `INDEX_REBUILT`
+   with the previous and new anchors.
 
-A crash between steps 5's index replacements leaves indexes whose contents already match the pinned
-data (no commit runs during a rebuild) and the registry unchanged; running the rebuild again is safe.
-Onboarding (registering a constraint) runs the same scan. A kill between two index replacements
-(fault point `DuringRebuildSwap`) is covered by `tests/crash.rs`.
+A crash before step 5's install leaves the live indexes and the registry unchanged (the build tables
+are discarded by the next build; sort runs in `indexes.redb.scratch/` are deleted on start). A crash
+between the install and the registry update leaves indexes whose contents already match the pinned
+data (no commit runs during a rebuild). Running the rebuild again is safe either way. Onboarding
+(registering a constraint) runs the same scan. A kill just before the install (fault point
+`DuringRebuildSwap`) is covered by `tests/crash.rs`.
 
 ## Lost control-store files
 

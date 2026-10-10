@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 35b49064c398589bc8a634428148f4571d9000bf80735edaeb41f2f5a904fabe # shrinks to domain = [[[(0, Some(2)), (0, None)]], [], []], row_group = 1, memory = 1
+cc a117ee1c554fb199ad21d60828c622c12e5c476dd6670169d1c9b6e4ceb5c5d2 # shrinks to domain = [[[(1, Some(1)), (2, Some(2)), (3, Some(3)), (4, Some(4)), (5, Some(5))]], [[(1, Some(1))]], []], row_group = 1, memory = 1

@@ -503,9 +503,9 @@ async fn every_fault_point_recovers_to_the_upstream_state() {
     }
 }
 
-/// Spec §19 step 5 under a crash: the gateway dies after replacing the first of two indexes. The
-/// replaced contents equal what the data implies and the registry is unchanged, so commits continue
-/// correctly and a second rebuild completes.
+/// Spec §19 step 5 under a crash: the gateway dies after building both indexes, just before
+/// swapping them in. The live indexes and the registry are unchanged and the build tables are left
+/// behind, so commits continue correctly and a second rebuild completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_between_index_swaps_of_a_rebuild_is_safe() {
     let dir = Dir::new();

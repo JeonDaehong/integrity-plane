@@ -43,6 +43,13 @@ async fn measured(
     ))
 }
 
+/// Waits `--settle` seconds after many files were written.
+async fn settle(o: &Options) {
+    if o.settle > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(o.settle)).await;
+    }
+}
+
 pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
     let mut out = String::new();
     let mut line = |s: String| {
@@ -50,6 +57,7 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
         out.push_str(&s);
         out.push('\n');
     };
+    let started = Instant::now();
     let rows = o.scale;
     let per = o.file_rows;
     let files = (rows + per - 1) / per;
@@ -69,7 +77,13 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
         seconds(t.elapsed().as_secs_f64())
     ));
 
+    settle(o).await;
+
     // Onboarding: register the PRIMARY KEY.
+    eprintln!(
+        "@ onboarding starts {:.0} s after the bench",
+        started.elapsed().as_secs_f64()
+    );
     let t = Instant::now();
     let r = b
         .http
@@ -86,12 +100,17 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
         ));
         return Ok(out);
     }
+    eprintln!(
+        "@ onboarding ends {:.0} s after the bench",
+        started.elapsed().as_secs_f64()
+    );
     line(format!(
         "| Onboarding scan of {rows} keys | {} | {:.0} keys/s | |",
         seconds(t.elapsed().as_secs_f64()),
         rows as f64 / t.elapsed().as_secs_f64()
     ));
 
+    settle(o).await;
     // Copy-on-write delete of one row: the whole file is rewritten without it.
     let list = current(b, "big").await?;
     let victim = list[0].clone();

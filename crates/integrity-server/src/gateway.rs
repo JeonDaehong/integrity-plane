@@ -272,6 +272,8 @@ pub struct Gateway {
     upstream_token: Mutex<Option<(String, std::time::Instant)>>,
     /// Leave key values out of violation reports.
     pub(crate) redact_keys: bool,
+    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table.
+    pub(crate) scan_memory: usize,
     /// Certificate signer (RFC 0005), if signing is enabled.
     pub(crate) signer: Option<integrity_core::CertSigner>,
     /// `verify` requires signatures.
@@ -318,6 +320,7 @@ impl Gateway {
             upstream_auth: None,
             upstream_token: Mutex::new(None),
             redact_keys: false,
+            scan_memory: crate::config::DEFAULT_SCAN_MEMORY as usize,
             signer: None,
             require_signatures: false,
             admin: tokio::sync::RwLock::new(()),
@@ -545,6 +548,13 @@ impl Gateway {
             })
             .collect();
         serde_json::json!({ "keys": keys })
+    }
+
+    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table before spilling
+    /// sorted runs to disk (`limits.scan_memory`).
+    pub fn with_scan_memory(mut self, bytes: u64) -> Self {
+        self.scan_memory = usize::try_from(bytes).unwrap_or(usize::MAX);
+        self
     }
 
     /// Leaves sample key values out of violation reports (`errors.redact_keys`).

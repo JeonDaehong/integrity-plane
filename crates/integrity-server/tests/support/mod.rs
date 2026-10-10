@@ -154,6 +154,11 @@ impl Files {
 
     /// A data file and its manifest holding `rows`; returns the manifest location.
     pub fn manifest(&self, rows: &[Row]) -> String {
+        self.manifest_with_row_groups(rows, None)
+    }
+
+    /// Like `manifest`, with at most `row_group` rows per Parquet row group.
+    pub fn manifest_with_row_groups(&self, rows: &[Row], row_group: Option<usize>) -> String {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         let meta =
             |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -174,7 +179,12 @@ impl Files {
         )
         .unwrap();
         let mut data = Vec::new();
-        let mut w = ArrowWriter::try_new(&mut data, schema, None).unwrap();
+        let props = row_group.map(|r| {
+            parquet::file::properties::WriterProperties::builder()
+                .set_max_row_group_row_count(Some(r))
+                .build()
+        });
+        let mut w = ArrowWriter::try_new(&mut data, schema, props).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
         let data_path = self.location(&format!("d{n}.parquet"));

@@ -22,11 +22,12 @@ pub mod request;
 pub use certify::{inject_certificate, inject_signature, snapshot_certificate, snapshot_signature};
 pub use changes::{
     FileChanges, InspectError, PositionDeletes, check_operation, commit_rows, diff_snapshots,
+    for_each_live_batch,
 };
 pub use classify::{
     Classification, MainChange, NewSnapshot, Operation, Rejection, check_requirements, classify,
 };
 pub use io::{Budgeted, FileIo, MemoryIo, ReadError};
 pub use metadata::TableMetadata;
-pub use parquet_keys::{ExtractError, extract_rows, extract_rows_from};
+pub use parquet_keys::{ExtractError, extract_rows, extract_rows_from, for_each_batch_from};
 pub use request::{CommitRequest, MalformedRequest, Requirement, Update};

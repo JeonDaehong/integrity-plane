@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Onboarding and rebuild run with bounded memory (ADR 0011 amendment): rows are read a row group at
+  a time, keys are sorted externally within `limits.scan_memory` (default 512 MiB), and the new
+  indexes are built beside the live ones and installed in one transaction. 100 M keys onboard in
+  about 1.3 GB (60 M keys needed 14.4 GB before) and faster (`docs/benchmarks.md`).
+- `integrity-bench --settle` waits after large file writes before measuring.
+
 ## 0.0.1 — 2026-10-09
 
 First public pre-release. **Pre-alpha, not production-ready**: see

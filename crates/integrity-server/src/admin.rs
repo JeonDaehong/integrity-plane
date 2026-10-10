@@ -8,12 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use axum::http::HeaderMap;
-use integrity_core::EncodedKey;
 use integrity_iceberg::TableMetadata;
 use integrity_iceberg::metadata::FieldLookup;
-use integrity_index::{IndexEpoch, IndexKind, IndexValue, KeyIndex};
+use integrity_index::IndexBuild;
 use integrity_txn::{FaultPoint, TxnId, fault};
-use integrity_types::{ConstraintId, ErrorCode, FieldId};
+use integrity_types::{ErrorCode, FieldId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -99,7 +98,9 @@ fn normalize(s: &str) -> String {
 
 /// The result of scanning a domain: index contents and the snapshot each table was read at.
 struct Scanned {
-    indexes: BTreeMap<ConstraintId, (IndexKind, Vec<(EncodedKey, IndexValue)>)>,
+    builds: Vec<IndexBuild>,
+    /// The constraints whose indexes were built.
+    constraints: Vec<u64>,
     anchors: BTreeMap<String, (String, Option<i64>)>,
 }
 
@@ -141,39 +142,34 @@ impl Gateway {
             });
         }
         let io = Arc::clone(&self.io);
+        let store = self.store.clone();
+        let memory = self.scan_memory;
         let configs = configs.to_vec();
         let redact = self.redact_keys;
         let outcome = tokio::task::spawn_blocking(move || {
-            onboard::scan(io.as_ref(), &configs, &loaded, redact)
+            onboard::scan(io.as_ref(), &store, memory, &configs, &loaded, redact)
         })
         .await
         .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, format!("scan task failed: {e}")))??;
         Ok(match outcome {
-            ScanOutcome::Clean(indexes) => Ok(Scanned { indexes, anchors }),
+            ScanOutcome::Clean(builds) => Ok(Scanned {
+                constraints: builds.iter().map(|b| b.constraint().0).collect(),
+                builds,
+                anchors,
+            }),
             ScanOutcome::Violations(v) => Err(json!({ "violations": v })),
         })
     }
 
-    /// Replaces the contents of every scanned index at one epoch above all of them.
-    fn install(&self, scanned: &Scanned) -> Result<(), ApiError> {
-        let degraded = |e: integrity_index::IndexError| {
-            ApiError::new(ErrorCode::IndexDegraded, format!("index store: {e}"))
-        };
-        let mut indexes = Vec::new();
-        let mut epoch = 0;
-        for (id, (kind, entries)) in &scanned.indexes {
-            let index = self.store.index(*id, *kind).map_err(degraded)?;
-            epoch = epoch.max(index.epoch().map_err(degraded)?.0);
-            indexes.push((index, entries));
+    /// Installs every scanned index at one epoch above all of them, in one transaction.
+    fn install(&self, scanned: &mut Scanned) -> Result<(), ApiError> {
+        let builds = std::mem::take(&mut scanned.builds);
+        if builds.len() > 1 {
+            fault::hit(FaultPoint::DuringRebuildSwap);
         }
-        for (n, (index, entries)) in indexes.into_iter().enumerate() {
-            if n > 0 {
-                fault::hit(FaultPoint::DuringRebuildSwap);
-            }
-            index
-                .replace_all(entries, IndexEpoch(epoch + 1))
-                .map_err(degraded)?;
-        }
+        self.store
+            .install(builds)
+            .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, format!("index store: {e}")))?;
         Ok(())
     }
 
@@ -299,7 +295,7 @@ impl Gateway {
         let mut candidate = doc.list();
         candidate.push(config.clone());
         let members = registry::component(&candidate, &config.table);
-        let scanned = match self.scan_domain(&candidate, &members).await? {
+        let mut scanned = match self.scan_domain(&candidate, &members).await? {
             Ok(s) => s,
             Err(report) => {
                 let mut event = AuditEvent::new("CONSTRAINT_REJECTED", Some(&config.table));
@@ -318,7 +314,7 @@ impl Gateway {
                 .with_report(report));
             }
         };
-        self.install(&scanned)?;
+        self.install(&mut scanned)?;
         let registered = config.clone();
         self.registry.update(|d| {
             d.constraints.insert(registered.id, registered.clone());
@@ -405,7 +401,7 @@ impl Gateway {
         })?;
         let constraints = doc.list();
         let members = registry::component(&constraints, &config.table);
-        let scanned = match self.scan_domain(&constraints, &members).await? {
+        let mut scanned = match self.scan_domain(&constraints, &members).await? {
             Ok(s) => s,
             Err(report) => {
                 let reason = "rebuild found constraint violations in the data".to_owned();
@@ -425,7 +421,7 @@ impl Gateway {
                 );
             }
         };
-        self.install(&scanned)?;
+        self.install(&mut scanned)?;
         let previous = doc.anchors.clone();
         self.registry.update(|d| {
             for (ident, (uuid, snapshot)) in &scanned.anchors {
@@ -455,7 +451,7 @@ impl Gateway {
             .collect();
         let mut event = AuditEvent::new("INDEX_REBUILT", Some(&config.table));
         event.actor = Some(actor_of(headers));
-        event.constraints = scanned.indexes.keys().map(|c| c.0).collect();
+        event.constraints = scanned.constraints.clone();
         event.detail = Some(Value::Array(relinks.clone()).to_string());
         self.audit(event);
         Ok(json!({ "domain": members, "anchors": relinks }))

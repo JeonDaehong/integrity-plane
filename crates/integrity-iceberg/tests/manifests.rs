@@ -15,7 +15,7 @@ use bytes::Bytes;
 use integrity_core::{Datum, KeyValue, LogicalType};
 use integrity_iceberg::{
     FileChanges, FileIo, InspectError, MemoryIo, Operation, check_operation, commit_rows,
-    diff_snapshots,
+    diff_snapshots, for_each_live_batch,
 };
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -807,4 +807,80 @@ fn invalid_deletion_vectors_are_unsupported() {
     t.list("new3.avro", &[("m1.avro", 0), ("d3.avro", 1)]);
     let changes = t.diff(Some("parent.avro"), "new3.avro").unwrap();
     assert!(unsupported(t.rows(&changes)).contains("beyond"));
+}
+
+// ---------- whole-table streaming (onboarding) ----------
+
+type Rows = Result<Vec<Vec<Datum>>, String>;
+
+/// Every live row of the snapshot at `list`, streamed; and what `commit_rows` reads for it.
+fn streamed_and_collected(t: &Table, list: &str) -> (Rows, Rows) {
+    let changes = t.diff(None, list).unwrap();
+    let columns = [
+        (FieldId(1), LogicalType::Long),
+        (FieldId(2), LogicalType::String),
+    ];
+    let mut streamed = Vec::new();
+    let s = for_each_live_batch(&t.io, &changes, &columns, |b| {
+        streamed.extend(b.rows().iter().cloned());
+        Ok::<_, InspectError>(())
+    })
+    .map(|()| streamed)
+    .map_err(|e| e.to_string());
+    let c = t
+        .rows(&changes)
+        .map(|r| r.added.rows().to_vec())
+        .map_err(|e| e.to_string());
+    (s, c)
+}
+
+#[test]
+fn streaming_a_whole_table_reads_what_commit_rows_reads() {
+    let t = parent();
+    let (s, c) = streamed_and_collected(&t, "parent.avro");
+    assert_eq!(s.clone().unwrap().len(), 3);
+    assert_eq!(s, c);
+
+    let t = parent_with_position_delete();
+    let (s, c) = streamed_and_collected(&t, "parent-pos.avro");
+    assert_eq!(s.clone().unwrap().len(), 2);
+    assert_eq!(s, c);
+
+    let mut t = parent();
+    let (offset, size) = t.dv("dv1.puffin", &[0, 1]);
+    t.dv_manifest(
+        "d1.avro",
+        &[(1, "dv1.puffin", "a.parquet", offset, size, 2)],
+    );
+    t.list("dv.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let (s, c) = streamed_and_collected(&t, "dv.avro");
+    assert_eq!(s.clone().unwrap(), [row(3, "eu")]);
+    assert_eq!(s, c);
+
+    // Positions beyond the file and lying record counts fail the same way.
+    let mut t = parent();
+    t.positions("pos.parquet", &[("b.parquet", 5)]);
+    t.manifest("d1.avro", &[(1, 1, "pos.parquet", "PARQUET", 1)]);
+    t.list("new.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let (s, c) = streamed_and_collected(&t, "new.avro");
+    assert!(s.clone().unwrap_err().contains("beyond"));
+    assert_eq!(s, c);
+
+    let mut t = Table::new();
+    t.data("a.parquet", &[(1, "eu"), (2, "us")]);
+    t.manifest("m1.avro", &[(1, 0, "a.parquet", "PARQUET", 3)]);
+    t.list("l.avro", &[("m1.avro", 0)]);
+    let (s, c) = streamed_and_collected(&t, "l.avro");
+    assert!(s.clone().unwrap_err().contains("manifest says"));
+    assert_eq!(s, c);
+}
+
+#[test]
+fn streaming_refuses_a_diff_against_a_parent() {
+    let t = parent_with_position_delete();
+    let changes = t.diff(Some("parent.avro"), "parent-pos.avro").unwrap();
+    let r = for_each_live_batch(&t.io, &changes, &[(FieldId(1), LogicalType::Long)], |_| {
+        Ok::<_, InspectError>(())
+    });
+    assert!(unsupported(r).contains("whole-table"));
 }
