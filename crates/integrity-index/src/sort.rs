@@ -19,7 +19,7 @@ use crate::{IndexError, Result};
 
 /// Runs merged at once.
 const FAN_IN: usize = 64;
-/// Bytes accounted per buffered key on top of its length (its span).
+/// Bytes per buffered key on top of its length (its span).
 const PER_KEY: usize = std::mem::size_of::<(usize, u32)>();
 /// Write and read buffer of each run file.
 const IO_BUFFER: usize = 64 * 1024;
@@ -89,17 +89,33 @@ struct Packed {
     spans: Vec<(usize, u32)>,
 }
 
+/// The capacity a vector grows to when it must hold `needed` elements (doubling, as `Vec` does).
+fn grown(capacity: usize, needed: usize) -> usize {
+    if needed <= capacity {
+        capacity
+    } else {
+        needed.max(capacity.saturating_mul(2)).max(8)
+    }
+}
+
 impl Packed {
+    /// The memory the buffer would have allocated after adding a key of `len` bytes: what the
+    /// budget is checked against, so that growth never overshoots it.
+    fn allocated_with(&self, len: usize) -> usize {
+        grown(self.data.capacity(), self.data.len() + len)
+            + grown(self.spans.capacity(), self.spans.len() + 1) * PER_KEY
+    }
+
     fn push(&mut self, bytes: &[u8]) -> Result<()> {
         let len = u32::try_from(bytes.len()).map_err(|_| IndexError::Corrupt)?;
+        // Grow exactly as `allocated_with` assumed.
+        let data = grown(self.data.capacity(), self.data.len() + bytes.len());
+        self.data.reserve_exact(data - self.data.len());
+        let spans = grown(self.spans.capacity(), self.spans.len() + 1);
+        self.spans.reserve_exact(spans - self.spans.len());
         self.spans.push((self.data.len(), len));
         self.data.extend_from_slice(bytes);
         Ok(())
-    }
-
-    /// Bytes accounted against the budget.
-    fn used(&self) -> usize {
-        self.data.len() + self.spans.len() * PER_KEY
     }
 
     fn is_empty(&self) -> bool {
@@ -176,11 +192,11 @@ impl KeySorter {
     /// Adds one occurrence of an arbitrary byte string (read back with
     /// [`KeySorter::finish_bytes`]).
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.buffer.push(bytes)?;
-        if self.buffer.used() >= self.budget {
+        // Spill before the buffer would grow past the budget (allocated memory, not just used).
+        if !self.buffer.is_empty() && self.buffer.allocated_with(bytes.len()) > self.budget {
             self.spill_buffer()?;
         }
-        Ok(())
+        self.buffer.push(bytes)
     }
 
     /// Number of run files written so far.
@@ -424,6 +440,22 @@ mod tests {
             prop_assert_eq!(leftover, 0);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The buffer's allocated memory, not only its contents, stays within the budget.
+    #[test]
+    fn allocated_memory_stays_within_the_budget() {
+        let dir = temp();
+        let budget = 64 * 1024;
+        let mut s = KeySorter::new(&dir, budget);
+        for i in 0..50_000 {
+            s.push(&key(i)).unwrap();
+            let allocated = s.buffer.data.capacity() + s.buffer.spans.capacity() * PER_KEY;
+            assert!(allocated <= budget, "{allocated} > {budget} after {i} keys");
+        }
+        assert!(s.runs() > 10);
+        assert_eq!(s.finish().unwrap().count(), 50_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
