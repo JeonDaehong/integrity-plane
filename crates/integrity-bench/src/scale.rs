@@ -43,6 +43,15 @@ async fn measured(
     ))
 }
 
+/// Prints when a phase starts or ends, in seconds since the scenario started, for external memory
+/// sampling.
+fn mark(started: &Instant, phase: &str, edge: &str) {
+    eprintln!(
+        "@ {phase} {edge} {:.0} s after the bench",
+        started.elapsed().as_secs_f64()
+    );
+}
+
 /// Waits `--settle` seconds after many files were written.
 async fn settle(o: &Options) {
     if o.settle > 0 {
@@ -116,11 +125,14 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
     let victim = list[0].clone();
     let ids: Vec<i64> = (1..per.min(rows)).collect(); // file 0 without id 0
     let rewritten = b.files.manifest(&ids, &vec![None; ids.len()])?;
+    drop(ids);
     let new_list: Vec<String> = std::iter::once(rewritten)
         .chain(list.iter().filter(|m| **m != victim).cloned())
         .collect();
+    mark(&started, "copy-on-write", "starts");
     let (status, took, validation, read) =
         measured(b, "big", Change::Raw(new_list, "overwrite")).await?;
+    mark(&started, "copy-on-write", "ends");
     line(format!(
         "| Copy-on-write delete of 1 row (rewrites a {per}-row file) | end-to-end {}; validation {} | read {} | status {status} |",
         seconds(took),
@@ -175,14 +187,17 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
             ids.extend(k * per..(k + 1) * per);
         }
         let merged = b.files.manifest(&ids, &vec![None; ids.len()])?;
+        drop(ids);
         let new_list: Vec<String> = list
             .iter()
             .filter(|m| !pick.contains(m))
             .cloned()
             .chain(std::iter::once(merged))
             .collect();
+        mark(&started, "compaction", "starts");
         let (status, took, validation, read) =
             measured(b, "big", Change::Raw(new_list, "replace")).await?;
+        mark(&started, "compaction", "ends");
         line(format!(
             "| Compaction of 10 files ({} rows) into one | end-to-end {}; validation {} | read {} | status {status} |",
             10 * per,
@@ -203,6 +218,7 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
             .collect()
     };
     let mut timings = Vec::new();
+    mark(&started, "merge-on-read", "starts");
     for i in 0..o.mor_deletes {
         let target = data[1 + i % (data.len() - 1).max(1)].clone();
         let dm = b
@@ -215,6 +231,7 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
         assert_eq!(status, 200, "merge-on-read delete {i}");
         timings.push((took, validation, read));
     }
+    mark(&started, "merge-on-read", "ends");
     if let (Some(first), Some(last)) = (timings.first(), timings.last()) {
         line(format!(
             "| Merge-on-read delete of 1 row, {} times (delete files accumulate) | first: end-to-end {} / validation {}; last: {} / {} | read first {}, last {} | |",

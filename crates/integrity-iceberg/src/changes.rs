@@ -537,7 +537,7 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
         for file in files {
             let gone = gone.get(&file.path).unwrap_or(&empty);
             stream_file(io, file, columns, &[gone], &mut |batch, start| {
-                let live = select(batch, columns, |pos| !gone.contains(&(start + pos)))?;
+                let live = without(batch, start, gone, columns)?;
                 if live.is_empty() {
                     Ok(())
                 } else {
@@ -557,8 +557,8 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
             let newly: BTreeSet<i64> = a.difference(b).copied().collect();
             let restored: BTreeSet<i64> = b.difference(a).copied().collect();
             stream_file(io, file, columns, &[a, b], &mut |batch, start| {
-                let removed = select(batch.clone(), columns, |pos| newly.contains(&(start + pos)))?;
-                let added = select(batch, columns, |pos| restored.contains(&(start + pos)))?;
+                let removed = only(&batch, start, &newly, columns)?;
+                let added = only(&batch, start, &restored, columns)?;
                 if !removed.is_empty() {
                     f(Side::Removed, removed).map_err(Failed::Caller)?;
                 }
@@ -623,23 +623,46 @@ fn stream_file<E: From<InspectError>>(
     Ok(())
 }
 
-/// The rows of `batch` at the positions `keep` accepts (the batch itself if it keeps all).
-fn select<E>(
+/// The positions of `set` that fall in `batch`, whose first row is at `start`, relative to it.
+fn positions_in(batch: &RowBatch, start: i64, set: &BTreeSet<i64>) -> Vec<usize> {
+    set.range(start..start + batch.len() as i64)
+        .map(|p| (p - start) as usize)
+        .collect()
+}
+
+/// `batch` without the rows at positions in `gone` (the batch itself if none is).
+fn without<E>(
     batch: RowBatch,
+    start: i64,
+    gone: &BTreeSet<i64>,
     columns: &[(FieldId, LogicalType)],
-    keep: impl Fn(i64) -> bool,
 ) -> Result<RowBatch, Failed<E>> {
-    if (0..batch.len() as i64).all(&keep) {
+    let skip = positions_in(&batch, start, gone);
+    if skip.is_empty() {
         return Ok(batch);
     }
-    if !(0..batch.len() as i64).any(&keep) {
-        return Ok(RowBatch::new(columns.iter().map(|(c, _)| *c).collect()));
-    }
     let mut out = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
+    let mut skip = skip.into_iter().peekable();
     for (i, row) in batch.rows().iter().enumerate() {
-        if keep(i as i64) {
+        if skip.peek() == Some(&i) {
+            skip.next();
+        } else {
             push(&mut out, row)?;
         }
+    }
+    Ok(out)
+}
+
+/// The rows of `batch` at positions in `keep`.
+fn only<E>(
+    batch: &RowBatch,
+    start: i64,
+    keep: &BTreeSet<i64>,
+    columns: &[(FieldId, LogicalType)],
+) -> Result<RowBatch, Failed<E>> {
+    let mut out = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
+    for i in positions_in(batch, start, keep) {
+        push(&mut out, &batch.rows()[i])?;
     }
     Ok(out)
 }
