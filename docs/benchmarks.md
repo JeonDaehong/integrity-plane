@@ -90,7 +90,32 @@ Before, memory grew with the number of keys (about 360 bytes per key here); one 
 have needed about 360 GB. Now onboarding holds `limits.scan_memory` (512 MiB) plus the index store's
 page cache (at most 1 GiB) at any size, at about 625 000–725 000 keys/s, 2.2 times the previous rate.
 The copy-on-write, compaction and merge-on-read rows of both versions match (the commit path did not
-change); the peak memory of the new version's runs, about 5 GB, is the 10 M-row compaction.
+change in this step); the peak memory of those runs, about 5 GB, is the 10 M-row compaction, which
+the next section removes.
+
+### Commit validation before and after streaming (ADR 0019)
+
+Same instance type and method; "before" is commit 2a75205 (bounded onboarding, commits validated
+in memory), "after" is commit cd0dfd2. Memory "per phase" is the highest sample between markers the
+benchmark prints around each measured commit; for "before" only the peak of the whole run is known,
+which for those runs is the compaction.
+
+| Scenario | Before | After |
+|---|---|---|
+| Copy-on-write delete of 1 row, 1 M-row file (100 M-row table) | 1.94 s | 0.64 s, 1.4 GB |
+| Compaction of 10 files, 10 M rows | 27.1 s, 5.1 GB (whole run) | 17.0 s, 1.4 GB |
+| Merge-on-read delete of 1 row in a 1 M-row file, first / 50th | 477 ms / 88 ms | 86 ms / 86 ms |
+| Copy-on-write delete of 1 row, 10 M-row file (200 M-row table) | 20.3 s | 7.8 s, 2.9–4.3 GB |
+| Compaction of 10 files, **100 M rows** | 304 s, **40.7 GB** (whole run) | 183 s, **1.6 GB** |
+| Merge-on-read delete of 1 row in a 10 M-row file, first / 50th | 1.06 s / 7.14 s | 0.78 s / 7.48 s |
+
+Validation memory no longer follows the rows a commit rewrites: compacting 100 M rows needs 1.6 GB
+instead of 40.7 GB, and it is faster because sorting runs of keys beats building per-key maps.
+One figure is not understood yet: the copy-on-write rewrite of one 10 M-row file peaks at
+2.9–4.3 GB on Linux (lower with `MALLOC_ARENA_MAX=2`), while the same scenario peaks at about 1 GB
+on Windows and the ten times larger compaction at 1.6 GB on Linux. It points at allocator
+retention or at the benchmark's own writing of the 10 M-row file just before the commit, not at
+memory that grows with the rewrite; it is being investigated.
 
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 

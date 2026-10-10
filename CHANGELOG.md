@@ -8,7 +8,8 @@
   m6id.4xlarge, 100 M keys onboard in 145 s and 1.5 GB (before: 329 s and 36 GB), and 1 000 M keys
   in 27 minutes and 1.5 GB (`docs/benchmarks.md`).
 - Commit validation streams rows and sorts keys externally (ADR 0019): copy-on-write rewrites and
-  compactions no longer need memory proportional to the rows they rewrite.
+  compactions no longer need memory proportional to the rows they rewrite. Compacting 100 M rows
+  needs 1.6 GB instead of 40.7 GB, in 183 s instead of 304 s (`docs/benchmarks.md`).
 - `integrity-bench --settle` waits after large file writes before measuring.
 
 ## 0.0.1 — 2026-10-09
