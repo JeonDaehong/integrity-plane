@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1ffa91230228833d9ced2fc6fc15f848993018078cd9d1a0df49adb43a3451c5 # shrinks to seeds = [OpSeed { table: 0, adds: [[Some(2), None, None], [Some(2), None, None]], removes: [], rewrite: false }]
+cc d3ea6fd06d0d1fbde47529ae41c605d80e8c610e542b3827e4ada554e6ba76cf # shrinks to seeds = [OpSeed { table: 0, adds: [[Some(0), None, None], [Some(0), None, None]], removes: [], rewrite: false }]

@@ -112,3 +112,77 @@ pub struct CommitRows {
     /// same commit are not affected.
     pub equality_deletes: Option<RowBatch>,
 }
+
+/// Which side of a commit a row is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Side {
+    /// A row the commit adds.
+    Added,
+    /// A row the commit removes.
+    Removed,
+}
+
+/// An injective byte encoding of a projected row: equal rows (as [`Datum`] values) and only equal
+/// rows have equal encodings. Used to compare the rows of both sides of a commit by sorting
+/// (a `replace` must not change any row). `Opaque` cells are equal to each other, as with `==`.
+pub fn encode_row(row: &[Datum]) -> Result<Vec<u8>, crate::key::KeyError> {
+    let mut out = Vec::new();
+    for cell in row {
+        match cell {
+            Datum::Null => out.push(0),
+            Datum::Opaque => out.push(1),
+            Datum::Value(v) => {
+                let schema = crate::key::KeySchema::new(vec![v.family()])?;
+                let key = crate::key::EncodedKey::encode(&schema, &[Some(v.clone())])?;
+                let bytes = key.as_bytes();
+                out.push(2);
+                out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_encoding_is_injective_on_samples() {
+        let rows: Vec<Vec<Datum>> = vec![
+            vec![],
+            vec![Datum::Null],
+            vec![Datum::Opaque],
+            vec![Datum::Value(KeyValue::Integer(1))],
+            vec![Datum::Value(KeyValue::Integer(256))],
+            vec![Datum::Value(KeyValue::Date(1))],
+            vec![Datum::Value(KeyValue::String("a".into()))],
+            vec![Datum::Value(KeyValue::String("a".into())), Datum::Null],
+            vec![Datum::Null, Datum::Value(KeyValue::String("a".into()))],
+            vec![Datum::Value(KeyValue::String("ab".into()))],
+            vec![
+                Datum::Value(KeyValue::String("a".into())),
+                Datum::Value(KeyValue::String("b".into())),
+            ],
+            vec![Datum::Value(KeyValue::Binary(b"a".to_vec()))],
+            vec![Datum::Value(KeyValue::Decimal {
+                unscaled: 1,
+                scale: 1,
+            })],
+            vec![Datum::Value(KeyValue::Decimal {
+                unscaled: 1,
+                scale: 2,
+            })],
+        ];
+        for a in &rows {
+            for b in &rows {
+                assert_eq!(
+                    encode_row(a).unwrap() == encode_row(b).unwrap(),
+                    a == b,
+                    "{a:?} / {b:?}"
+                );
+            }
+        }
+    }
+}

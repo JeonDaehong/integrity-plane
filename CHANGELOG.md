@@ -7,6 +7,8 @@
   indexes are built beside the live ones and installed in one transaction. On one AWS
   m6id.4xlarge, 100 M keys onboard in 145 s and 1.5 GB (before: 329 s and 36 GB), and 1 000 M keys
   in 27 minutes and 1.5 GB (`docs/benchmarks.md`).
+- Commit validation streams rows and sorts keys externally (ADR 0019): copy-on-write rewrites and
+  compactions no longer need memory proportional to the rows they rewrite.
 - `integrity-bench --settle` waits after large file writes before measuring.
 
 ## 0.0.1 — 2026-10-09

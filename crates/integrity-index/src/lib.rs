@@ -26,7 +26,7 @@ use integrity_types::SnapshotId;
 pub use memory::MemoryIndex;
 pub use overlay::Overlay;
 pub use persistent::{IndexBuild, PersistentIndex, PersistentStore};
-pub use sort::{KeySorter, SortedKeys};
+pub use sort::{KeySorter, SortedBytes, SortedKeys};
 
 /// Monotonically increasing version of an index's contents. A new index starts at epoch 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

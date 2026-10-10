@@ -272,7 +272,7 @@ pub struct Gateway {
     upstream_token: Mutex<Option<(String, std::time::Instant)>>,
     /// Leave key values out of violation reports.
     pub(crate) redact_keys: bool,
-    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table.
+    /// Bytes of keys a scan (per table) or a commit validation keeps in memory.
     pub(crate) scan_memory: usize,
     /// Certificate signer (RFC 0005), if signing is enabled.
     pub(crate) signer: Option<integrity_core::CertSigner>,
@@ -550,8 +550,8 @@ impl Gateway {
         serde_json::json!({ "keys": keys })
     }
 
-    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table before spilling
-    /// sorted runs to disk (`limits.scan_memory`).
+    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table, and a commit
+    /// validation per commit, before spilling sorted runs to disk (`limits.scan_memory`).
     pub fn with_scan_memory(mut self, bytes: u64) -> Self {
         self.scan_memory = usize::try_from(bytes).unwrap_or(usize::MAX);
         self
@@ -1255,6 +1255,8 @@ impl Gateway {
             validator,
             indexes: indexes.clone(),
             stats: Arc::new(pipeline::Stats::default()),
+            scratch: self.store.scratch_dir().to_path_buf(),
+            memory: self.scan_memory,
         };
         let stats = Arc::clone(&job.stats);
         let validating = Instant::now();

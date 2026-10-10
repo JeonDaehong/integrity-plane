@@ -104,7 +104,13 @@ impl KeySorter {
 
     /// Adds one occurrence of `key`.
     pub fn push(&mut self, key: &EncodedKey) -> Result<()> {
-        let bytes = key.as_bytes().to_vec();
+        self.push_bytes(key.as_bytes())
+    }
+
+    /// Adds one occurrence of an arbitrary byte string (read back with
+    /// [`KeySorter::finish_bytes`]).
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let bytes = bytes.to_vec();
         self.used += bytes.len() + PER_KEY;
         self.buffer.push(bytes);
         if self.used >= self.budget {
@@ -134,9 +140,14 @@ impl KeySorter {
     }
 
     /// Every distinct key pushed, in order, with its number of occurrences.
-    pub fn finish(mut self) -> Result<SortedKeys> {
+    pub fn finish(self) -> Result<SortedKeys> {
+        Ok(SortedKeys(self.finish_bytes()?))
+    }
+
+    /// Every distinct byte string pushed, in byte order, with its number of occurrences.
+    pub fn finish_bytes(mut self) -> Result<SortedBytes> {
         let Some(mut spill) = self.spill.take() else {
-            return Ok(SortedKeys {
+            return Ok(SortedBytes {
                 inner: Inner::Memory(collapse(std::mem::take(&mut self.buffer)).into_iter()),
                 _spill: None,
             });
@@ -157,7 +168,7 @@ impl KeySorter {
             }
             runs = merged;
         }
-        Ok(SortedKeys {
+        Ok(SortedBytes {
             inner: Inner::Merge(Merge::open(&runs)?),
             _spill: Some(spill),
         })
@@ -259,27 +270,39 @@ enum Inner {
     Merge(Merge),
 }
 
-/// The distinct keys of a [`KeySorter`] in order, with their counts. Keeps the run files alive
-/// until dropped.
-pub struct SortedKeys {
+/// The distinct byte strings of a [`KeySorter`] in order, with their counts. Keeps the run files
+/// alive until dropped.
+pub struct SortedBytes {
     inner: Inner,
     _spill: Option<Spill>,
 }
 
-impl std::fmt::Debug for SortedKeys {
+impl std::fmt::Debug for SortedBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SortedKeys")
+        f.write_str("SortedBytes")
     }
 }
+
+impl Iterator for SortedBytes {
+    type Item = Result<(Vec<u8>, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            Inner::Memory(it) => it.next().map(Ok),
+            Inner::Merge(m) => m.next(),
+        }
+    }
+}
+
+/// The distinct keys of a [`KeySorter`] in order, with their counts.
+#[derive(Debug)]
+pub struct SortedKeys(SortedBytes);
 
 impl Iterator for SortedKeys {
     type Item = Result<(EncodedKey, u64)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let record = match &mut self.inner {
-            Inner::Memory(it) => it.next().map(Ok),
-            Inner::Merge(m) => m.next(),
-        }?;
+        let record = self.0.next()?;
         Some(record.and_then(|(key, count)| {
             EncodedKey::from_bytes(&key)
                 .map(|k| (k, count))

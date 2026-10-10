@@ -134,21 +134,34 @@ impl Plan {
         key: &KeySpec,
         commit: &CommitRows,
     ) -> Result<KeyDelta, ValidationError> {
-        let c = &rc.constraint;
-        let (Some(schema), Some(role)) = (&rc.schema, c.kind.key_role()) else {
-            return Err(ValidationError::Unprovable(c.id));
-        };
-
         let mut added = KeyMultiset::new();
         self.added_keys(rc, key, &commit.added, |k| {
             added.insert(k).map_err(ValidationError::Delta)
         })?;
 
         let mut removed = KeyMultiset::new();
-        for tuple in tuples(&commit.removed, key)? {
+        Self::removed_keys(rc, key, &commit.removed, |k| {
+            removed.insert(k).map_err(ValidationError::Delta)
+        })?;
+        Ok(KeyDelta { added, removed })
+    }
+
+    /// Classifies the key tuple of every row of `removed`: keys go to `emit`; a removed row whose
+    /// NULLs violate the constraint contradicts the indexed state.
+    pub fn removed_keys(
+        rc: &ResolvedConstraint,
+        key: &KeySpec,
+        removed: &RowBatch,
+        mut emit: impl FnMut(EncodedKey) -> Result<(), ValidationError>,
+    ) -> Result<(), ValidationError> {
+        let c = &rc.constraint;
+        let (Some(schema), Some(role)) = (&rc.schema, c.kind.key_role()) else {
+            return Err(ValidationError::Unprovable(c.id));
+        };
+        for tuple in tuples(removed, key)? {
             let tuple = tuple?;
             match classify(role, schema, &tuple).map_err(|e| malformed(e, key))? {
-                KeyDisposition::Key(k) => removed.insert(k).map_err(ValidationError::Delta)?,
+                KeyDisposition::Key(k) => emit(k)?,
                 KeyDisposition::Exempt => {}
                 // A committed row cannot violate an enforced constraint by its NULLs alone.
                 KeyDisposition::Violation(_) => {
@@ -158,7 +171,7 @@ impl Plan {
                 }
             }
         }
-        Ok(KeyDelta { added, removed })
+        Ok(())
     }
 }
 

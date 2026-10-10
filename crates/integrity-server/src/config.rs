@@ -132,8 +132,9 @@ pub struct LimitsConfig {
     /// Maximum bytes read from storage to validate one commit.
     #[serde(default = "default_budget", deserialize_with = "byte_size")]
     pub max_inline_validation_bytes: u64,
-    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table; beyond it, sorted
-    /// runs spill to the control store directory.
+    /// Bytes of keys an onboarding or rebuild scan keeps in memory per table, and a commit
+    /// validation per commit (one per domain at a time); beyond it, sorted runs spill to the
+    /// control store directory.
     #[serde(default = "default_scan_memory", deserialize_with = "byte_size")]
     pub scan_memory: u64,
 }

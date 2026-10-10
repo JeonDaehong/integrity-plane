@@ -12,10 +12,10 @@ use apache_avro::{Codec, DeflateSettings, Schema, Writer};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field};
 use bytes::Bytes;
-use integrity_core::{Datum, KeyValue, LogicalType};
+use integrity_core::{Datum, KeyValue, LogicalType, Side};
 use integrity_iceberg::{
     FileChanges, FileIo, InspectError, MemoryIo, Operation, check_operation, commit_rows,
-    diff_snapshots, for_each_live_batch,
+    diff_snapshots, for_each_commit_batch, for_each_live_batch,
 };
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -883,4 +883,145 @@ fn streaming_refuses_a_diff_against_a_parent() {
         Ok::<_, InspectError>(())
     });
     assert!(unsupported(r).contains("whole-table"));
+}
+
+// ---------- commit streaming (validation, ADR 0019) ----------
+
+/// Both sides of the commit `parent` → `new`, streamed; and what `commit_rows` reads.
+fn streamed_sides(t: &Table, parent: &str, new: &str) -> (String, String) {
+    let changes = t.diff(Some(parent), new).unwrap();
+    let columns = [
+        (FieldId(1), LogicalType::Long),
+        (FieldId(2), LogicalType::String),
+    ];
+    let (mut added, mut removed) = (Vec::new(), Vec::new());
+    let s = for_each_commit_batch(&t.io, &changes, &columns, |side, b| {
+        assert!(!b.is_empty(), "empty batches are not handed over");
+        match side {
+            Side::Added => added.extend(b.rows().iter().cloned()),
+            Side::Removed => removed.extend(b.rows().iter().cloned()),
+        }
+        Ok::<_, InspectError>(())
+    });
+    let s = match s {
+        Ok(()) => format!("{added:?} / {removed:?}"),
+        Err(e) => e.to_string(),
+    };
+    let c = match t.rows(&changes) {
+        Ok(r) => format!("{:?} / {:?}", r.added.rows(), r.removed.rows()),
+        Err(e) => e.to_string(),
+    };
+    (s, c)
+}
+
+#[test]
+fn streaming_a_commit_reads_what_commit_rows_reads() {
+    // Copy-on-write, merge-on-read update, compaction of a merge-on-read table, restored rows,
+    // replaced deletion vectors, positions beyond the file.
+    let mut t = parent_with_position_delete();
+    t.data("c.parquet", &[(2, "eu"), (4, "us")]);
+    t.manifest("m2.avro", &[(1, 0, "c.parquet", "PARQUET", 2)]);
+    t.positions("pos2.parquet", &[("b.parquet", 0)]);
+    t.manifest("d2.avro", &[(1, 1, "pos2.parquet", "PARQUET", 1)]);
+    t.list(
+        "update.avro",
+        &[("m1.avro", 0), ("m2.avro", 0), ("d2.avro", 1)],
+    );
+    t.data("ab.parquet", &[(3, "eu"), (1, "eu")]);
+    t.manifest("m3.avro", &[(1, 0, "ab.parquet", "PARQUET", 2)]);
+    t.list("compacted.avro", &[("m3.avro", 0)]);
+    t.positions("far.parquet", &[("a.parquet", 9)]);
+    t.manifest("d3.avro", &[(1, 1, "far.parquet", "PARQUET", 1)]);
+    t.list(
+        "far.avro",
+        &[("m1.avro", 0), ("d1.avro", 1), ("d3.avro", 1)],
+    );
+    for (parent, new) in [
+        ("parent.avro", "parent-pos.avro"),
+        ("parent-pos.avro", "parent.avro"),
+        ("parent-pos.avro", "update.avro"),
+        ("parent-pos.avro", "compacted.avro"),
+        ("parent.avro", "compacted.avro"),
+        ("parent-pos.avro", "far.avro"),
+    ] {
+        let (s, c) = streamed_sides(&t, parent, new);
+        assert_eq!(s, c, "{parent} -> {new}");
+    }
+
+    let mut t = parent();
+    let (o1, s1) = t.dv("dv1.puffin", &[1]);
+    t.dv_manifest("d1.avro", &[(1, "dv1.puffin", "a.parquet", o1, s1, 1)]);
+    t.list("parent-dv.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+    let (o2, s2) = t.dv("dv2.puffin", &[0, 1]);
+    t.dv_manifest(
+        "d2.avro",
+        &[
+            (2, "dv1.puffin", "a.parquet", o1, s1, 1),
+            (1, "dv2.puffin", "a.parquet", o2, s2, 2),
+        ],
+    );
+    t.list("new.avro", &[("m1.avro", 0), ("d2.avro", 1)]);
+    let (s, c) = streamed_sides(&t, "parent-dv.avro", "new.avro");
+    assert_eq!(s, c);
+    let (s, c) = streamed_sides(&t, "new.avro", "parent-dv.avro");
+    assert_eq!(s, c);
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config { cases: 128, ..Default::default() })]
+
+    /// Random parent and new snapshots over four data files with position deletes on both sides.
+    #[test]
+    fn streaming_random_commits_reads_what_commit_rows_reads(
+        rows in proptest::collection::vec(1usize..6, 4),
+        parent_files in proptest::collection::vec(proptest::bool::ANY, 4),
+        new_files in proptest::collection::vec(proptest::bool::ANY, 4),
+        parent_deletes in proptest::collection::vec((0usize..4, 0i64..6), 0..4),
+        new_deletes in proptest::collection::vec((0usize..4, 0i64..6), 0..4),
+        keep_parent_deletes in proptest::bool::ANY,
+    ) {
+        let mut t = Table::new();
+        let names = ["f0.parquet", "f1.parquet", "f2.parquet", "f3.parquet"];
+        for (i, n) in rows.iter().enumerate() {
+            let data: Vec<(i64, &str)> =
+                (0..*n).map(|r| ((i * 10 + r) as i64, ["eu", "us"][r % 2])).collect();
+            t.data(names[i], &data);
+            t.manifest(&format!("m{i}.avro"), &[(1, 0, names[i], "PARQUET", *n as i64)]);
+        }
+        fn deletes(names: &[&'static str], d: &[(usize, i64)]) -> Vec<(&'static str, i64)> {
+            d.iter().map(|&(f, p)| (names[f], p)).collect()
+        }
+        fn as_refs(l: &[(String, i32)]) -> Vec<(&str, i32)> {
+            l.iter().map(|(m, c)| (m.as_str(), *c)).collect()
+        }
+        t.positions("pd-parent.parquet", &deletes(&names, &parent_deletes));
+        t.manifest("dp.avro", &[(1, 1, "pd-parent.parquet", "PARQUET", parent_deletes.len() as i64)]);
+        t.positions("pd-new.parquet", &deletes(&names, &new_deletes));
+        t.manifest("dn.avro", &[(1, 1, "pd-new.parquet", "PARQUET", new_deletes.len() as i64)]);
+        let list = |files: &[bool], with: &[&str]| -> Vec<(String, i32)> {
+            let mut l: Vec<(String, i32)> = files
+                .iter()
+                .enumerate()
+                .filter(|(_, on)| **on)
+                .map(|(i, _)| (format!("m{i}.avro"), 0))
+                .collect();
+            l.extend(with.iter().map(|m| (m.to_string(), 1)));
+            l
+        };
+        let p = list(&parent_files, if parent_deletes.is_empty() { &[] } else { &["dp.avro"] });
+        let mut new_with: Vec<&str> = Vec::new();
+        if keep_parent_deletes && !parent_deletes.is_empty() {
+            new_with.push("dp.avro");
+        }
+        if !new_deletes.is_empty() {
+            new_with.push("dn.avro");
+        }
+        let n = list(&new_files, &new_with);
+        t.list("p.avro", &as_refs(&p));
+        t.list("n.avro", &as_refs(&n));
+        if t.diff(Some("p.avro"), "n.avro").is_ok() {
+            let (s, c) = streamed_sides(&t, "p.avro", "n.avro");
+            proptest::prop_assert_eq!(s, c);
+        }
+    }
 }

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 703e26aaec25a061a2c4ca5cd693d6c26f6aa2864d9697f28d1e8f1dda1b5cc0 # shrinks to (parent, step, not_null) = ([[]], Step { keep: [false], new_files: [[(0, None)]], operation: Replace }, false), row_group = 1, memory = 1
+cc 0d67a8a165e7ff0f53bef9bf245d5994ee3f218ac0288218c7ee367ea629e2ca # shrinks to (parent, step, not_null) = ([[(0, Some(1))]], Step { keep: [false], new_files: [[(0, Some(17)), (18, Some(27))]], operation: Overwrite }, false), row_group = 3, memory = 855

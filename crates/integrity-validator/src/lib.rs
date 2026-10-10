@@ -21,13 +21,13 @@ use std::fmt;
 
 use integrity_core::{
     CommitRows, Constraint, ConstraintKind, Datum, DeltaError, Digest, EncodedKey, EnforcementMode,
-    InvalidCertificate, InvalidConstraint, KeyDisposition, KeySchema, KeyValue, NetDelta,
-    RegistrationContext, RowBatch, UniqueSpec, Violation, classify, key_delta_digest,
+    InvalidCertificate, InvalidConstraint, KeyDelta, KeyDisposition, KeySchema, KeyValue, NetDelta,
+    RegistrationContext, RowBatch, Side, UniqueSpec, Violation, classify, key_delta_digest,
 };
 use integrity_index::{
     IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, StagedDelta,
 };
-use integrity_types::{ConstraintId, ErrorCode, FieldId, TableId};
+use integrity_types::{ConstraintId, ErrorCode, FieldId, SnapshotId, TableId};
 
 use plan::Plan;
 
@@ -356,8 +356,30 @@ impl Validator {
         commit: &CommitRows,
         indexes: &impl IndexSet,
     ) -> Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
-        let table = &commit.table;
-        let own: Vec<&ResolvedConstraint> = self.on_table(table).collect();
+        let ctx = self.context(&commit.table)?;
+        let observed = self.observe(&ctx, indexes)?;
+        let mut plan = Plan::build(commit, ctx.own.iter().copied())?;
+        if let Some(deletes) = &commit.equality_deletes {
+            self.apply_equality_deletes(
+                commit,
+                deletes,
+                &ctx.own,
+                &ctx.referencing,
+                &mut plan,
+                indexes,
+            )?;
+        }
+        Self::decide(&ctx, observed, plan, commit.snapshot, indexes)
+    }
+
+    /// The constraints a commit to `table` is checked against; fails closed on anything that
+    /// cannot be proven, before any data is read.
+    fn context(&self, table: &TableId) -> Result<Context<'_>, ValidationError> {
+        let own: Vec<&ResolvedConstraint> = self
+            .constraints
+            .values()
+            .filter(|rc| rc.enforced() && rc.constraint.table == *table)
+            .collect();
         // Enforced FKs whose parent key lives on this table.
         let referencing: Vec<(&ResolvedConstraint, ConstraintId)> = self
             .constraints
@@ -370,8 +392,6 @@ impl Validator {
                 _ => None,
             })
             .collect();
-
-        // Fail closed on anything we cannot prove, before reading data.
         for rc in &own {
             if let ConstraintKind::ForeignKey(fk) = &rc.constraint.kind {
                 self.require_enforced(fk.parent_constraint, rc.constraint.id)?;
@@ -380,8 +400,15 @@ impl Validator {
         for (rc, parent) in &referencing {
             self.require_enforced(*parent, rc.constraint.id)?;
         }
+        Ok(Context { own, referencing })
+    }
 
-        // Record every index epoch before reading any index.
+    /// Records every index epoch, before reading any index.
+    fn observe(
+        &self,
+        ctx: &Context<'_>,
+        indexes: &impl IndexSet,
+    ) -> Result<BTreeMap<ConstraintId, IndexEpoch>, ValidationError> {
         let mut observed = BTreeMap::new();
         let mut observe = |id: ConstraintId| -> Result<(), ValidationError> {
             let epoch = index(indexes, id)?
@@ -390,7 +417,7 @@ impl Validator {
             observed.insert(id, epoch);
             Ok(())
         };
-        for rc in &own {
+        for rc in &ctx.own {
             if let ConstraintKind::ForeignKey(fk) = &rc.constraint.kind {
                 observe(fk.parent_constraint)?;
             }
@@ -398,16 +425,23 @@ impl Validator {
                 observe(rc.constraint.id)?;
             }
         }
-        for (rc, _) in &referencing {
+        for (rc, _) in &ctx.referencing {
             observe(rc.constraint.id)?;
         }
+        Ok(observed)
+    }
 
-        let mut plan = Plan::build(commit, own.iter().copied())?;
-        if let Some(deletes) = &commit.equality_deletes {
-            self.apply_equality_deletes(commit, deletes, &own, &referencing, &mut plan, indexes)?;
-        }
-
-        for rc in &own {
+    /// Probes the indexes for a planned commit and decides it.
+    fn decide(
+        ctx: &Context<'_>,
+        observed: BTreeMap<ConstraintId, IndexEpoch>,
+        mut plan: Plan,
+        snapshot: SnapshotId,
+        indexes: &impl IndexSet,
+    ) -> Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
+        let own = &ctx.own;
+        let referencing = &ctx.referencing;
+        for rc in own {
             let id = rc.constraint.id;
             let Some(delta) = plan.deltas.get(&id) else {
                 continue;
@@ -455,7 +489,7 @@ impl Validator {
             }
         }
 
-        for (rc, parent) in &referencing {
+        for (rc, parent) in referencing {
             let Some(parent_delta) = plan.deltas.get(parent) else {
                 return Err(ValidationError::Unprovable(rc.constraint.id));
             };
@@ -495,7 +529,7 @@ impl Validator {
                 (
                     *id,
                     IndexDelta {
-                        snapshot: commit.snapshot,
+                        snapshot,
                         changes: net.clone(),
                     },
                 )
@@ -650,6 +684,185 @@ impl Validator {
             Some(rc) if rc.enforced() && rc.schema.is_some() => Ok(()),
             _ => Err(ValidationError::Unprovable(by)),
         }
+    }
+}
+
+/// The constraints a commit is checked against.
+struct Context<'v> {
+    /// Enforced constraints on the committed table.
+    own: Vec<&'v ResolvedConstraint>,
+    /// Enforced FKs whose parent key lives on the committed table, with that parent constraint.
+    referencing: Vec<(&'v ResolvedConstraint, ConstraintId)>,
+}
+
+/// [`Validator::validate_with_details`] of a commit without equality deletes, fed a batch at a
+/// time so that commits larger than memory can be validated (ADR 0019).
+///
+/// [`CommitScan::feed`] does the index-free part (NULL rules, spec §7) on the rows of each side and
+/// emits every key. The caller sorts the keys of each constraint of [`CommitScan::keyed`] per
+/// side, and reports each distinct key once, in key order, with how often each side has it
+/// ([`CommitScan::counts`]). [`CommitScan::decide`] then probes the indexes and returns exactly
+/// what `validate_with_details` returns for the same rows in the same order.
+pub struct CommitScan<'v> {
+    validator: &'v Validator,
+    ctx: Context<'v>,
+    snapshot: SnapshotId,
+    plan: Plan,
+    /// The first error of each (constraint position, side), reported in that order (the order in
+    /// which validating all rows at once meets them).
+    errors: BTreeMap<(usize, Side), ValidationError>,
+}
+
+impl std::fmt::Debug for CommitScan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitScan")
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Validator {
+    /// Starts validating a commit to `table` that would publish `snapshot`, a batch at a time
+    /// (see [`CommitScan`]). Fails like [`Validator::validate`] on constraints it cannot prove.
+    pub fn commit_scan(
+        &self,
+        table: &TableId,
+        snapshot: SnapshotId,
+    ) -> Result<CommitScan<'_>, ValidationError> {
+        let ctx = self.context(table)?;
+        let mut plan = Plan::default();
+        for rc in &ctx.own {
+            if rc.constraint.kind.key().is_some() {
+                if rc.schema.is_none() || rc.constraint.kind.key_role().is_none() {
+                    return Err(ValidationError::Unprovable(rc.constraint.id));
+                }
+                plan.deltas.insert(rc.constraint.id, KeyDelta::default());
+            }
+        }
+        Ok(CommitScan {
+            validator: self,
+            ctx,
+            snapshot,
+            plan,
+            errors: BTreeMap::new(),
+        })
+    }
+}
+
+impl CommitScan<'_> {
+    /// The constraints whose keys [`CommitScan::feed`] emits.
+    pub fn keyed(&self) -> Vec<ConstraintId> {
+        self.ctx
+            .own
+            .iter()
+            .filter(|rc| rc.constraint.kind.key().is_some())
+            .map(|rc| rc.constraint.id)
+            .collect()
+    }
+
+    /// Checks the NULL rules of rows on `side` and hands every key to `emit` with its
+    /// constraint. Errors of `emit` are returned at once; validation errors are kept and reported
+    /// by [`CommitScan::decide`], as validating all rows at once would.
+    pub fn feed<E>(
+        &mut self,
+        side: Side,
+        rows: &RowBatch,
+        mut emit: impl FnMut(ConstraintId, EncodedKey) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (pos, rc) in self.ctx.own.iter().enumerate() {
+            if self.errors.contains_key(&(pos, side)) {
+                continue;
+            }
+            let id = rc.constraint.id;
+            let mut failed: Option<E> = None;
+            let result = match (&rc.constraint.kind, side) {
+                (ConstraintKind::NotNull(field), Side::Added) => {
+                    self.plan.not_null(id, *field, rows)
+                }
+                (ConstraintKind::NotNull(_), Side::Removed) => Ok(()),
+                (kind, Side::Added) => match kind.key() {
+                    Some(key) => self.plan.added_keys(rc, key, rows, |k| {
+                        emit(id, k).map_err(|e| {
+                            failed = Some(e);
+                            ValidationError::Unprovable(id)
+                        })
+                    }),
+                    None => Err(ValidationError::Unprovable(id)),
+                },
+                (kind, Side::Removed) => match kind.key() {
+                    Some(key) => Plan::removed_keys(rc, key, rows, |k| {
+                        emit(id, k).map_err(|e| {
+                            failed = Some(e);
+                            ValidationError::Unprovable(id)
+                        })
+                    }),
+                    None => Err(ValidationError::Unprovable(id)),
+                },
+            };
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if let Err(e) = result {
+                self.errors.insert((pos, side), e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reports that `key` of constraint `id` occurs `added` times among the added rows and
+    /// `removed` times among the removed ones (see [`CommitScan`]).
+    pub fn counts(
+        &mut self,
+        id: ConstraintId,
+        key: EncodedKey,
+        added: u64,
+        removed: u64,
+    ) -> Result<(), ValidationError> {
+        let rc = self
+            .ctx
+            .own
+            .iter()
+            .find(|rc| rc.constraint.id == id)
+            .ok_or(ValidationError::MissingIndex(id))?;
+        // Spec §8: multiplicities of added keys, before any index probe.
+        let duplicate = match rc.constraint.kind {
+            ConstraintKind::PrimaryKey(_) => Some(ErrorCode::DuplicatePrimaryKey),
+            ConstraintKind::Unique(_) => Some(ErrorCode::DuplicateUniqueKey),
+            _ => None,
+        };
+        if let Some(code) = duplicate
+            && added > 1
+        {
+            self.plan.record_key(id, code, &key);
+        }
+        let delta = self.plan.deltas.entry(id).or_default();
+        if added > removed {
+            delta
+                .added
+                .insert_n(key, added - removed)
+                .map_err(ValidationError::Delta)?;
+        } else if removed > added {
+            delta
+                .removed
+                .insert_n(key, removed - added)
+                .map_err(ValidationError::Delta)?;
+        }
+        Ok(())
+    }
+
+    /// Probes the indexes and decides the commit.
+    pub fn decide(
+        self,
+        indexes: &impl IndexSet,
+    ) -> Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
+        let observed = self.validator.observe(&self.ctx, indexes)?;
+        if let Some((_, e)) = self.errors.into_iter().next() {
+            return Err(e);
+        }
+        Validator::decide(&self.ctx, observed, self.plan, self.snapshot, indexes)
     }
 }
 

@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-use integrity_core::{CommitRows, Datum, LogicalType, RowBatch};
+use integrity_core::{CommitRows, Datum, LogicalType, RowBatch, Side};
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 
 use crate::classify::Operation;
@@ -483,7 +483,6 @@ pub fn for_each_live_batch<E: From<InspectError>>(
     mut f: impl FnMut(RowBatch) -> Result<(), E>,
 ) -> Result<(), E> {
     if !changes.removed.is_empty()
-        || !changes.equality_deletes.is_empty()
         || changes
             .positions
             .as_ref()
@@ -493,61 +492,162 @@ pub fn for_each_live_batch<E: From<InspectError>>(
             unsupported("a whole-table scan needs a snapshot diffed against no parent").into(),
         );
     }
-    let mut deleted: HashMap<String, BTreeSet<i64>> = HashMap::new();
-    if let Some(pd) = &changes.positions {
-        for d in &pd.after {
-            for (path, positions) in position_deletes(io, d)? {
-                deleted.entry(path).or_default().extend(positions);
-            }
-        }
+    for_each_commit_batch(io, changes, columns, |_, batch| f(batch))
+}
+
+/// Hands the rows [`commit_rows`] would read to `f`, side by side, a few thousand at a time and in
+/// the same order within each side, without holding them (ADR 0019): memory is one row group of
+/// key columns plus the deleted positions of both snapshots. Commits with equality deletes are
+/// refused here; they go through `commit_rows`.
+pub fn for_each_commit_batch<E: From<InspectError>>(
+    io: &impl FileIo,
+    changes: &FileChanges,
+    columns: &[(FieldId, LogicalType)],
+    mut f: impl FnMut(Side, RowBatch) -> Result<(), E>,
+) -> Result<(), E> {
+    if !changes.equality_deletes.is_empty() {
+        return Err(unsupported("equality deletes are read with commit_rows").into());
     }
-    /// The caller's error, or one of reading the file.
-    enum Failed<E> {
-        Inspect(InspectError),
-        Caller(E),
-    }
-    impl<E> From<ExtractError> for Failed<E> {
-        fn from(e: ExtractError) -> Self {
-            Failed::Inspect(e.into())
-        }
-    }
-    let fields: Vec<FieldId> = columns.iter().map(|(f, _)| *f).collect();
     let empty = BTreeSet::new();
-    for file in &changes.added {
-        let gone = deleted.get(&file.path).unwrap_or(&empty);
-        let mut rows: usize = 0;
-        let read = crate::parquet_keys::for_each_batch_from(io, &file.path, columns, |batch| {
-            let start = rows as i64;
-            rows += batch.len();
-            let batch = if gone.range(start..rows as i64).next().is_none() {
-                batch
-            } else {
-                let mut live = RowBatch::new(fields.clone());
-                for (i, row) in batch.rows().iter().enumerate() {
-                    if !gone.contains(&(start + i as i64)) {
-                        live.push(row.clone())
-                            .map_err(|e| Failed::Inspect(unsupported(e.to_string())))?;
+    let (before, after) = match &changes.positions {
+        None => (HashMap::new(), HashMap::new()),
+        Some(pd) => {
+            let mut by_file: HashMap<String, BTreeMap<String, BTreeSet<i64>>> = HashMap::new();
+            let mut deleted =
+                |files: &[DataFile]| -> Result<HashMap<String, BTreeSet<i64>>, InspectError> {
+                    let mut out: HashMap<String, BTreeSet<i64>> = HashMap::new();
+                    for d in files {
+                        if !by_file.contains_key(&d.path) {
+                            by_file.insert(d.path.clone(), position_deletes(io, d)?);
+                        }
+                        for (path, positions) in &by_file[&d.path] {
+                            out.entry(path.clone()).or_default().extend(positions);
+                        }
                     }
+                    Ok(out)
+                };
+            (deleted(&pd.before)?, deleted(&pd.after)?)
+        }
+    };
+    // Live rows of whole data files.
+    for (side, files, gone) in [
+        (Side::Added, &changes.added, &after),
+        (Side::Removed, &changes.removed, &before),
+    ] {
+        for file in files {
+            let gone = gone.get(&file.path).unwrap_or(&empty);
+            stream_file(io, file, columns, &[gone], &mut |batch, start| {
+                let live = select(batch, columns, |pos| !gone.contains(&(start + pos)))?;
+                if live.is_empty() {
+                    Ok(())
+                } else {
+                    f(side, live).map_err(Failed::Caller)
                 }
-                live
-            };
-            f(batch).map_err(Failed::Caller)
-        });
-        match read {
-            Ok(()) => {}
-            Err(Failed::Inspect(e)) => return Err(e.into()),
-            Err(Failed::Caller(e)) => return Err(e),
+            })?;
         }
-        if rows as i64 != file.record_count {
-            return Err(unsupported(format!(
-                "{} has {rows} rows but its manifest says {}",
-                file.path, file.record_count
-            ))
-            .into());
+    }
+    // Kept data files whose deleted positions the commit changes.
+    if let Some(pd) = &changes.positions {
+        for (path, file) in &pd.kept {
+            let b = before.get(path).unwrap_or(&empty);
+            let a = after.get(path).unwrap_or(&empty);
+            if b == a {
+                continue;
+            }
+            let newly: BTreeSet<i64> = a.difference(b).copied().collect();
+            let restored: BTreeSet<i64> = b.difference(a).copied().collect();
+            stream_file(io, file, columns, &[a, b], &mut |batch, start| {
+                let removed = select(batch.clone(), columns, |pos| newly.contains(&(start + pos)))?;
+                let added = select(batch, columns, |pos| restored.contains(&(start + pos)))?;
+                if !removed.is_empty() {
+                    f(Side::Removed, removed).map_err(Failed::Caller)?;
+                }
+                if !added.is_empty() {
+                    f(Side::Added, added).map_err(Failed::Caller)?;
+                }
+                Ok(())
+            })?;
         }
-        check_positions(file, gone, rows)?;
     }
     Ok(())
+}
+
+/// The caller's error, or one of reading a file.
+enum Failed<E> {
+    Inspect(InspectError),
+    Caller(E),
+}
+
+impl<E> From<ExtractError> for Failed<E> {
+    fn from(e: ExtractError) -> Self {
+        Failed::Inspect(e.into())
+    }
+}
+
+impl<E> From<InspectError> for Failed<E> {
+    fn from(e: InspectError) -> Self {
+        Failed::Inspect(e)
+    }
+}
+
+/// Streams one data file to `g(batch, position of its first row)`, then checks its row count
+/// against the manifest and that every position of every set in `deleted` is within the file.
+fn stream_file<E: From<InspectError>>(
+    io: &impl FileIo,
+    file: &DataFile,
+    columns: &[(FieldId, LogicalType)],
+    deleted: &[&BTreeSet<i64>],
+    g: &mut dyn FnMut(RowBatch, i64) -> Result<(), Failed<E>>,
+) -> Result<(), E> {
+    let mut rows: usize = 0;
+    let read = crate::parquet_keys::for_each_batch_from(io, &file.path, columns, |batch| {
+        let start = rows as i64;
+        rows += batch.len();
+        g(batch, start)
+    });
+    match read {
+        Ok(()) => {}
+        Err(Failed::Inspect(e)) => return Err(e.into()),
+        Err(Failed::Caller(e)) => return Err(e),
+    }
+    if rows as i64 != file.record_count {
+        return Err(unsupported(format!(
+            "{} has {rows} rows but its manifest says {}",
+            file.path, file.record_count
+        ))
+        .into());
+    }
+    for positions in deleted {
+        check_positions(file, positions, rows)?;
+    }
+    Ok(())
+}
+
+/// The rows of `batch` at the positions `keep` accepts (the batch itself if it keeps all).
+fn select<E>(
+    batch: RowBatch,
+    columns: &[(FieldId, LogicalType)],
+    keep: impl Fn(i64) -> bool,
+) -> Result<RowBatch, Failed<E>> {
+    if (0..batch.len() as i64).all(&keep) {
+        return Ok(batch);
+    }
+    if !(0..batch.len() as i64).any(&keep) {
+        return Ok(RowBatch::new(columns.iter().map(|(c, _)| *c).collect()));
+    }
+    let mut out = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
+    for (i, row) in batch.rows().iter().enumerate() {
+        if keep(i as i64) {
+            push(&mut out, row)?;
+        }
+    }
+    Ok(out)
+}
+
+fn push<E>(batch: &mut RowBatch, row: &[Datum]) -> Result<(), Failed<E>> {
+    batch
+        .push(row.to_vec())
+        .map_err(|e| Failed::Inspect(unsupported(e.to_string())))
 }
 
 /// Field ids of `file_path` and `pos` in position delete files (Iceberg spec, reserved ids).
@@ -648,14 +748,11 @@ fn check_positions(
 /// removes nothing, `delete` adds nothing, and `replace` must leave the multiset of projected rows,
 /// hence every key multiset, unchanged.
 pub fn check_operation(operation: Operation, rows: &CommitRows) -> Result<(), InspectError> {
-    match operation {
-        Operation::Append if !rows.removed.is_empty() => {
-            Err(unsupported("append snapshot removes data files"))
-        }
-        Operation::Delete if !rows.added.is_empty() => {
-            Err(unsupported("delete snapshot adds data files"))
-        }
-        Operation::Replace => {
+    check_sides(
+        operation,
+        !rows.added.is_empty(),
+        !rows.removed.is_empty(),
+        || {
             let mut counts: HashMap<&[Datum], i64> = HashMap::new();
             for row in rows.added.rows() {
                 *counts.entry(row.as_slice()).or_insert(0) += 1;
@@ -663,10 +760,30 @@ pub fn check_operation(operation: Operation, rows: &CommitRows) -> Result<(), In
             for row in rows.removed.rows() {
                 *counts.entry(row.as_slice()).or_insert(0) -= 1;
             }
-            if counts.values().all(|&c| c == 0) {
+            Ok(counts.values().all(|&c| c == 0))
+        },
+    )
+}
+
+/// [`check_operation`] from what a commit's rows are, for callers that stream them (ADR 0019):
+/// whether it adds rows, whether it removes rows, and (asked only for `replace`) whether both
+/// sides hold the same rows.
+pub fn check_sides<E: From<InspectError>>(
+    operation: Operation,
+    adds: bool,
+    removes: bool,
+    same_rows: impl FnOnce() -> Result<bool, E>,
+) -> Result<(), E> {
+    match operation {
+        Operation::Append if removes => {
+            Err(unsupported("append snapshot removes data files").into())
+        }
+        Operation::Delete if adds => Err(unsupported("delete snapshot adds data files").into()),
+        Operation::Replace => {
+            if same_rows()? {
                 Ok(())
             } else {
-                Err(unsupported("replace snapshot changes constrained data"))
+                Err(unsupported("replace snapshot changes constrained data").into())
             }
         }
         Operation::Append | Operation::Delete | Operation::Overwrite => Ok(()),

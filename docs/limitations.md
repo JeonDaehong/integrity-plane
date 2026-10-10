@@ -22,6 +22,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Validation reads the footer and the key column chunks of every data file a commit adds or
   removes (ranged reads), so its cost follows the key columns, not the file size; manifests are
   read whole. About 5 µs per changed key on the benchmark machine.
+- Commit validation streams rows and sorts keys within `limits.scan_memory` (ADR 0019), so large
+  rewrites need scratch disk instead of memory; commits with equality deletes are still read
+  whole. `verify` reads the rows of each snapshot it recomputes whole.
 - One domain commits about 80 times per second with one writer on the benchmark machine, and about
   25 times per second when 16 writers race on one table (about a third of the same race without
   the Plane; `benchmarks.md`).

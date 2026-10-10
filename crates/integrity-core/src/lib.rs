@@ -28,6 +28,6 @@ pub use key::{
 };
 pub use logical_type::{LogicalType, UnsupportedKeyType};
 pub use nulls::{KeyDisposition, KeyRole, classify};
-pub use rows::{ArityMismatch, CommitRows, Datum, RowBatch};
+pub use rows::{ArityMismatch, CommitRows, Datum, RowBatch, Side, encode_row};
 pub use signature::{CertSigner, SUMMARY_CERT_KEY_ID, SUMMARY_CERT_SIGNATURE};
 pub use verdict::Violation;

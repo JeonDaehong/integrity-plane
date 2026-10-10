@@ -21,8 +21,8 @@ pub mod request;
 
 pub use certify::{inject_certificate, inject_signature, snapshot_certificate, snapshot_signature};
 pub use changes::{
-    FileChanges, InspectError, PositionDeletes, check_operation, commit_rows, diff_snapshots,
-    for_each_live_batch,
+    FileChanges, InspectError, PositionDeletes, check_operation, check_sides, commit_rows,
+    diff_snapshots, for_each_commit_batch, for_each_live_batch,
 };
 pub use classify::{
     Classification, MainChange, NewSnapshot, Operation, Rejection, check_requirements, classify,

@@ -23,6 +23,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0016](0016-violation-reports-disabled-domains-actors.md) | Violation reports, disabled domains and audit actors | Accepted |
 | [0017](0017-merge-on-read-position-deletes.md) | Merge-on-read position deletes | Accepted |
 | [0018](0018-deletion-vectors.md) | Iceberg v3 deletion vectors | Accepted |
+| [0019](0019-streaming-commit-validation.md) | Streaming commit validation | Accepted |
 
 The decisions spec §31 requires for 0.1 are all recorded: Iceberg first (0012), proxy gateway (0010),
 indexes as derived state (0013), counts instead of locators (0014), serial domain queues (0015) and

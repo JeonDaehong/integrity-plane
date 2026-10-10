@@ -8,16 +8,58 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use integrity_core::{
-    CommitRows, Constraint, ConstraintKind, Datum, EnforcementMode, ForeignKeySpec, KeySpec,
-    KeyValue, LogicalType, MatchMode, NullsMode, ReferentialAction, RowBatch, UniqueSpec,
+    CommitRows, Constraint, ConstraintKind, Datum, EncodedKey, EnforcementMode, ForeignKeySpec,
+    KeySpec, KeyValue, LogicalType, MatchMode, NullsMode, ReferentialAction, RowBatch, Side,
+    UniqueSpec, Violation,
 };
 use integrity_index::{IndexEpoch, IndexValue, KeyIndex, MemoryIndex, PersistentStore};
 use integrity_reference::{Commit, Oracle, Row, Verdict};
 use integrity_types::{ConstraintId, ConstraintSetVersion, FieldId, SnapshotId, TableId};
-use integrity_validator::{Decision, ResolvedConstraint, ValidationError, Validator};
+use integrity_validator::{
+    Decision, ResolvedConstraint, ValidationError, Validator, ViolationDetail,
+};
 use proptest::prelude::*;
 
 // ---------- engine ----------
+
+/// `rows` validated through a `CommitScan`: batches of `size` rows, sides in either order, keys
+/// counted per side in sorted maps (the role of the external sorter).
+pub fn streamed(
+    validator: &Validator,
+    rows: &CommitRows,
+    indexes: &impl integrity_validator::IndexSet,
+    size: usize,
+    removed_first: bool,
+) -> Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
+    let mut scan = validator.commit_scan(&rows.table, rows.snapshot)?;
+    let mut keys: BTreeMap<ConstraintId, BTreeMap<EncodedKey, (u64, u64)>> = BTreeMap::new();
+    let mut sides = vec![(Side::Added, &rows.added), (Side::Removed, &rows.removed)];
+    if removed_first {
+        sides.reverse();
+    }
+    for (side, batch) in sides {
+        for chunk in batch.rows().chunks(size) {
+            let mut b = RowBatch::new(batch.columns().to_vec());
+            for r in chunk {
+                b.push(r.clone()).unwrap();
+            }
+            scan.feed(side, &b, |id, key| {
+                let e = keys.entry(id).or_default().entry(key).or_default();
+                match side {
+                    Side::Added => e.0 += 1,
+                    Side::Removed => e.1 += 1,
+                }
+                Ok::<_, ValidationError>(())
+            })?;
+        }
+    }
+    for id in scan.keyed() {
+        for (key, (added, removed)) in keys.remove(&id).unwrap_or_default() {
+            scan.counts(id, key, added, removed)?;
+        }
+    }
+    scan.decide(indexes)
+}
 
 /// Which index backend the engine uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +175,21 @@ impl Engine {
             removed: self.rows(&commit.table, &commit.removed),
             equality_deletes,
         };
-        let (decision, details) = self.validator.validate_with_details(&rows, &self.indexes)?;
+        let at_once = self.validator.validate_with_details(&rows, &self.indexes);
+        if rows.equality_deletes.is_none() {
+            // Batch by batch (ADR 0019) must decide exactly the same, however the rows are split
+            // and whichever side comes first.
+            let size = 1 + (self.snapshot as usize) % 3;
+            let streamed = streamed(
+                &self.validator,
+                &rows,
+                &self.indexes,
+                size,
+                self.snapshot % 2 == 0,
+            );
+            assert_eq!(streamed, at_once, "CommitScan disagrees with validate");
+        }
+        let (decision, details) = at_once?;
         match decision {
             Decision::Rejected(v) => {
                 // Every violation is explained, and nothing else is.

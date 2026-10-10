@@ -29,7 +29,8 @@ path = "/var/lib/integrity"
 
 [limits]
 max_inline_validation_bytes = "2GiB"
-# Keys an onboarding or rebuild scan keeps in memory per table; the rest spills to the control store.
+# Keys kept in memory per onboarding table or per commit validation; the rest spills to the control
+# store.
 scan_memory = "512MiB"
 
 # Sign certificates (RFC 0005). The key file is created on first start if missing; publish its public
