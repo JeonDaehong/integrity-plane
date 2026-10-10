@@ -9,7 +9,9 @@
   in 27 minutes and 1.5 GB (`docs/benchmarks.md`).
 - Commit validation streams rows and sorts keys externally (ADR 0019): copy-on-write rewrites and
   compactions no longer need memory proportional to the rows they rewrite. Compacting 100 M rows
-  needs 1.6 GB instead of 40.7 GB, in 183 s instead of 304 s (`docs/benchmarks.md`).
+  needs 1.5 GB instead of 40.7 GB, in 128 s instead of 304 s (`docs/benchmarks.md`).
+- Merge-on-read deletes read only the row groups holding changed positions: one delete in a
+  10 M-row file takes 88 ms instead of up to 7 s.
 - `integrity-bench --settle` waits after large file writes before measuring.
 
 ## 0.0.1 — 2026-10-09

@@ -95,27 +95,27 @@ the next section removes.
 
 ### Commit validation before and after streaming (ADR 0019)
 
-Same instance type and method; "before" is commit 2a75205 (bounded onboarding, commits validated
-in memory), "after" is commit cd0dfd2. Memory "per phase" is the highest sample between markers the
-benchmark prints around each measured commit; for "before" only the peak of the whole run is known,
-which for those runs is the compaction.
+Same instance type and method. "Before" is commit 2a75205 (bounded onboarding, commits validated in
+memory), "after" is commit b20c5aa (streaming validation, keys packed in one buffer per sorter,
+merge-on-read reading only the row groups holding changed positions). Memory "after" is the
+highest sample (every 0.2 s) between markers the benchmark prints around each measured commit;
+for "before" only the peak of the whole run is known, which for those runs is the compaction.
 
 | Scenario | Before | After |
 |---|---|---|
-| Copy-on-write delete of 1 row, 1 M-row file (100 M-row table) | 1.94 s | 0.64 s, 1.4 GB |
-| Compaction of 10 files, 10 M rows | 27.1 s, 5.1 GB (whole run) | 17.0 s, 1.4 GB |
+| Copy-on-write delete of 1 row, 1 M-row file (100 M-row table) | 1.94 s | 0.55 s, 1.5 GB |
+| Compaction of 10 files, 10 M rows | 27.1 s, 5.1 GB (whole run) | 11.7 s, 1.7 GB |
 | Merge-on-read delete of 1 row in a 1 M-row file, first / 50th | 477 ms / 88 ms | 86 ms / 86 ms |
-| Copy-on-write delete of 1 row, 10 M-row file (200 M-row table) | 20.3 s | 7.8 s, 2.9–4.3 GB |
-| Compaction of 10 files, **100 M rows** | 304 s, **40.7 GB** (whole run) | 183 s, **1.6 GB** |
-| Merge-on-read delete of 1 row in a 10 M-row file, first / 50th | 1.06 s / 7.14 s | 0.78 s / 7.48 s |
+| Copy-on-write delete of 1 row, 10 M-row file (200 M-row table) | 20.3 s | 6.7 s, 1.5 GB |
+| Compaction of 10 files, **100 M rows** | 304 s, **40.7 GB** (whole run) | 128 s, **1.5 GB** |
+| Merge-on-read delete of 1 row in a 10 M-row file, first / 50th | 1.06 s / 7.14 s | 88 ms / 88 ms (read 8 MB instead of 79–788 MB) |
 
-Validation memory no longer follows the rows a commit rewrites: compacting 100 M rows needs 1.6 GB
-instead of 40.7 GB, and it is faster because sorting runs of keys beats building per-key maps.
-One figure is not understood yet: the copy-on-write rewrite of one 10 M-row file peaks at
-2.9–4.3 GB on Linux (lower with `MALLOC_ARENA_MAX=2`), while the same scenario peaks at about 1 GB
-on Windows and the ten times larger compaction at 1.6 GB on Linux. It points at allocator
-retention or at the benchmark's own writing of the 10 M-row file just before the commit, not at
-memory that grows with the rewrite; it is being investigated.
+Validation memory no longer follows the rows a commit rewrites: compacting 100 M rows needs about
+1.5 GB (index page cache and sort budget included) instead of 40.7 GB, and every commit shape is
+faster. Merge-on-read deletes in large files read only the row group holding the deleted row.
+(An earlier measurement attributed 3–4 GB to the 10 M-row copy-on-write; the 0.2 s timeline showed
+that this was the benchmark generating the next scenario's 100 M-row file right after the commit.
+During the commit itself the process grows by about 0.4 GB.)
 
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 
