@@ -66,7 +66,63 @@ target), multi-node anything.
 | Baseline: the same writers straight to the catalog (no Plane) | end-to-end incl. retries p50 133.7 ms / p99 1.14 s | 68 commits/s | 2219 attempts for 320 commits |
 | Control store after the run | indexes 1028.0 MiB / txn log 64.3 MiB / registry 0.5 MiB | | |
 
-## Large tables (local, `--scale`)
+## Large tables on AWS (`--scale`)
+
+One EC2 `m6id.4xlarge` in ap-northeast-2 (16 vCPU Xeon Platinum 8375C, 64 GB, data on the local
+NVMe instance store), Amazon Linux 2023, Rust 1.99, 2026-10-10. Each run is
+`integrity-bench --scale N --file-rows 1000000 --dir <nvme>`: N rows loaded in 1 M-row files
+straight to the catalog, a PRIMARY KEY onboarded, then through the Plane a copy-on-write delete of
+one row, compaction of 10 files and 50 merge-on-read deletes. Memory is the process's resident set
+sampled every second; "during onboarding" is the highest sample during the registration request.
+"Before" is commit 0f0d373 (it has no onboarding markers, so its figure is the peak of the whole
+run, which for that version is onboarding).
+
+### Onboarding before and after the bounded-memory scan (ADR 0011 amendment)
+
+| Rows | Onboarding before | Onboarding after | Memory before | Memory during onboarding, after |
+|---|---|---|---|---|
+| 30 M | 94.95 s | 41.44 s | 11.1 GB (whole run) | 1.5 GB |
+| 60 M | 193.02 s | 85.96 s | 21.6 GB (whole run) | 1.6 GB |
+| 100 M | 328.68 s | 145.27 s | 35.5 GB (whole run) | 1.5 GB |
+| 1 000 M | not run (about 360 GB needed) | 1598.00 s | | 1.5 GB |
+
+Before, memory grew with the number of keys (about 360 bytes per key here); one billion keys would
+have needed about 360 GB. Now onboarding holds `limits.scan_memory` (512 MiB) plus the index store's
+page cache (at most 1 GiB) at any size, at about 625 000–725 000 keys/s, 2.2 times the previous rate.
+The copy-on-write, compaction and merge-on-read rows of both versions match (the commit path did not
+change); the peak memory of the new version's runs, about 5 GB, is the 10 M-row compaction.
+
+### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
+
+| Scenario | Time | Data | Notes |
+|---|---|---|---|
+| Load 1000000000 rows in 1000 files of 1000000 rows (no Plane) | 19.28 s | | |
+| Onboarding scan of 1000000000 keys | 1598.00 s | 625782 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 1.91 s; validation 1.89 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 26.66 s; validation 26.64 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 524.4 ms / validation 505.5 ms; last: 145.3 ms / 122.6 ms | read first 8.8 MiB, last 8.8 MiB | |
+
+### 100 M rows, after (peak memory of the whole run 5.0 GB)
+
+| Scenario | Time | Data | Notes |
+|---|---|---|---|
+| Load 100000000 rows in 100 files of 1000000 rows (no Plane) | 1.56 s | | |
+| Onboarding scan of 100000000 keys | 145.27 s | 688356 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 1.90 s; validation 1.90 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 26.66 s; validation 26.65 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 481.4 ms / validation 477.5 ms; last: 87.3 ms / 82.1 ms | read first 8.0 MiB, last 8.1 MiB | |
+
+### 100 M rows, before (peak memory of the whole run 35.5 GB)
+
+| Scenario | Time | Data | Notes |
+|---|---|---|---|
+| Load 100000000 rows in 100 files of 1000000 rows (no Plane) | 1.64 s | | |
+| Onboarding scan of 100000000 keys | 328.68 s | 304249 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 3.41 s; validation 3.40 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 25.37 s; validation 25.36 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 632.4 ms / validation 628.3 ms; last: 86.4 ms / 81.0 ms | read first 8.0 MiB, last 8.1 MiB | |
+
+## Large tables (local Windows machine, `--scale`)
 
 `integrity-bench --scale N --file-rows 1000000 --settle 120` loads N rows in 1 M-row files straight
 to the catalog, onboards a PRIMARY KEY, then measures through the Plane: a copy-on-write delete of
