@@ -47,7 +47,7 @@ async fn measured(
 /// sampling.
 fn mark(started: &Instant, phase: &str, edge: &str) {
     eprintln!(
-        "@ {phase} {edge} {:.0} s after the bench",
+        "@ {phase} {edge} {:.1} s after the bench",
         started.elapsed().as_secs_f64()
     );
 }
@@ -90,7 +90,7 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
 
     // Onboarding: register the PRIMARY KEY.
     eprintln!(
-        "@ onboarding starts {:.0} s after the bench",
+        "@ onboarding starts {:.1} s after the bench",
         started.elapsed().as_secs_f64()
     );
     let t = Instant::now();
@@ -110,7 +110,7 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
         return Ok(out);
     }
     eprintln!(
-        "@ onboarding ends {:.0} s after the bench",
+        "@ onboarding ends {:.1} s after the bench",
         started.elapsed().as_secs_f64()
     );
     line(format!(
@@ -135,6 +135,26 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
     mark(&started, "copy-on-write", "ends");
     line(format!(
         "| Copy-on-write delete of 1 row (rewrites a {per}-row file) | end-to-end {}; validation {} | read {} | status {status} |",
+        seconds(took),
+        seconds(validation),
+        mib(read)
+    ));
+
+    // The same again on the rewritten file: is the first commit after onboarding special?
+    let list = current(b, "big").await?;
+    let victim = list[0].clone();
+    let ids: Vec<i64> = (2..per.min(rows)).collect();
+    let rewritten = b.files.manifest(&ids, &vec![None; ids.len()])?;
+    drop(ids);
+    let new_list: Vec<String> = std::iter::once(rewritten)
+        .chain(list.iter().filter(|m| **m != victim).cloned())
+        .collect();
+    mark(&started, "copy-on-write-2", "starts");
+    let (status, took, validation, read) =
+        measured(b, "big", Change::Raw(new_list, "overwrite")).await?;
+    mark(&started, "copy-on-write-2", "ends");
+    line(format!(
+        "| Copy-on-write delete of 1 more row (the same file again) | end-to-end {}; validation {} | read {} | status {status} |",
         seconds(took),
         seconds(validation),
         mib(read)
