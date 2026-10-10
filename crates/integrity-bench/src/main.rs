@@ -35,6 +35,8 @@ use serde_json::{Value, json};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+mod scale;
+
 // ---------- options ----------
 
 struct Options {
@@ -44,6 +46,12 @@ struct Options {
     append_rows: i64,
     writers: usize,
     hot_commits: usize,
+    /// Large-table mode: parent rows (0 = the standard scenarios).
+    scale: i64,
+    /// Rows per data file in large-table mode.
+    file_rows: i64,
+    /// Merge-on-read deletes in large-table mode.
+    mor_deletes: usize,
 }
 
 fn options() -> Result<Options, String> {
@@ -54,6 +62,9 @@ fn options() -> Result<Options, String> {
         append_rows: 10_000,
         writers: 16,
         hot_commits: 20,
+        scale: 0,
+        file_rows: 1_000_000,
+        mor_deletes: 50,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -71,6 +82,9 @@ fn options() -> Result<Options, String> {
             "--append-rows" => o.append_rows = n()?,
             "--writers" => o.writers = n()? as usize,
             "--hot-commits" => o.hot_commits = n()? as usize,
+            "--scale" => o.scale = n()?,
+            "--file-rows" => o.file_rows = n()?,
+            "--mor-deletes" => o.mor_deletes = n()? as usize,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -148,6 +162,10 @@ struct Files {
     next: AtomicI64,
     manifests_of: Mutex<HashMap<i64, Vec<String>>>,
     rows_of: Mutex<HashMap<String, i64>>,
+    /// Data file of each data manifest.
+    data_of: Mutex<HashMap<String, String>>,
+    /// Manifests that hold delete files.
+    deletes: Mutex<std::collections::HashSet<String>>,
 }
 
 fn avro(schema: &str, records: Vec<Vec<(&str, Avro)>>) -> Result<Vec<u8>, BoxError> {
@@ -209,7 +227,7 @@ impl Files {
         }
         let schema = Arc::new(arrow_schema::Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let data_path = self.location(&format!("d{n}.parquet"));
+        let data_path = data_path_for(&self.dir, n);
         let file = std::fs::File::create(&data_path)?;
         let mut w = ArrowWriter::try_new(file, schema, None)?;
         w.write(&batch)?;
@@ -238,6 +256,62 @@ impl Files {
         if let Ok(mut rows) = self.rows_of.lock() {
             rows.insert(path.clone(), ids.len() as i64);
         }
+        if let Ok(mut d) = self.data_of.lock() {
+            d.insert(path.clone(), data_path_for(&self.dir, n));
+        }
+        Ok(path)
+    }
+
+    /// A Parquet position delete file of `(data file, row position)` and a delete manifest listing
+    /// it; returns the manifest location.
+    fn position_deletes(&self, deletes: &[(String, i64)]) -> Result<String, BoxError> {
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
+        let meta =
+            |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(meta("2147483546")),
+            Field::new("pos", DataType::Int64, false).with_metadata(meta("2147483545")),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(
+                    deletes.iter().map(|d| d.0.clone()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    deletes.iter().map(|d| d.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+        let file_path = self.location(&format!("pd{n}.parquet"));
+        let file = std::fs::File::create(&file_path)?;
+        let mut w = ArrowWriter::try_new(file, schema, None)?;
+        w.write(&batch)?;
+        w.close()?;
+        let manifest = avro(
+            r#"{"type": "record", "name": "manifest_entry", "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
+                    {"name": "content", "type": "int"}, {"name": "file_path", "type": "string"},
+                    {"name": "file_format", "type": "string"}, {"name": "record_count", "type": "long"}]}}]}"#,
+            vec![vec![
+                ("status", Avro::Int(1)),
+                (
+                    "data_file",
+                    Avro::Record(vec![
+                        ("content".into(), Avro::Int(1)),
+                        ("file_path".into(), Avro::String(file_path)),
+                        ("file_format".into(), Avro::String("PARQUET".into())),
+                        ("record_count".into(), Avro::Long(deletes.len() as i64)),
+                    ]),
+                ),
+            ]],
+        )?;
+        let path = self.location(&format!("dm{n}.avro"));
+        std::fs::write(&path, manifest)?;
+        if let Ok(mut d) = self.deletes.lock() {
+            d.insert(path.clone());
+        }
         Ok(path)
     }
 
@@ -251,9 +325,10 @@ impl Files {
             manifests
                 .iter()
                 .map(|m| {
+                    let content = i32::from(self.deletes.lock().is_ok_and(|d| d.contains(m)));
                     vec![
                         ("manifest_path", Avro::String(m.clone())),
-                        ("content", Avro::Int(0)),
+                        ("content", Avro::Int(content)),
                         ("added_snapshot_id", Avro::Long(id)),
                     ]
                 })
@@ -266,6 +341,12 @@ impl Files {
         }
         Ok((id, path))
     }
+}
+
+fn data_path_for(dir: &Path, n: i64) -> String {
+    dir.join(format!("d{n}.parquet"))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 // ---------- client ----------
@@ -283,6 +364,8 @@ enum Change {
     Wide(Vec<i64>, usize),
     /// Replace every current manifest with one file holding the same rows.
     Compact(Vec<i64>, Vec<Option<i64>>),
+    /// An explicit new manifest list and operation (scale scenarios).
+    Raw(Vec<String>, &'static str),
 }
 
 impl Bench {
@@ -318,6 +401,7 @@ impl Bench {
                 (m, "append")
             }
             Change::Compact(ids, refs) => (vec![self.files.manifest(ids, refs)?], "replace"),
+            Change::Raw(list, op) => (list.clone(), *op),
             Change::Wide(ids, payload) => {
                 let mut m = current;
                 m.push(
@@ -484,6 +568,7 @@ async fn main() -> Result<(), BoxError> {
         ("direct", "55555555-5555-5555-5555-555555555555"),
         ("free", "66666666-6666-6666-6666-666666666666"),
         ("wide", "77777777-7777-7777-7777-777777777777"),
+        ("big", "88888888-8888-8888-8888-888888888888"),
     ] {
         shared.lock().map_err(|_| "lock")?.tables.insert(
             format!("/v1/namespaces/bench/tables/{name}"),
@@ -518,6 +603,8 @@ async fn main() -> Result<(), BoxError> {
             next: AtomicI64::new(1),
             manifests_of: Mutex::new(HashMap::new()),
             rows_of: Mutex::new(HashMap::new()),
+            data_of: Mutex::new(HashMap::new()),
+            deletes: Mutex::new(std::collections::HashSet::new()),
         }),
     };
     let mut report = String::new();
@@ -526,6 +613,13 @@ async fn main() -> Result<(), BoxError> {
         report.push_str(&s);
         report.push('\n');
     };
+
+    if o.scale > 0 {
+        let report = scale::run(&b, &o).await?;
+        println!("| Scenario | Time | Data | Notes |\n|---|---|---|---|\n{report}");
+        let _ = std::fs::remove_dir_all(&o.dir);
+        return Ok(());
+    }
 
     // 1. Parent data written before the Plane (1 M rows per file), then onboarded.
     let chunk = 1_000_000;

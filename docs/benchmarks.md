@@ -66,6 +66,46 @@ target), multi-node anything.
 | Baseline: the same writers straight to the catalog (no Plane) | end-to-end incl. retries p50 133.7 ms / p99 1.14 s | 68 commits/s | 2219 attempts for 320 commits |
 | Control store after the run | indexes 1028.0 MiB / txn log 64.3 MiB / registry 0.5 MiB | | |
 
+## Large tables (local, `--scale`)
+
+`integrity-bench --scale N --file-rows 1000000` loads N rows in 1 M-row files straight to the
+catalog, onboards a PRIMARY KEY, then measures through the Plane: a copy-on-write delete of one row
+(its 1 M-row file rewritten), compaction of 10 files, and 50 merge-on-read deletes of one row each.
+Peak memory is the benchmark process's peak working set (the Plane runs in it).
+
+### 30 M rows (peak memory 10.2 GB)
+
+| Scenario | Time | Data | Notes |
+|---|---|---|---|
+| Load 30000000 rows in 30 files of 1000000 rows (no Plane) | 1.76 s | | |
+| Onboarding scan of 30000000 keys | 154.73 s | 193892 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.83 s; validation 2.77 s | read 15.9 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 269.8 ms / validation 259.3 ms; last: 161.5 ms / 150.1 ms | read first 8.0 MiB, last 8.1 MiB | |
+| Compaction | skipped: fewer than 10 untouched files | | |
+
+### 60 M rows (peak memory 15.2 GB)
+
+| Scenario | Time | Data | Notes |
+|---|---|---|---|
+| Load 60000000 rows in 60 files of 1000000 rows (no Plane) | 2.80 s | | |
+| Onboarding scan of 60000000 keys | 433.47 s | 138416 keys/s | |
+| Copy-on-write delete of 1 row (rewrites a 1000000-row file) | end-to-end 2.97 s; validation 2.95 s | read 15.9 MiB | status 200 |
+| Compaction of 10 files (10000000 rows) into one | end-to-end 52.33 s; validation 52.32 s | read 158.4 MiB | status 200 |
+| Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 149.9 ms / validation 139.1 ms; last: 1.68 s / 1.67 s | read first 8.0 MiB, last 79.1 MiB | |
+
+What this shows:
+
+- **Onboarding and rebuild hold every key in memory** (about 250–340 bytes per key): 60 M keys need
+  about 15 GB, so a single node of this size cannot onboard much more than 100 M keys. They need a
+  streaming / external-sort build.
+- **Copy-on-write work follows the rewritten file, not the change:** deleting one row of a 1 M-row
+  file validates 2 M keys (before and after), about 3 s.
+- **Compaction** validates about 200 K keys/s on one thread (10 M rows in 52 s), comparable to the
+  engine's own rewrite time for the same data, and needs a larger validation budget than the
+  default for big rewrites.
+- **Merge-on-read** deletes stay at 150–300 ms while the deleted rows sit in 1 M-row files; a delete
+  in a large file reads that file's whole key column (79 MB for a 10 M-row file, 1.7 s).
+
 ## What the Plane adds to Iceberg
 
 | Path | Extra cost | Why |
