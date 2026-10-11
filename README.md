@@ -6,6 +6,39 @@ independent of the writing engine, with verifiable integrity certificates.
 > **Status: pre-alpha (0.0.1), not production-ready.** Do not use this for data you care about.
 > Only what is listed below is implemented, and only within the limits stated in the linked docs.
 
+## When to use it, and when not
+
+The Plane refuses a commit that would break a constraint, before it reaches the catalog; checks
+that run after a commit (dbt tests, data quality jobs) find the bad rows only once readers can see
+them. That is worth a gateway in the commit path for some tables and not for others.
+
+Worth it when:
+
+- **several jobs or engines write the same table** (Spark, Flink, PyIceberg, …): each job's
+  `MERGE` deduplicates only against what it read, so two jobs racing can still commit the same key;
+- **tables reference each other** (orders → customer): Iceberg checks no foreign keys;
+- **a bad commit is expensive**: downstream reports, billing or regulated data, where finding the
+  rows afterwards is already too late;
+- **you need evidence** that each snapshot satisfied its constraints (certificates, `verify`).
+
+Not worth it when:
+
+- one job writes the table and its own `MERGE` already guarantees the key;
+- an occasional duplicate is acceptable and a scheduled check is enough;
+- the table has no meaningful key (logs, raw events);
+- one table takes many small commits per second: commits to one table, and to tables linked by
+  foreign keys, are validated one at a time (about 25–80 commits/s, `docs/benchmarks.md`);
+- the table regularly takes very large commits and their latency matters (see the cost below).
+
+Cost: reads do not go through the Plane, and tables without constraints are forwarded unchanged.
+Each commit to a constrained table is validated before it is forwarded, and today the cost grows
+with the number of keys the commit changes. Measured with Spark on Amazon S3: a statement changing a
+few rows or a few hundred thousand rows takes under a second more, but inserting 1 M rows takes
+11 s instead of 0.7 s, and an initial load of 30 M rows 164 s instead of 6 s
+([`docs/benchmarks.md`](docs/benchmarks.md)). Large batch loads are therefore better done before
+the constraints are registered (onboarding scans existing data at about 700 000 keys/s) or into
+tables that do not need them.
+
 ## Supported features
 
 All of these are covered by tests in this repository; none has been run in production.
