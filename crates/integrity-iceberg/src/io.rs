@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -31,8 +31,9 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// Reads by Iceberg location (object store, local disk, …).
-pub trait FileIo {
+/// Reads by Iceberg location (object store, local disk, …). Independent files are read from
+/// several threads at once ([`concurrently`]).
+pub trait FileIo: Sync {
     /// The contents of the file at `location`.
     fn read(&self, location: &str) -> Result<Bytes, ReadError>;
 
@@ -47,6 +48,52 @@ pub trait FileIo {
         let all = self.read(location)?;
         slice(&all, location, range)
     }
+}
+
+/// Requests in flight at once when reading independent files (manifests, delete files): object
+/// stores answer each in tens of milliseconds, so one at a time a commit touching a few hundred
+/// files waits seconds.
+pub const READ_CONCURRENCY: usize = 16;
+
+/// `f` applied to every item, up to [`READ_CONCURRENCY`] at a time; the results in item order, or
+/// the error of the first failing item in item order (items after a failure are not started).
+pub(crate) fn concurrently<T: Sync, R: Send, E: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> Result<R, E> + Sync,
+) -> Result<Vec<R>, E> {
+    let workers = READ_CONCURRENCY.min(items.len());
+    if workers <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let mut done: Vec<(usize, Result<R, E>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    while !failed.load(Ordering::SeqCst) {
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        let Some(item) = items.get(i) else { break };
+                        let r = f(item);
+                        if r.is_err() {
+                            failed.store(true, Ordering::SeqCst);
+                        }
+                        out.push((i, r));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    // Items are taken in order, so every item before a failed one has a result: the first error
+    // in item order comes before any item that was not started.
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 /// `bytes[range]`, or an error naming `location` if the range is out of bounds.
@@ -161,5 +208,51 @@ impl<I: FileIo + ?Sized> FileIo for Budgeted<'_, I> {
         let bytes = self.inner.read_range(location, range)?;
         self.charge(&bytes)?;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Item `i` takes longer the smaller `i` is, so later items finish first.
+    fn slow(i: &u64) {
+        std::thread::sleep(std::time::Duration::from_millis(40 - *i));
+    }
+
+    #[test]
+    fn concurrent_results_keep_item_order() {
+        let items: Vec<u64> = (0..40).collect();
+        let out = concurrently(&items, |i| {
+            slow(i);
+            Ok::<_, ()>(i * 2)
+        });
+        assert_eq!(out, Ok(items.iter().map(|i| i * 2).collect()));
+        assert_eq!(concurrently(&[] as &[u64], |i| Ok::<_, ()>(*i)), Ok(vec![]));
+    }
+
+    #[test]
+    fn the_first_failing_item_in_order_is_reported() {
+        let items: Vec<u64> = (0..40).collect();
+        for _ in 0..10 {
+            let out = concurrently(&items, |i| {
+                slow(i);
+                if *i == 5 || *i == 30 { Err(*i) } else { Ok(*i) }
+            });
+            assert_eq!(out, Err(5));
+        }
+    }
+
+    #[test]
+    fn items_after_a_failure_are_not_started() {
+        let started = AtomicUsize::new(0);
+        let items: Vec<u64> = (0..1000).collect();
+        let out = concurrently(&items, |i| {
+            started.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if *i == 0 { Err(()) } else { Ok(()) }
+        });
+        assert_eq!(out, Err(()));
+        assert!(started.load(Ordering::SeqCst) < 100);
     }
 }

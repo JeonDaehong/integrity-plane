@@ -1035,3 +1035,179 @@ proptest::proptest! {
         }
     }
 }
+
+/// Counts the requests made through `inner` per location, and the most made at once; each takes
+/// at least `delay` (an object store's round trip).
+struct Requests<'a> {
+    inner: &'a MemoryIo,
+    delay: std::time::Duration,
+    reads: std::sync::Mutex<HashMap<String, usize>>,
+    opens: std::sync::Mutex<HashMap<String, usize>>,
+    in_flight: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> Requests<'a> {
+    fn new(inner: &'a MemoryIo, delay: std::time::Duration) -> Self {
+        Self {
+            inner,
+            delay,
+            reads: Default::default(),
+            opens: Default::default(),
+            in_flight: Default::default(),
+            most: Default::default(),
+        }
+    }
+
+    fn request<T>(&self, f: impl FnOnce() -> T) -> T {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        std::thread::sleep(self.delay);
+        let out = f();
+        self.in_flight.fetch_sub(1, SeqCst);
+        out
+    }
+
+    fn most_at_once(&self) -> usize {
+        self.most.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl FileIo for Requests<'_> {
+    fn read(&self, location: &str) -> Result<Bytes, integrity_iceberg::ReadError> {
+        *self
+            .reads
+            .lock()
+            .unwrap()
+            .entry(location.to_owned())
+            .or_default() += 1;
+        self.request(|| self.inner.read(location))
+    }
+
+    fn size(&self, location: &str) -> Result<u64, integrity_iceberg::ReadError> {
+        *self
+            .opens
+            .lock()
+            .unwrap()
+            .entry(location.to_owned())
+            .or_default() += 1;
+        self.request(|| self.inner.size(location))
+    }
+
+    fn read_range(
+        &self,
+        location: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, integrity_iceberg::ReadError> {
+        self.request(|| self.inner.read_range(location, range))
+    }
+}
+
+/// A merge-on-read table: `files` data files in a manifest each, and `deletes` position delete
+/// files (one per manifest) deleting row 0 of the first data files. Lists `parent.avro` and
+/// `new.avro`; the new snapshot adds one more delete file, for row 1 of `f0.parquet`.
+fn merge_on_read_table(files: usize, deletes: usize) -> Table {
+    let mut t = Table::new();
+    let mut parent: Vec<(String, i32)> = Vec::new();
+    for i in 0..files {
+        let (data, manifest) = (format!("f{i}.parquet"), format!("m{i}.avro"));
+        t.data(&data, &[(2 * i as i64, "eu"), (2 * i as i64 + 1, "us")]);
+        let data: &'static str = Box::leak(data.into_boxed_str());
+        t.manifest(&manifest, &[(1, 0, data, "PARQUET", 2)]);
+        parent.push((manifest, 0));
+    }
+    for k in 0..deletes {
+        let (pos, manifest) = (format!("pos{k}.parquet"), format!("d{k}.avro"));
+        t.positions(&pos, &[(&format!("f{}.parquet", k % files), 0)]);
+        let pos: &'static str = Box::leak(pos.into_boxed_str());
+        t.manifest(&manifest, &[(1, 1, pos, "PARQUET", 1)]);
+        parent.push((manifest, 1));
+    }
+    fn as_refs(v: &[(String, i32)]) -> Vec<(&str, i32)> {
+        v.iter().map(|(m, c)| (m.as_str(), *c)).collect()
+    }
+    t.list("parent.avro", &as_refs(&parent));
+    t.positions("pos-new.parquet", &[("f0.parquet", 1)]);
+    t.manifest("d-new.avro", &[(1, 1, "pos-new.parquet", "PARQUET", 1)]);
+    let mut new = parent;
+    new.push(("d-new.avro".into(), 1));
+    t.list("new.avro", &as_refs(&new));
+    t
+}
+
+/// Rows of both sides of `parent.avro -> new.avro`, streamed through `io`.
+fn streamed_through(io: &impl FileIo) -> (Vec<Vec<Datum>>, Vec<Vec<Datum>>) {
+    let changes = diff_snapshots(io, Some("parent.avro"), "new.avro").unwrap();
+    let columns = [
+        (FieldId(1), LogicalType::Long),
+        (FieldId(2), LogicalType::String),
+    ];
+    let (mut added, mut removed) = (Vec::new(), Vec::new());
+    for_each_commit_batch(io, &changes, &columns, |side, b| {
+        match side {
+            Side::Added => added.extend(b.rows().iter().cloned()),
+            Side::Removed => removed.extend(b.rows().iter().cloned()),
+        }
+        Ok::<_, InspectError>(())
+    })
+    .unwrap();
+    (added, removed)
+}
+
+#[test]
+fn a_merge_on_read_commit_reads_every_file_once() {
+    let t = merge_on_read_table(12, 5);
+    let io = Requests::new(&t.io, std::time::Duration::ZERO);
+    let (added, removed) = streamed_through(&io);
+    assert!(added.is_empty());
+    assert_eq!(removed, [row(1, "us")]);
+    let reads = io.reads.lock().unwrap();
+    for (location, n) in reads.iter() {
+        assert_eq!(*n, 1, "{location} read {n} times");
+    }
+    // Every manifest of both snapshots is needed once delete files exist (the complete picture
+    // of deleted positions), and every delete file.
+    assert_eq!(reads.len(), 2 + 12 + 5 + 1);
+    let opens = io.opens.lock().unwrap();
+    for k in 0..5 {
+        assert_eq!(opens.get(&format!("pos{k}.parquet")), Some(&1), "pos{k}");
+    }
+    assert_eq!(opens.get("pos-new.parquet"), Some(&1));
+}
+
+#[test]
+fn manifests_and_delete_files_are_read_concurrently() {
+    let t = merge_on_read_table(12, 5);
+    let slow = Requests::new(&t.io, std::time::Duration::from_millis(20));
+    let started = std::time::Instant::now();
+    let streamed = streamed_through(&slow);
+    let took = started.elapsed();
+    assert_eq!(streamed, streamed_through(&t.io));
+    assert!(slow.most_at_once() > 1, "requests never overlapped");
+    // One at a time this would be about 2 lists + 17 manifests + 6 delete files of 3 requests
+    // + 1 data file of 3 requests, at 20 ms each: over 0.8 s.
+    assert!(
+        took < std::time::Duration::from_millis(600),
+        "took {took:?}"
+    );
+}
+
+#[test]
+fn of_several_unreadable_manifests_the_first_listed_is_reported() {
+    let mut t = merge_on_read_table(4, 1);
+    t.list(
+        "broken.avro",
+        &[
+            ("m0.avro", 0),
+            ("missing-1.avro", 0),
+            ("m1.avro", 0),
+            ("missing-2.avro", 0),
+            ("d0.avro", 1),
+        ],
+    );
+    for _ in 0..20 {
+        let err = diff_snapshots(&t.io, Some("parent.avro"), "broken.avro").unwrap_err();
+        assert!(err.to_string().contains("missing-1.avro"), "{err}");
+    }
+}

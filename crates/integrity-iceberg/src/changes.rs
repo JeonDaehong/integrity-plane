@@ -9,17 +9,17 @@
 //! live elsewhere therefore counts as added, so its keys are checked again (and duplicate keys are
 //! caught by the validator).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use integrity_core::{CommitRows, Datum, LogicalType, RowBatch, Side};
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 
 use crate::classify::Operation;
-use crate::io::{FileIo, ReadError};
+use crate::io::{FileIo, ReadError, concurrently};
 use crate::manifest::{
-    DataFile, FileContent, ManifestContent, ManifestError, ManifestFile, read_manifest,
-    read_manifest_list,
+    DataFile, FileContent, ManifestContent, ManifestEntry, ManifestError, ManifestFile,
+    read_manifest, read_manifest_list,
 };
 use crate::parquet_keys::{ExtractError, extract_rows_from};
 
@@ -130,15 +130,29 @@ fn manifests(io: &impl FileIo, list: Option<&str>) -> Result<Vec<ManifestFile>, 
     }
 }
 
-/// Live files of `manifests`, keyed by path, with their explicit sequence numbers; a path live
-/// twice is invalid.
-fn live_files(
+/// The entries of every manifest in `paths`, read concurrently, each once.
+fn read_manifests<'a>(
     io: &impl FileIo,
+    paths: Vec<&'a str>,
+) -> Result<HashMap<&'a str, Vec<ManifestEntry>>, InspectError> {
+    let entries = concurrently(&paths, |p| -> Result<_, InspectError> {
+        Ok(read_manifest(&io.read(p)?)?)
+    })?;
+    Ok(paths.into_iter().zip(entries).collect())
+}
+
+/// Live files of `manifests` (whose entries are in `read`), keyed by path, with their explicit
+/// sequence numbers; a path live twice is invalid.
+fn live_files(
+    read: &HashMap<&str, Vec<ManifestEntry>>,
     manifests: &[&ManifestFile],
 ) -> Result<BTreeMap<String, (DataFile, Option<i64>)>, InspectError> {
     let mut out = BTreeMap::new();
     for m in manifests {
-        for entry in read_manifest(&io.read(&m.path)?)? {
+        let entries = read
+            .get(m.path.as_str())
+            .ok_or_else(|| unsupported(format!("manifest {} was not read", m.path)))?;
+        for entry in entries {
             if !entry.status.is_live() {
                 continue;
             }
@@ -154,7 +168,7 @@ fn live_files(
             }
             let path = entry.file.path.clone();
             if out
-                .insert(path.clone(), (entry.file, entry.sequence_number))
+                .insert(path.clone(), (entry.file.clone(), entry.sequence_number))
                 .is_some()
             {
                 return Err(unsupported(format!("file listed twice: {path}")));
@@ -174,8 +188,9 @@ pub fn diff_snapshots(
     parent_list: Option<&str>,
     new_list: &str,
 ) -> Result<FileChanges, InspectError> {
-    let parent = manifests(io, parent_list)?;
-    let new = manifests(io, Some(new_list))?;
+    let mut lists = concurrently(&[parent_list, Some(new_list)], |l| manifests(io, *l))?;
+    let new = lists.pop().unwrap_or_default();
+    let parent = lists.pop().unwrap_or_default();
     let parent_paths: BTreeSet<&str> = parent.iter().map(|m| m.path.as_str()).collect();
     let new_paths: BTreeSet<&str> = new.iter().map(|m| m.path.as_str()).collect();
     if parent_paths.len() != parent.len() || new_paths.len() != new.len() {
@@ -191,8 +206,29 @@ pub fn diff_snapshots(
         .filter(|m| !parent_paths.contains(m.path.as_str()))
         .collect();
 
-    let before = live_files(io, &dropped)?;
-    let after = live_files(io, &introduced)?;
+    // With delete manifests on either side, position deletes need the complete picture: every
+    // live delete file (unchanged ones included) and every data file kept by the commit.
+    let any_deletes = parent
+        .iter()
+        .chain(new.iter())
+        .any(|m| m.content == ManifestContent::Deletes);
+    // Every manifest needed below, read once: all of both snapshots, or only the changed ones.
+    let mut needed: Vec<&str> = Vec::new();
+    if any_deletes {
+        needed.extend(parent.iter().map(|m| m.path.as_str()));
+        needed.extend(
+            new.iter()
+                .map(|m| m.path.as_str())
+                .filter(|p| !parent_paths.contains(p)),
+        );
+    } else {
+        needed.extend(dropped.iter().map(|m| m.path.as_str()));
+        needed.extend(introduced.iter().map(|m| m.path.as_str()));
+    }
+    let read = read_manifests(io, needed)?;
+
+    let before = live_files(&read, &dropped)?;
+    let after = live_files(&read, &introduced)?;
     let unchanged =
         |path: &str, file: &DataFile, other: &Live| other.get(path).is_some_and(|(f, _)| f == file);
 
@@ -234,16 +270,10 @@ pub fn diff_snapshots(
         }
     }
 
-    // With delete manifests on either side, position deletes need the complete picture: every
-    // live delete file (unchanged ones included) and every data file kept by the commit.
-    let any_deletes = parent
-        .iter()
-        .chain(new.iter())
-        .any(|m| m.content == ManifestContent::Deletes);
     let (parent_all, new_all) = if any_deletes {
         (
-            live_files(io, &parent.iter().collect::<Vec<_>>())?,
-            live_files(io, &new.iter().collect::<Vec<_>>())?,
+            live_files(&read, &parent.iter().collect::<Vec<_>>())?,
+            live_files(&read, &new.iter().collect::<Vec<_>>())?,
         )
     } else {
         (Live::new(), Live::new())
@@ -410,22 +440,7 @@ pub fn commit_rows(
     };
 
     // Position deletes (ADR 0017): deleted positions per data file, before and after.
-    let mut by_file: HashMap<String, BTreeMap<String, BTreeSet<i64>>> = HashMap::new();
-    let mut deleted =
-        |files: &[DataFile]| -> Result<BTreeMap<String, BTreeSet<i64>>, InspectError> {
-            let mut out: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
-            for f in files {
-                if !by_file.contains_key(&f.path) {
-                    by_file.insert(f.path.clone(), position_deletes(io, f)?);
-                }
-                for (path, positions) in &by_file[&f.path] {
-                    out.entry(path.clone()).or_default().extend(positions);
-                }
-            }
-            Ok(out)
-        };
-    let before = deleted(&pd.before)?;
-    let after = deleted(&pd.after)?;
+    let (before, after) = deleted_positions(io, pd)?;
     let empty = BTreeSet::new();
     let live =
         |file: &DataFile, gone: &BTreeSet<i64>, batch: &mut RowBatch| -> Result<(), InspectError> {
@@ -511,23 +526,7 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
     let empty = BTreeSet::new();
     let (before, after) = match &changes.positions {
         None => (HashMap::new(), HashMap::new()),
-        Some(pd) => {
-            let mut by_file: HashMap<String, BTreeMap<String, BTreeSet<i64>>> = HashMap::new();
-            let mut deleted =
-                |files: &[DataFile]| -> Result<HashMap<String, BTreeSet<i64>>, InspectError> {
-                    let mut out: HashMap<String, BTreeSet<i64>> = HashMap::new();
-                    for d in files {
-                        if !by_file.contains_key(&d.path) {
-                            by_file.insert(d.path.clone(), position_deletes(io, d)?);
-                        }
-                        for (path, positions) in &by_file[&d.path] {
-                            out.entry(path.clone()).or_default().extend(positions);
-                        }
-                    }
-                    Ok(out)
-                };
-            (deleted(&pd.before)?, deleted(&pd.after)?)
-        }
+        Some(pd) => deleted_positions(io, pd)?,
     };
     // Live rows of whole data files.
     for (side, files, gone) in [
@@ -699,6 +698,37 @@ fn is_deletion_vector(f: &DataFile) -> bool {
         && f.content_offset.is_some()
         && f.content_size_in_bytes.is_some()
 }
+
+/// Deleted positions per data file path before and after the commit. Each delete file is read
+/// once, concurrently with the others.
+fn deleted_positions(
+    io: &impl FileIo,
+    pd: &PositionDeletes,
+) -> Result<(Deleted, Deleted), InspectError> {
+    let mut seen = HashSet::new();
+    let distinct: Vec<&DataFile> = pd
+        .before
+        .iter()
+        .chain(&pd.after)
+        .filter(|d| seen.insert(d.path.as_str()))
+        .collect();
+    let read = concurrently(&distinct, |d| position_deletes(io, d))?;
+    let by_file: HashMap<&str, BTreeMap<String, BTreeSet<i64>>> =
+        distinct.iter().map(|d| d.path.as_str()).zip(read).collect();
+    let side = |files: &[DataFile]| {
+        let mut out = Deleted::new();
+        for d in files {
+            for (path, positions) in by_file.get(d.path.as_str()).into_iter().flatten() {
+                out.entry(path.clone()).or_default().extend(positions);
+            }
+        }
+        out
+    };
+    Ok((side(&pd.before), side(&pd.after)))
+}
+
+/// Deleted positions per data file path.
+type Deleted = HashMap<String, BTreeSet<i64>>;
 
 /// Reads a position delete file or deletion vector: deleted positions per data file path.
 fn position_deletes(
