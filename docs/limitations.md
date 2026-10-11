@@ -70,10 +70,11 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   catalog prefix), Lakekeeper 0.13 and Nessie 0.108. On Nessie, `verify` cannot recompute
   certificates (the catalog serves only the current snapshot). The client tests use S3 through
   SeaweedFS (MinIO no longer publishes container images); AWS S3 was used only by the benchmarks.
-- Validating a commit costs about 5–11 µs per row it adds or removes (per-key in-memory maps and
-  index updates): with Spark on S3, inserting 1 M rows takes 11 s through the Plane against 0.7 s
-  directly, an initial load of 30 M rows 164 s against 6 s (`docs/benchmarks.md`). Its memory also
-  grows with the keys the commit changes (unlike copy-on-write rewrites and compactions, whose
+- Validating a commit costs time per row it adds, removes or rewrites: with Spark on S3,
+  inserting 1 M rows takes 6.3 s through the Plane against 0.7 s directly, an initial load of
+  30 M rows 72 s against 6 s, compacting 33 M rows 104 s against 31 s (`docs/benchmarks.md`).
+  Writing the index of every added key and sorting every key of a rewrite dominate. A commit's
+  memory also grows with the keys it changes (unlike copy-on-write rewrites and compactions, whose
   unchanged keys cancel out).
 - Commits to a table with position delete files read every manifest of both snapshots and every
   live position delete file (each once, 16 at a time; ADR 0020), so their cost grows with the
