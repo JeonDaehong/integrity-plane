@@ -20,7 +20,7 @@ use crate::{IndexError, Result};
 /// Runs merged at once.
 const FAN_IN: usize = 64;
 /// Bytes per buffered key on top of its length (its span).
-const PER_KEY: usize = std::mem::size_of::<(usize, u32)>();
+const PER_KEY: usize = std::mem::size_of::<Span>();
 /// Write and read buffer of each run file.
 const IO_BUFFER: usize = 64 * 1024;
 
@@ -81,12 +81,28 @@ impl Drop for Spill {
     }
 }
 
-/// Keys packed into one allocation: their bytes back to back, and an `(offset, length)` span
-/// per key. Millions of keys cost two allocations, not one each.
+/// Where one buffered key is, with its first 8 bytes as a big-endian number (zero-padded): most
+/// comparisons are decided by the prefix without touching the key bytes.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    prefix: u64,
+    offset: usize,
+    len: u32,
+}
+
+fn prefix(bytes: &[u8]) -> u64 {
+    let mut p = [0u8; 8];
+    let n = bytes.len().min(8);
+    p[..n].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(p)
+}
+
+/// Keys packed into one allocation: their bytes back to back, and a [`Span`] per key. Millions
+/// of keys cost two allocations, not one each.
 #[derive(Debug, Default)]
 struct Packed {
     data: Vec<u8>,
-    spans: Vec<(usize, u32)>,
+    spans: Vec<Span>,
 }
 
 /// The capacity a vector grows to when it must hold `needed` elements (doubling, as `Vec` does).
@@ -113,7 +129,11 @@ impl Packed {
         self.data.reserve_exact(data - self.data.len());
         let spans = grown(self.spans.capacity(), self.spans.len() + 1);
         self.spans.reserve_exact(spans - self.spans.len());
-        self.spans.push((self.data.len(), len));
+        self.spans.push(Span {
+            prefix: prefix(bytes),
+            offset: self.data.len(),
+            len,
+        });
         self.data.extend_from_slice(bytes);
         Ok(())
     }
@@ -122,15 +142,17 @@ impl Packed {
         self.spans.is_empty()
     }
 
-    fn key(&self, (offset, len): (usize, u32)) -> &[u8] {
-        &self.data[offset..offset + len as usize]
+    fn key(&self, span: Span) -> &[u8] {
+        &self.data[span.offset..span.offset + span.len as usize]
     }
 
+    /// Sorts the spans in byte order of their keys. Equal prefixes do not mean equal keys (a
+    /// shorter key is padded with zeros), so ties compare the bytes.
     fn sort(&mut self) {
         let data = &self.data;
-        self.spans.sort_unstable_by(|&(a, la), &(b, lb)| {
-            data[a..a + la as usize].cmp(&data[b..b + lb as usize])
-        });
+        let bytes = |s: &Span| &data[s.offset..s.offset + s.len as usize];
+        self.spans
+            .sort_unstable_by(|a, b| a.prefix.cmp(&b.prefix).then_with(|| bytes(a).cmp(bytes(b))));
     }
 
     /// The distinct keys from span `at` on, collapsed: the next key and its count, and where the
@@ -139,7 +161,10 @@ impl Packed {
         let first = *self.spans.get(at)?;
         let key = self.key(first);
         let mut end = at + 1;
-        while end < self.spans.len() && self.key(self.spans[end]) == key {
+        while end < self.spans.len()
+            && self.spans[end].prefix == first.prefix
+            && self.key(self.spans[end]) == key
+        {
             end += 1;
         }
         Some((key, (end - at) as u64, end))
@@ -235,14 +260,14 @@ impl KeySorter {
                 _spill: None,
             });
         }
-        self.spill_buffer()?;
         let Some(mut spill) = self.spill.take() else {
             return Err(IndexError::Corrupt);
         };
-        // The buffer is not needed any more: free it before merging.
-        self.buffer = Packed::default();
+        // The last buffer joins the final merge from memory instead of a run file.
+        let mut last = std::mem::take(&mut self.buffer);
+        last.sort();
         let mut runs = std::mem::take(&mut self.runs);
-        while runs.len() > FAN_IN {
+        while runs.len() >= FAN_IN {
             let mut merged = Vec::new();
             for group in runs.chunks(FAN_IN) {
                 let merge = Merge::open(group)?;
@@ -253,53 +278,76 @@ impl KeySorter {
             }
             runs = merged;
         }
+        let mut merge = Merge::open(&runs)?;
+        merge.add(Source::Memory {
+            packed: last,
+            at: 0,
+        })?;
         Ok(SortedBytes {
-            inner: Inner::Merge(Merge::open(&runs)?),
+            inner: Inner::Merge(merge),
             _spill: Some(spill),
         })
     }
 }
 
-/// Reads the records of one run file.
-struct Run(BufReader<File>);
+/// Records to merge: a run file, or the sorted last buffer.
+enum Source {
+    Run(BufReader<File>),
+    Memory { packed: Packed, at: usize },
+}
 
-impl Run {
+impl Source {
     fn next(&mut self) -> Result<Option<(Vec<u8>, u64)>> {
+        let run = match self {
+            Source::Run(r) => r,
+            Source::Memory { packed, at } => {
+                return Ok(packed.next_from(*at).map(|(key, count, next)| {
+                    *at = next;
+                    (key.to_vec(), count)
+                }));
+            }
+        };
         let mut len = [0u8; 4];
-        match self.0.read_exact(&mut len) {
+        match run.read_exact(&mut len) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(io(e)),
         }
         let mut key = vec![0u8; u32::from_le_bytes(len) as usize];
-        self.0.read_exact(&mut key).map_err(io)?;
+        run.read_exact(&mut key).map_err(io)?;
         let mut count = [0u8; 8];
-        self.0.read_exact(&mut count).map_err(io)?;
+        run.read_exact(&mut count).map_err(io)?;
         Ok(Some((key, u64::from_le_bytes(count))))
     }
 }
 
 /// K-way merge of run files, summing the counts of equal keys.
 struct Merge {
-    runs: Vec<Run>,
+    runs: Vec<Source>,
     heap: BinaryHeap<Reverse<(Vec<u8>, usize, u64)>>,
 }
 
 impl Merge {
     fn open(paths: &[PathBuf]) -> Result<Self> {
-        let mut runs = Vec::with_capacity(paths.len());
-        let mut heap = BinaryHeap::with_capacity(paths.len());
-        for (i, path) in paths.iter().enumerate() {
-            let mut run = Run(BufReader::with_capacity(
+        let mut merge = Self {
+            runs: Vec::with_capacity(paths.len() + 1),
+            heap: BinaryHeap::with_capacity(paths.len() + 1),
+        };
+        for path in paths {
+            merge.add(Source::Run(BufReader::with_capacity(
                 IO_BUFFER,
                 File::open(path).map_err(io)?,
-            ));
-            if let Some((key, count)) = run.next()? {
-                heap.push(Reverse((key, i, count)));
-            }
-            runs.push(run);
+            )))?;
         }
-        Ok(Self { runs, heap })
+        Ok(merge)
+    }
+
+    fn add(&mut self, mut source: Source) -> Result<()> {
+        if let Some((key, count)) = source.next()? {
+            self.heap.push(Reverse((key, self.runs.len(), count)));
+        }
+        self.runs.push(source);
+        Ok(())
     }
 
     fn advance(&mut self, run: usize) -> Result<()> {
@@ -381,7 +429,7 @@ impl Iterator for SortedKeys {
     fn next(&mut self) -> Option<Self::Item> {
         let record = self.0.next()?;
         Some(record.and_then(|(key, count)| {
-            EncodedKey::from_bytes(&key)
+            EncodedKey::from_vec(key)
                 .map(|k| (k, count))
                 .map_err(|_| IndexError::Corrupt)
         }))
@@ -438,6 +486,38 @@ mod tests {
             // Run files are gone once the keys are consumed and dropped.
             let leftover = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
             prop_assert_eq!(leftover, 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Byte strings that share prefixes, contain zero bytes and differ in length (where a
+    /// comparison by fixed-size prefix could go wrong), at any budget.
+    fn bytes() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(
+            prop_oneof![Just(0u8), Just(1u8), Just(0xff), any::<u8>()],
+            0..12,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config { cases: 256, ..Default::default() })]
+
+        #[test]
+        fn byte_strings_come_out_in_byte_order(
+            values in proptest::collection::vec(bytes(), 0..200),
+            budget in 1usize..4000,
+        ) {
+            let mut want: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+            for v in &values {
+                *want.entry(v.clone()).or_default() += 1;
+            }
+            let dir = temp();
+            let mut s = KeySorter::new(&dir, budget);
+            for v in &values {
+                s.push_bytes(v).unwrap();
+            }
+            let got = s.finish_bytes().unwrap().collect::<Result<Vec<_>>>().unwrap();
+            prop_assert_eq!(got, want.into_iter().collect::<Vec<_>>());
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

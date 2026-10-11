@@ -127,21 +127,29 @@ pub enum Side {
 /// (a `replace` must not change any row). `Opaque` cells are equal to each other, as with `==`.
 pub fn encode_row(row: &[Datum]) -> Result<Vec<u8>, crate::key::KeyError> {
     let mut out = Vec::new();
+    encode_row_into(row, &mut out);
+    Ok(out)
+}
+
+/// [`encode_row`] into `out` (cleared first), reusing its allocation: one buffer serves every row
+/// of a commit.
+pub fn encode_row_into(row: &[Datum], out: &mut Vec<u8>) {
+    out.clear();
     for cell in row {
         match cell {
             Datum::Null => out.push(0),
             Datum::Opaque => out.push(1),
             Datum::Value(v) => {
-                let schema = crate::key::KeySchema::new(vec![v.family()])?;
-                let key = crate::key::EncodedKey::encode(&schema, &[Some(v.clone())])?;
-                let bytes = key.as_bytes();
+                // Tag, then the value as a one-column key, prefixed with its length.
                 out.push(2);
-                out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-                out.extend_from_slice(bytes);
+                let at = out.len();
+                out.extend_from_slice(&[0; 8]);
+                crate::key::encode_single(v, out);
+                let len = (out.len() - at - 8) as u64;
+                out[at..at + 8].copy_from_slice(&len.to_be_bytes());
             }
         }
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -182,6 +190,56 @@ mod tests {
                     a == b,
                     "{a:?} / {b:?}"
                 );
+            }
+        }
+    }
+
+    /// The encoding as first defined: each value as a one-column key of its own family.
+    fn reference(row: &[Datum]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for cell in row {
+            match cell {
+                Datum::Null => out.push(0),
+                Datum::Opaque => out.push(1),
+                Datum::Value(v) => {
+                    let schema = crate::key::KeySchema::new(vec![v.family()]).unwrap();
+                    let key = crate::key::EncodedKey::encode(&schema, &[Some(v.clone())]).unwrap();
+                    out.push(2);
+                    out.extend_from_slice(&(key.as_bytes().len() as u64).to_be_bytes());
+                    out.extend_from_slice(key.as_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    fn datum() -> impl proptest::strategy::Strategy<Value = Datum> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(Datum::Null),
+            Just(Datum::Opaque),
+            any::<bool>().prop_map(|b| Datum::Value(KeyValue::Boolean(b))),
+            any::<i64>().prop_map(|v| Datum::Value(KeyValue::Integer(v))),
+            any::<i32>().prop_map(|v| Datum::Value(KeyValue::Date(v))),
+            (any::<i128>(), 0u8..20)
+                .prop_map(|(unscaled, scale)| Datum::Value(KeyValue::Decimal { unscaled, scale })),
+            any::<i128>().prop_map(|v| Datum::Value(KeyValue::Timestamp(v))),
+            any::<i128>().prop_map(|v| Datum::Value(KeyValue::TimestampTz(v))),
+            ".{0,6}".prop_map(|s| Datum::Value(KeyValue::String(s))),
+            proptest::collection::vec(any::<u8>(), 0..6)
+                .prop_map(|b| Datum::Value(KeyValue::Binary(b))),
+            any::<[u8; 16]>().prop_map(|u| Datum::Value(KeyValue::Uuid(u))),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn row_encoding_is_unchanged(rows in proptest::collection::vec(proptest::collection::vec(datum(), 0..5), 1..6)) {
+            let mut buf = Vec::new();
+            for row in &rows {
+                encode_row_into(row, &mut buf);
+                proptest::prop_assert_eq!(&buf, &reference(row));
+                proptest::prop_assert_eq!(encode_row(row).unwrap(), reference(row));
             }
         }
     }

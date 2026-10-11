@@ -249,8 +249,14 @@ impl EncodedKey {
 
     /// Validates bytes (e.g. read back from an index backend) as a canonical v1 key.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        decode(bytes)?;
+        check(bytes)?;
         Ok(Self(bytes.into()))
+    }
+
+    /// [`EncodedKey::from_bytes`] taking ownership: no copy when `bytes` has no spare capacity.
+    pub fn from_vec(bytes: Vec<u8>) -> Result<Self, DecodeError> {
+        check(&bytes)?;
+        Ok(Self(bytes.into_boxed_slice()))
     }
 
     /// Decodes into the schema and values it was encoded from.
@@ -268,6 +274,19 @@ impl fmt::Debug for EncodedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "EncodedKey(<{} bytes>)", self.0.len())
     }
+}
+
+/// Appends to `out` exactly the bytes of `EncodedKey::encode` for a one-column key of `value`'s
+/// own family holding `value`, without the allocations of building a schema and a key.
+pub(crate) fn encode_single(value: &KeyValue, out: &mut Vec<u8>) {
+    let family = value.family();
+    out.push(KEY_FORMAT_VERSION);
+    out.push(family.tag());
+    if let TypeFamily::Decimal { scale } = family {
+        out.push(scale);
+    }
+    out.push(PRESENT);
+    encode_value(value, out);
 }
 
 fn encode_value(value: &KeyValue, out: &mut Vec<u8>) {
@@ -355,6 +374,29 @@ impl<'a> Reader<'a> {
         Ok(*head)
     }
 
+    /// Reads past an escaped value like [`Reader::escaped`], failing the same way; with `utf8`,
+    /// also as `String::from_utf8` of the unescaped bytes would (after the terminator). The
+    /// unescaped bytes are the stretches between escapes joined by single zero bytes, and a zero
+    /// byte is a whole UTF-8 character, so they are valid iff every stretch is.
+    fn skip_escaped(&mut self, utf8: bool) -> Result<(), DecodeError> {
+        let mut valid = true;
+        loop {
+            let at = self
+                .bytes
+                .iter()
+                .position(|&b| b == ESCAPE)
+                .ok_or(DecodeError::Truncated)?;
+            valid &= !utf8 || std::str::from_utf8(&self.bytes[..at]).is_ok();
+            self.bytes = &self.bytes[at + 1..];
+            match self.byte()? {
+                TERMINATOR if valid => return Ok(()),
+                TERMINATOR => return Err(DecodeError::InvalidUtf8),
+                ESCAPED_ZERO => {}
+                _ => return Err(DecodeError::InvalidEscape),
+            }
+        }
+    }
+
     fn escaped(&mut self) -> Result<Vec<u8>, DecodeError> {
         let mut out = Vec::new();
         loop {
@@ -370,6 +412,54 @@ impl<'a> Reader<'a> {
             }
         }
     }
+}
+
+/// Whether `bytes` decode ([`decode`]), with the same error, without building the values: keys
+/// read back from sort runs and index files are checked one by one.
+fn check(bytes: &[u8]) -> Result<(), DecodeError> {
+    let mut r = Reader { bytes };
+    let version = r.byte().map_err(|_| DecodeError::Empty)?;
+    if version != KEY_FORMAT_VERSION {
+        return Err(DecodeError::UnsupportedVersion(version));
+    }
+    if r.bytes.is_empty() {
+        return Err(DecodeError::Empty);
+    }
+    while !r.bytes.is_empty() {
+        let tag = r.byte()?;
+        if tag == 0x03 {
+            r.byte()?; // scale
+        } else if !(0x01..=0x09).contains(&tag) {
+            return Err(DecodeError::UnknownTag(tag));
+        }
+        match r.byte()? {
+            NULL => {}
+            PRESENT => match tag {
+                0x01 => {
+                    let b = r.byte()?;
+                    if b > 0x01 {
+                        return Err(DecodeError::InvalidBoolean(b));
+                    }
+                }
+                0x02 => {
+                    r.array::<8>()?;
+                }
+                0x03 | 0x05 | 0x06 => {
+                    r.array::<16>()?;
+                }
+                0x04 => {
+                    r.array::<4>()?;
+                }
+                0x07 => r.skip_escaped(true)?,
+                0x08 => r.skip_escaped(false)?,
+                _ => {
+                    r.array::<16>()?;
+                }
+            },
+            m => return Err(DecodeError::InvalidNullMarker(m)),
+        }
+    }
+    Ok(())
 }
 
 fn decode(bytes: &[u8]) -> Result<(KeySchema, Vec<Option<KeyValue>>), DecodeError> {
@@ -433,4 +523,96 @@ fn decode_value(family: TypeFamily, r: &mut Reader<'_>) -> Result<KeyValue, Deco
         TypeFamily::Binary => KeyValue::Binary(r.escaped()?),
         TypeFamily::Uuid => KeyValue::Uuid(r.array()?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Payload bytes: escapes, UTF-8 lead and continuation bytes, booleans.
+    fn payload() -> impl Strategy<Value = Vec<u8>> {
+        let byte = prop_oneof![
+            Just(0x00),
+            Just(0x01),
+            Just(0x02),
+            Just(0xff),
+            Just(0x80),
+            Just(0xc3),
+            Just(0xe2),
+            Just(b'a'),
+            any::<u8>(),
+        ];
+        prop_oneof![
+            // Fixed-size values, sometimes a byte short or long.
+            (
+                prop_oneof![
+                    Just(1usize),
+                    Just(3),
+                    Just(4),
+                    Just(5),
+                    Just(7),
+                    Just(8),
+                    Just(9),
+                    Just(15),
+                    Just(16),
+                    Just(17)
+                ],
+                any::<u8>()
+            )
+                .prop_map(|(n, b)| vec![b; n]),
+            // Escaped values: content, then usually a terminator.
+            (proptest::collection::vec(byte, 0..8), any::<bool>()).prop_map(|(mut v, end)| {
+                if end {
+                    v.extend_from_slice(&[0x00, 0x00]);
+                }
+                v
+            }),
+        ]
+    }
+
+    /// Byte strings built column by column like keys (tag, scale, NULL marker, value), with
+    /// wrong tags, markers and lengths mixed in, and sometimes cut short.
+    fn near_keys() -> impl Strategy<Value = Vec<u8>> {
+        let tag = prop_oneof![1u8..=9, Just(0u8), Just(0x0a)];
+        let marker = prop_oneof![Just(0u8), Just(1u8), Just(1u8), Just(1u8), Just(2u8)];
+        let column = (tag, any::<u8>(), marker, payload());
+        (
+            proptest::collection::vec(column, 0..4),
+            any::<prop::sample::Index>(),
+            any::<bool>(),
+        )
+            .prop_map(|(columns, cut, truncate)| {
+                let mut v = vec![KEY_FORMAT_VERSION];
+                for (tag, scale, marker, payload) in columns {
+                    v.push(tag);
+                    if tag == 0x03 {
+                        v.push(scale);
+                    }
+                    v.push(marker);
+                    if marker == 1 {
+                        v.extend_from_slice(&payload);
+                    }
+                }
+                if truncate {
+                    v.truncate(cut.index(v.len() + 1));
+                }
+                v
+            })
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config { cases: 4096, ..Default::default() })]
+
+        #[test]
+        fn check_agrees_with_decode(bytes in near_keys()) {
+            prop_assert_eq!(check(&bytes), decode(&bytes).map(|_| ()));
+        }
+
+        #[test]
+        fn check_agrees_with_decode_on_any_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..24)) {
+            prop_assert_eq!(check(&bytes), decode(&bytes).map(|_| ()));
+        }
+    }
 }

@@ -118,15 +118,16 @@ impl Plan {
         let (Some(schema), Some(role)) = (&rc.schema, c.kind.key_role()) else {
             return Err(ValidationError::Unprovable(c.id));
         };
-        for tuple in tuples(added, key)? {
-            let tuple = tuple?;
-            match classify(role, schema, &tuple).map_err(|e| malformed(e, key))? {
+        for_each_tuple(added, key, |tuple| {
+            match classify(role, schema, tuple).map_err(|e| malformed(e, key))? {
                 KeyDisposition::Key(k) => emit(k)?,
                 KeyDisposition::Exempt => {}
-                KeyDisposition::Violation(code) => self.record_row(c.id, code, Some(tuple)),
+                KeyDisposition::Violation(code) => {
+                    self.record_row(c.id, code, Some(tuple.to_vec()));
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn key_delta(
@@ -159,9 +160,8 @@ impl Plan {
         let (Some(schema), Some(role)) = (&rc.schema, c.kind.key_role()) else {
             return Err(ValidationError::Unprovable(c.id));
         };
-        for tuple in tuples(removed, key)? {
-            let tuple = tuple?;
-            match classify(role, schema, &tuple).map_err(|e| malformed(e, key))? {
+        for_each_tuple(removed, key, |tuple| {
+            match classify(role, schema, tuple).map_err(|e| malformed(e, key))? {
                 KeyDisposition::Key(k) => emit(k)?,
                 KeyDisposition::Exempt => {}
                 // A committed row cannot violate an enforced constraint by its NULLs alone.
@@ -171,7 +171,8 @@ impl Plan {
                     ));
                 }
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -189,27 +190,32 @@ fn column(batch: &RowBatch, field: FieldId) -> Result<Option<usize>, ValidationE
 
 pub(crate) type Tuple = Vec<Option<KeyValue>>;
 
-/// The key tuple of every row in `batch`.
-fn tuples<'b>(
-    batch: &'b RowBatch,
-    key: &'b KeySpec,
-) -> Result<impl Iterator<Item = Result<Tuple, ValidationError>> + 'b, ValidationError> {
+/// Calls `f` with the key tuple of every row in `batch`, in row order, reusing one buffer.
+fn for_each_tuple(
+    batch: &RowBatch,
+    key: &KeySpec,
+    mut f: impl FnMut(&[Option<KeyValue>]) -> Result<(), ValidationError>,
+) -> Result<(), ValidationError> {
     let cols = key
         .columns
         .iter()
         .map(|&f| Ok((f, column(batch, f)?)))
         .collect::<Result<Vec<_>, ValidationError>>()?;
-    Ok(batch.rows().iter().map(move |row| {
-        cols.iter()
-            .map(|&(field, i)| match i.map(|i| &row[i]) {
-                Some(Datum::Value(v)) => Ok(Some(v.clone())),
-                Some(Datum::Null) => Ok(None),
+    let mut tuple: Tuple = Vec::with_capacity(cols.len());
+    for row in batch.rows() {
+        tuple.clear();
+        for &(field, i) in &cols {
+            tuple.push(match i.map(|i| &row[i]) {
+                Some(Datum::Value(v)) => Some(v.clone()),
+                Some(Datum::Null) => None,
                 Some(Datum::Opaque) | None => {
-                    Err(ValidationError::MalformedValue { field: Some(field) })
+                    return Err(ValidationError::MalformedValue { field: Some(field) });
                 }
-            })
-            .collect()
-    }))
+            });
+        }
+        f(&tuple)?;
+    }
+    Ok(())
 }
 
 fn malformed(e: KeyError, key: &KeySpec) -> ValidationError {

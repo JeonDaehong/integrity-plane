@@ -11,8 +11,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 
-use integrity_core::{EncodedKey, LogicalType, Side, Violation, encode_row};
+use integrity_core::{EncodedKey, LogicalType, RowBatch, Side, Violation, encode_row_into};
 use integrity_iceberg::{
     Budgeted, FileChanges, FileIo, InspectError, MainChange, NewSnapshot, Operation, TableMetadata,
     check_operation, check_sides, commit_rows, diff_snapshots, for_each_commit_batch,
@@ -274,6 +276,8 @@ pub struct Streamed<'a> {
 enum Failed {
     Inspect(InspectError),
     Api(ApiError),
+    /// The consumer of the rows stopped (and reports why).
+    Stopped,
 }
 
 impl From<InspectError> for Failed {
@@ -287,9 +291,15 @@ impl From<Failed> for ApiError {
         match f {
             Failed::Inspect(e) => ApiError::new(e.code(), e.to_string()),
             Failed::Api(e) => e,
+            Failed::Stopped => {
+                ApiError::new(ErrorCode::IndexDegraded, "validation stopped reading")
+            }
         }
     }
 }
+
+/// Batches of rows buffered between the reading thread and each consumer.
+const QUEUED_BATCHES: usize = 4;
 
 fn spill(e: IndexError) -> ApiError {
     ApiError::new(ErrorCode::IndexDegraded, format!("validation sort: {e}"))
@@ -341,63 +351,98 @@ impl Streamed<'_> {
             .collect();
         let mut rows_of = replace.then(|| Sides::new(self.scratch, budget));
         let (mut adds, mut removes, mut read) = (false, false, 0u64);
-
-        for_each_commit_batch(io, changes, self.columns, |side, batch| {
-            read += batch.len() as u64;
-            match side {
-                Side::Added => adds = true,
-                Side::Removed => removes = true,
-            }
-            if let Some(rows) = &mut rows_of {
-                let sorter = rows.side(side);
-                for row in batch.rows() {
-                    let bytes = encode_row(row).map_err(|e| {
-                        Failed::Api(ApiError::new(
-                            ErrorCode::UnsupportedCommitOperation,
-                            format!("row encoding: {e}"),
-                        ))
-                    })?;
-                    sorter
-                        .push_bytes(&bytes)
-                        .map_err(|e| Failed::Api(spill(e)))?;
+        // Three threads: one decodes the files, one encodes and sorts the rows of a `replace`,
+        // and this one checks and sorts the keys, in the order the files are read. Each channel
+        // holds a few batches, so memory stays bounded.
+        std::thread::scope(|s| -> Result<(), ApiError> {
+            let (send_batch, batches) = sync_channel::<(Side, Arc<RowBatch>)>(QUEUED_BATCHES);
+            let reader = s.spawn(move || {
+                for_each_commit_batch(io, changes, self.columns, |side, batch| {
+                    send_batch
+                        .send((side, Arc::new(batch)))
+                        .map_err(|_| Failed::Stopped)
+                })
+            });
+            let (send_rows, rows) = sync_channel::<(Side, Arc<RowBatch>)>(QUEUED_BATCHES);
+            let row_sorter = rows_of.take().map(|mut sides| {
+                s.spawn(move || -> Result<Sides, ApiError> {
+                    let mut bytes = Vec::new();
+                    for (side, batch) in rows {
+                        let sorter = sides.side(side);
+                        for row in batch.rows() {
+                            encode_row_into(row, &mut bytes);
+                            sorter.push_bytes(&bytes).map_err(spill)?;
+                        }
+                    }
+                    Ok(sides)
+                })
+            });
+            let mut fed = Ok(());
+            // Leaving the loop early drops the receiver, which stops the reader.
+            for (side, batch) in batches {
+                read += batch.len() as u64;
+                match side {
+                    Side::Added => adds = true,
+                    Side::Removed => removes = true,
+                }
+                // A row sorter that stopped reports its error below.
+                if row_sorter.is_some() && send_rows.send((side, Arc::clone(&batch))).is_err() {
+                    break;
+                }
+                fed = scan.feed(side, &batch, |id, key| -> Result<(), ApiError> {
+                    keys.get_mut(&id)
+                        .ok_or_else(|| invalid(ValidationError::MissingIndex(id)))?
+                        .side(side)
+                        .push(&key)
+                        .map_err(spill)
+                });
+                if fed.is_err() {
+                    break;
                 }
             }
-            scan.feed(side, &batch, |id, key| -> Result<(), ApiError> {
-                keys.get_mut(&id)
-                    .ok_or_else(|| invalid(ValidationError::MissingIndex(id)))?
-                    .side(side)
-                    .push(&key)
-                    .map_err(spill)
-            })
-            .map_err(Failed::Api)
+            drop(send_rows);
+            let sorted_rows = row_sorter.map(joined);
+            let read_all = joined(reader);
+            fed?;
+            if let Some(sides) = sorted_rows {
+                rows_of = Some(sides?);
+            }
+            match read_all {
+                Ok(()) => Ok(()),
+                Err(Failed::Stopped) => Err(ApiError::new(
+                    ErrorCode::IndexDegraded,
+                    "validation stopped reading",
+                )),
+                Err(f) => Err(f.into()),
+            }
         })?;
 
+        // The rows of both sides (a `replace`) are compared while each constraint's keys are
+        // sorted and merged, each on its own thread; the results are then used in the order
+        // validating at once would use them: the rows first, then the keys by constraint.
+        let (same_rows, merged): (Option<Result<bool, ApiError>>, Vec<Merged>) =
+            std::thread::scope(|s| {
+                let rows = rows_of.take().map(|Sides([added, removed])| {
+                    s.spawn(move || {
+                        same(
+                            added.finish_bytes().map_err(spill)?,
+                            removed.finish_bytes().map_err(spill)?,
+                        )
+                        .map_err(spill)
+                    })
+                });
+                let handles: Vec<_> = keyed
+                    .iter()
+                    .map(|id| {
+                        let sides = keys.remove(id);
+                        s.spawn(move || sides.map_or(Ok(Vec::new()), merge_sides))
+                    })
+                    .collect();
+                (rows.map(joined), handles.into_iter().map(joined).collect())
+            });
         check_sides(self.operation, adds, removes, || {
-            let Some(Sides([added, removed])) = rows_of.take() else {
-                return Ok(true);
-            };
-            same(
-                added.finish_bytes().map_err(|e| Failed::Api(spill(e)))?,
-                removed.finish_bytes().map_err(|e| Failed::Api(spill(e)))?,
-            )
-            .map_err(|e| Failed::Api(spill(e)))
+            same_rows.unwrap_or(Ok(true)).map_err(Failed::Api)
         })?;
-
-        // Each constraint's sides are sorted and merged on its own thread; what matters reaches
-        // the validator in constraint order.
-        let merged: Vec<Result<Vec<Counted>, ApiError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = keyed
-                .iter()
-                .map(|id| {
-                    let sides = keys.remove(id);
-                    s.spawn(move || sides.map_or(Ok(Vec::new()), merge_sides))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                .collect()
-        });
         for (id, counted) in keyed.iter().zip(merged) {
             for (key, a, r) in counted? {
                 scan.counts(*id, key, a, r).map_err(invalid)?;
@@ -408,8 +453,16 @@ impl Streamed<'_> {
     }
 }
 
+/// The result of a scoped thread; its panic, if any, continues on the caller.
+fn joined<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+}
+
 /// A distinct key with its count among the added and the removed rows.
 type Counted = (EncodedKey, u64, u64);
+
+/// The keys of one constraint that matter, merged from both sides.
+type Merged = Result<Vec<Counted>, ApiError>;
 
 /// Merges the two sorted sides of one constraint: each distinct key once, with its count on each
 /// side, keeping only the keys that matter to the validator ([`CommitScan::counts_matter`]).
