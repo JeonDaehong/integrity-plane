@@ -71,7 +71,7 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   certificates (the catalog serves only the current snapshot). The client tests use S3 through
   SeaweedFS (MinIO no longer publishes container images); AWS S3 was used only by the benchmarks.
 - Commits to a table with position delete files read every manifest of both snapshots and every
-  live position delete file, sequentially. On local disk this is cheap; on S3 a merge-on-read
-  delete of one row in a 100-file table took 4.7 s, and 8.5 s once 50 delete files had
-  accumulated (`docs/benchmarks.md`).
+  live position delete file (each once, 16 at a time; ADR 0020), so their cost grows with the
+  number of manifests and live delete files. On S3 a merge-on-read delete of one row in a 100-file
+  table takes about 0.5 s, 0.65 s with 50 accumulated delete files (`docs/benchmarks.md`).
 - Not tested: power loss (only process kills), Linux and Windows only.

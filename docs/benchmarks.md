@@ -136,10 +136,28 @@ column above.
 | Merge-on-read delete of 1 row, 100-file table, first / 50th | 86 ms / 86 ms | **4.67 s / 8.52 s** |
 
 Onboarding, copy-on-write and compaction read large ranges and cost 5–70 % more on S3. Merge-on-read
-deletes do not: they read about 8 MB, but as soon as a table has delete files, validation reads
-every manifest of both snapshots and every live position delete file, one request at a time, so
-each commit costs a few hundred sequential S3 requests and grows with the number of manifests and
-of accumulated delete files (`docs/limitations.md`).
+deletes did not: they read about 8 MB, but as soon as a table has delete files, validation read
+every manifest of both snapshots (those in both twice) and every live position delete file, one
+request at a time, so each commit cost a few hundred sequential S3 requests.
+
+### Concurrent metadata reads on S3 (ADR 0020)
+
+Same method, commit 5de14bd: each manifest and delete file of a commit is read once, up to 16 at a
+time. "Before" is the S3 column above.
+
+| Scenario | S3 before | S3 after | Local NVMe after |
+|---|---|---|---|
+| Merge-on-read delete of 1 row, 100-file table, first / 50th | 4.67 s / 8.52 s | **478 ms / 645 ms** | 82 ms / 82 ms |
+| Merge-on-read delete of 1 row, 20-file table, first / 5th | 0.97 s / 1.21 s | 386 ms / 408 ms | |
+| Copy-on-write delete of 1 row, 1 M-row file | 0.98 s | 0.90 s | 0.55 s |
+| Compaction of 10 files, 10 M rows | 14.3 s | 13.8 s | 11.6 s |
+| Copy-on-write delete of 1 row, 10 M-row file | 8.3 s | 8.5 s | |
+| Compaction of 10 files, 100 M rows | 147 s | 142 s | |
+| Onboarding of 100 M keys | 155 s | 151 s | 138 s |
+
+Merge-on-read deletes on S3 are 10–13 times faster and grow much more slowly with accumulated delete
+files; the other shapes and local disk are unchanged (memory as before: at most 1.6 GB during each
+measured commit).
 
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 
