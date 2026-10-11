@@ -34,8 +34,8 @@ Cost: reads do not go through the Plane, and tables without constraints are forw
 Each commit to a constrained table is validated before it is forwarded, and the cost grows with
 the rows the commit adds, removes or rewrites. Measured with Spark on Amazon S3: a statement
 changing a few rows or a hundred thousand rows takes about a second more, but inserting 1 M rows
-takes 6.3 s instead of 0.7 s, an initial load of 30 M rows 72 s instead of 6 s, and compacting
-33 M rows 104 s instead of 31 s ([`docs/benchmarks.md`](docs/benchmarks.md)). Large batch loads are therefore better done before
+takes 4.6 s instead of 0.7 s, an initial load of 30 M rows 38 s instead of 6 s, and compacting
+33 M rows 77 s instead of 33 s ([`docs/benchmarks.md`](docs/benchmarks.md)). Large batch loads are therefore better done before
 the constraints are registered (onboarding scans existing data at about 700 000 keys/s) or into
 tables that do not need them.
 

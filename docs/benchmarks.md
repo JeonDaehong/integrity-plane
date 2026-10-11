@@ -166,35 +166,54 @@ through two catalogs on one Spark session, `direct` (the Iceberg reference REST 
 `plane` (the gateway in front of the same catalog), on tables of the same shape: customer(id PK,
 1 M rows) and events(id PK, cust FK → customer, payload). Data on Amazon S3, gateway and Spark
 (`local[*]`) on one `m6id.4xlarge`, 2026-10-11. Times are the whole statement as Spark sees it;
-"validation" is the gateway's own validation time. "Before" is commit 9318c84, "after" commit
-9ac0446 (sorted key deltas, ADR 0021).
+"validation" is the gateway's own validation time. Three versions of the Plane: A is commit 9318c84,
+B commit 9ac0446 (sorted key deltas, ADR 0021), C commit fe42956 (rewrites validated on several
+threads without per-row allocations, and the client answered before the index write, ADR 0022).
 
-| Statement | Direct | Plane, before | Plane, after | Validation before → after |
-|---|---|---|---|---|
-| INSERT 30 M rows (initial load, PK + FK) | 5.8 s | 163.9 s | **72.4 s** | 113.3 s → 29.1 s |
-| INSERT 1 M rows (median of 3) | 0.7 s | 11.4 s | **6.3 s** | 7.8 s → 3.4 s |
-| MERGE copy-on-write, 500 K updates + 500 K inserts | 3.3 s | 13.2 s | 10.4 s | 6.7 s → 4.3 s |
-| DELETE copy-on-write, 100 K rows | 2.2 s | 7.2 s | 7.0 s | 5.0 s → 4.7 s |
-| DELETE merge-on-read, 1 % of all rows | 3.7 s | 20.7 s | 20.1 s | 12.5 s → 11.8 s |
-| UPDATE merge-on-read, 100 K rows | 1.6 s | 2.4 s | 2.3 s | 0.9 s → 0.9 s |
-| MERGE merge-on-read, 100 K updates + 100 K inserts | 7.0 s | 10.7 s | 10.8 s | 2.6 s → 2.4 s |
-| DELETE merge-on-read, 1 row (median of 3) | 1.2 s | 2.0 s | 2.1 s | 0.7 s → 0.7 s |
-| Compaction (`rewrite_data_files`, all files) | 31.5 s | 110.9 s | 103.5 s | 79.6 s → 76.9 s |
+| Statement | Direct | Plane A | Plane B | **Plane C** | Validation A → C |
+|---|---|---|---|---|---|
+| INSERT 30 M rows (initial load, PK + FK) | 5.9 s | 163.9 s | 72.4 s | **38.3 s** | 113.3 s → 26.0 s |
+| INSERT 1 M rows (median of 3) | 0.7 s | 11.4 s | 6.3 s | **4.6 s** | 7.8 s → 3.1 s |
+| MERGE copy-on-write, 500 K updates + 500 K inserts | 3.3 s | 13.2 s | 10.4 s | **9.1 s** | 6.7 s → 4.2 s |
+| DELETE copy-on-write, 100 K rows | 2.1 s | 7.2 s | 7.0 s | **6.2 s** | 5.0 s → 4.2 s |
+| DELETE merge-on-read, 1 % of all rows | 3.6 s | 20.7 s | 20.1 s | **16.4 s** | 12.5 s → 11.6 s |
+| UPDATE merge-on-read, 100 K rows | 1.6 s | 2.4 s | 2.3 s | **2.3 s** | 0.9 s → 0.9 s |
+| MERGE merge-on-read, 100 K updates + 100 K inserts | 7.3 s | 10.7 s | 10.8 s | **10.1 s** | 2.6 s → 2.1 s |
+| DELETE merge-on-read, 1 row (median of 3) | 1.2 s | 2.0 s | 2.1 s | **2.0 s** | 0.7 s → 0.7 s |
+| Compaction (`rewrite_data_files`, all files) | 32.8 s | 110.9 s | 103.5 s | **76.8 s** | 79.6 s → 50.0 s |
 
-("Direct" is from the "after" run; it moved by at most a few tenths of a second, compaction by 5 s.)
-Both sides end with the same 33 166 997 rows and distinct ids in both runs.
+("Direct" is from run C; across runs it moved by at most a few tenths of a second, compaction by
+up to 6 s.) Both sides end with the same 33 166 997 rows and distinct ids in every run.
 
-Commits that change few keys cost about a second more. Commits that add many keys cost about half
-as much as before but still several times the engine's own work. Before ADR 0021, a profile of
-1 M-row appends put the time in per-key in-memory maps (the commit's key delta, probe results and
-staged index changes) and their allocations; index probes were a small part (5.2 s of 293 s of
-validation over the run). After it, timing a 1 M-row append (`integrity-bench --append-rows
-1000000`, local disk) gives about 0.4 s to read and extract keys, 0.6 s to sort and merge them,
-0.6 s for probes, 0.25 s to stage, 0.2 s for the transaction log record and 1.3 s to write the
-index (one B-tree insert per changed key, PK and FK). Two shapes did not change: a merge-on-read
-delete spread over every file reads the key columns of every row group it touches, and a
-compaction sorts every key and row of both sides (validation time follows the rows rewritten,
-about 2.3 µs per row here). Both remain open (`docs/limitations.md`).
+Statements that change few or a hundred thousand rows cost about a second more. Statements that
+add or rewrite millions of rows cost two to six times the engine's own work, down from up to 28
+times. What remains, for a 1 M-row append (local disk, before ADR 0022): about 0.4 s to read and
+extract keys, 0.6 s to sort and merge them, 0.6 s for probes, 0.25 s to stage and 0.2 s for the
+transaction log record are on the commit's path; the index write (about 1.3 s, one B-tree insert
+per changed key) now follows the answer. A merge-on-read delete spread over every file reads the key
+columns of every row group it touches, and a compaction sorts every key and row of both sides
+(`docs/limitations.md`).
+
+### Large tables and appends, version C (local NVMe)
+
+Same instance, commit fe42956, files on the instance's disk as in the sections above
+(`integrity-bench`, peak resident memory of each run).
+
+| Scenario | Before (sections above) | Version C |
+|---|---|---|
+| Onboarding of 100 M keys | 145 s | 129 s |
+| Onboarding of 200 M keys | | 248 s |
+| Copy-on-write delete of 1 row, 1 M-row file (100 M-row table) | 0.55 s | 0.50 s |
+| Compaction of 10 files, 10 M rows | 11.7 s | 7.0 s |
+| Merge-on-read delete of 1 row, 100-file table, first / 50th | 86 ms / 86 ms | 74 ms / 73 ms |
+| Copy-on-write delete of 1 row, 10 M-row file (200 M-row table) | 6.7 s | 5.1–6.4 s |
+| Compaction of 10 files, **100 M rows** | 128 s | **70 s** |
+| Append of 1 M rows (PK + FK into 1 M parent keys), validation / end to end | | 1.5 s / 2.8 s |
+| One writer, sequential single-row FK appends | | 306 commits/s (p50 3.3 ms) |
+| Peak memory | 1.5 GB (100 M), compaction of 100 M rows 1.5 GB | 1.5 GB (100 M run); 4.8 GB in the 200 M run, the benchmark generating its 100 M-row file |
+
+Single-row commits gain most from answering before the index write: each of them paid a durable
+index transaction before its answer.
 
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 
