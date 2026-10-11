@@ -24,7 +24,7 @@ use integrity_index::{
 use integrity_txn::{FaultPoint, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, SnapshotId, TableId};
 use integrity_validator::{
-    Decision, IndexSet, ValidatedDeltas, ValidationError, Validator, ViolationDetail,
+    CommitScan, Decision, IndexSet, ValidatedDeltas, ValidationError, Validator, ViolationDetail,
 };
 
 use crate::error::ApiError;
@@ -383,48 +383,74 @@ impl Streamed<'_> {
             .map_err(|e| Failed::Api(spill(e)))
         })?;
 
-        for id in keyed {
-            let Some(Sides([added, removed])) = keys.remove(&id) else {
-                continue;
-            };
-            let mut added = added.finish().map_err(spill)?.peekable();
-            let mut removed = removed.finish().map_err(spill)?.peekable();
-            // Merge the two sorted sides: each distinct key once, with its count on each side.
-            loop {
-                let next = match (added.peek(), removed.peek()) {
-                    (None, None) => break,
-                    (Some(Err(_)), _) | (_, Some(Err(_))) => {
-                        let e = match (added.next(), removed.next()) {
-                            (Some(Err(e)), _) | (_, Some(Err(e))) => e,
-                            _ => IndexError::Corrupt,
-                        };
-                        return Err(spill(e));
-                    }
-                    (Some(Ok((a, _))), Some(Ok((r, _)))) => a.cmp(r),
-                    (Some(Ok(_)), None) => std::cmp::Ordering::Less,
-                    (None, Some(Ok(_))) => std::cmp::Ordering::Greater,
-                };
-                let (key, a, r): (EncodedKey, u64, u64) = match next {
-                    std::cmp::Ordering::Less => {
-                        let (k, n) = take(&mut added)?;
-                        (k, n, 0)
-                    }
-                    std::cmp::Ordering::Greater => {
-                        let (k, n) = take(&mut removed)?;
-                        (k, 0, n)
-                    }
-                    std::cmp::Ordering::Equal => {
-                        let (k, n) = take(&mut added)?;
-                        let (_, m) = take(&mut removed)?;
-                        (k, n, m)
-                    }
-                };
-                scan.counts(id, key, a, r).map_err(invalid)?;
+        // Each constraint's sides are sorted and merged on its own thread; what matters reaches
+        // the validator in constraint order.
+        let merged: Vec<Result<Vec<Counted>, ApiError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = keyed
+                .iter()
+                .map(|id| {
+                    let sides = keys.remove(id);
+                    s.spawn(move || sides.map_or(Ok(Vec::new()), merge_sides))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for (id, counted) in keyed.iter().zip(merged) {
+            for (key, a, r) in counted? {
+                scan.counts(*id, key, a, r).map_err(invalid)?;
             }
         }
         let decided = scan.decide(indexes).map_err(invalid)?;
         Ok((decided, read))
     }
+}
+
+/// A distinct key with its count among the added and the removed rows.
+type Counted = (EncodedKey, u64, u64);
+
+/// Merges the two sorted sides of one constraint: each distinct key once, with its count on each
+/// side, keeping only the keys that matter to the validator ([`CommitScan::counts_matter`]).
+fn merge_sides(Sides([added, removed]): Sides) -> Result<Vec<Counted>, ApiError> {
+    let mut added = added.finish().map_err(spill)?.peekable();
+    let mut removed = removed.finish().map_err(spill)?.peekable();
+    let mut out = Vec::new();
+    loop {
+        let next = match (added.peek(), removed.peek()) {
+            (None, None) => break,
+            (Some(Err(_)), _) | (_, Some(Err(_))) => {
+                let e = match (added.next(), removed.next()) {
+                    (Some(Err(e)), _) | (_, Some(Err(e))) => e,
+                    _ => IndexError::Corrupt,
+                };
+                return Err(spill(e));
+            }
+            (Some(Ok((a, _))), Some(Ok((r, _)))) => a.cmp(r),
+            (Some(Ok(_)), None) => std::cmp::Ordering::Less,
+            (None, Some(Ok(_))) => std::cmp::Ordering::Greater,
+        };
+        let (key, a, r): Counted = match next {
+            std::cmp::Ordering::Less => {
+                let (k, n) = take(&mut added)?;
+                (k, n, 0)
+            }
+            std::cmp::Ordering::Greater => {
+                let (k, n) = take(&mut removed)?;
+                (k, 0, n)
+            }
+            std::cmp::Ordering::Equal => {
+                let (k, n) = take(&mut added)?;
+                let (_, m) = take(&mut removed)?;
+                (k, n, m)
+            }
+        };
+        if CommitScan::counts_matter(a, r) {
+            out.push((key, a, r));
+        }
+    }
+    Ok(out)
 }
 
 fn take(

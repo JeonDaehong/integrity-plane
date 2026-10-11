@@ -16,14 +16,16 @@ use integrity_index::{IndexEpoch, IndexValue, KeyIndex, MemoryIndex, PersistentS
 use integrity_reference::{Commit, Oracle, Row, Verdict};
 use integrity_types::{ConstraintId, ConstraintSetVersion, FieldId, SnapshotId, TableId};
 use integrity_validator::{
-    Decision, ResolvedConstraint, ValidationError, Validator, ViolationDetail,
+    CommitScan, Decision, ResolvedConstraint, ValidationError, Validator, ViolationDetail,
 };
 use proptest::prelude::*;
 
 // ---------- engine ----------
 
 /// `rows` validated through a `CommitScan`: batches of `size` rows, sides in either order, keys
-/// counted per side in sorted maps (the role of the external sorter).
+/// counted per side in sorted maps (the role of the external sorter). With the removed side first,
+/// only the keys that matter are reported (`CommitScan::counts_matter`), as the gateway does; the
+/// other order reports every key.
 pub fn streamed(
     validator: &Validator,
     rows: &CommitRows,
@@ -55,6 +57,9 @@ pub fn streamed(
     }
     for id in scan.keyed() {
         for (key, (added, removed)) in keys.remove(&id).unwrap_or_default() {
+            if removed_first && !CommitScan::counts_matter(added, removed) {
+                continue;
+            }
             scan.counts(id, key, added, removed)?;
         }
     }

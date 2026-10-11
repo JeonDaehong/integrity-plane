@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use integrity_core::{
     CommitRows, ConstraintKind, Datum, EncodedKey, KeyDelta, KeyDisposition, KeyError, KeyMultiset,
-    KeySpec, KeyValue, RowBatch, Violation, classify,
+    KeySpec, KeyValue, NetDelta, RowBatch, Violation, classify,
 };
 use integrity_types::{ConstraintId, ErrorCode, FieldId};
 
@@ -15,8 +15,9 @@ use crate::{Inconsistency, ResolvedConstraint, ValidationError, ViolationDetail}
 /// added by the validator).
 #[derive(Debug, Default)]
 pub(crate) struct Plan {
-    /// Per PK/UNIQUE/FK-child constraint on the committed table.
-    pub deltas: BTreeMap<ConstraintId, KeyDelta>,
+    /// Net key change per PK/UNIQUE/FK-child constraint on the committed table (intra-commit
+    /// duplicates are recorded as violations before netting, spec §8).
+    pub deltas: BTreeMap<ConstraintId, NetDelta>,
     /// Every violated `(constraint, code)`.
     pub violations: BTreeSet<Violation>,
     /// What violates each of them.
@@ -80,7 +81,7 @@ impl Plan {
                             plan.record_key(c.id, code, k);
                         }
                     }
-                    plan.deltas.insert(c.id, delta);
+                    plan.deltas.insert(c.id, delta.net());
                 }
             }
         }

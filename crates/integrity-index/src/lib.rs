@@ -17,7 +17,6 @@ mod overlay;
 mod persistent;
 mod sort;
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use integrity_core::{EncodedKey, NetDelta};
@@ -80,7 +79,8 @@ pub struct IndexDelta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedDelta {
     base_epoch: IndexEpoch,
-    writes: BTreeMap<EncodedKey, Option<IndexValue>>,
+    /// In strictly increasing key order.
+    writes: Vec<(EncodedKey, Option<IndexValue>)>,
 }
 
 impl StagedDelta {
@@ -103,7 +103,7 @@ impl StagedDelta {
         for (key, value) in &self.writes {
             out.extend_from_slice(&(key.as_bytes().len() as u32).to_be_bytes());
             out.extend_from_slice(key.as_bytes());
-            out.extend_from_slice(&encode_value(value.as_ref()));
+            out.extend_from_slice(encode_value(value.as_ref()).as_slice());
         }
         out
     }
@@ -130,14 +130,13 @@ impl StagedDelta {
         }
         let base_epoch = IndexEpoch(u64_at(&mut b)?);
         let n = u64_at(&mut b)?;
-        let mut writes = BTreeMap::new();
-        let mut previous: Option<EncodedKey> = None;
+        let mut writes: Vec<(EncodedKey, Option<IndexValue>)> = Vec::new();
         for _ in 0..n {
             let mut len = [0u8; 4];
             len.copy_from_slice(take(&mut b, 4)?);
             let key = EncodedKey::from_bytes(take(&mut b, u32::from_be_bytes(len) as usize)?)
                 .map_err(|_| IndexError::Corrupt)?;
-            if previous.as_ref().is_some_and(|p| *p >= key) {
+            if writes.last().is_some_and(|(p, _)| *p >= key) {
                 return Err(IndexError::Corrupt);
             }
             let value = match take(&mut b, 1)?[0] {
@@ -148,8 +147,7 @@ impl StagedDelta {
                     Some(decode_value(&v)?)
                 }
             };
-            previous = Some(key.clone());
-            writes.insert(key, value);
+            writes.push((key, value));
         }
         if !b.is_empty() {
             return Err(IndexError::Corrupt);
@@ -167,7 +165,7 @@ impl StagedDelta {
         for (key, value) in &self.writes {
             h.update(&(key.as_bytes().len() as u64).to_be_bytes());
             h.update(key.as_bytes());
-            h.update(&encode_value(value.as_ref()));
+            h.update(encode_value(value.as_ref()).as_slice());
         }
         *h.finalize().as_bytes()
     }
@@ -273,7 +271,8 @@ pub(crate) fn resolve(
     base_epoch: IndexEpoch,
     mut current: impl FnMut(&EncodedKey) -> Result<Option<IndexValue>>,
 ) -> Result<StagedDelta> {
-    let mut writes = BTreeMap::new();
+    // The delta is in key order, so the writes are too.
+    let mut writes = Vec::with_capacity(delta.changes.len());
     for (key, change) in delta.changes.iter() {
         let value = current(key)?;
         let new = match kind {
@@ -301,7 +300,7 @@ pub(crate) fn resolve(
                 (new > 0).then_some(IndexValue::Reference { child_count: new })
             }
         };
-        writes.insert(key.clone(), new);
+        writes.push((key.clone(), new));
     }
     Ok(StagedDelta { base_epoch, writes })
 }
@@ -346,19 +345,35 @@ const VALUE_ABSENT: u8 = 0x00;
 const VALUE_UNIQUE: u8 = 0x01;
 const VALUE_REFERENCE: u8 = 0x02;
 
+/// An encoded index value, without a heap allocation (one is written per changed key).
+pub(crate) struct EncodedValue {
+    bytes: [u8; 9],
+    len: usize,
+}
+
+impl EncodedValue {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 /// Canonical 1- or 9-byte encoding of an index value (`None` = absent).
-pub(crate) fn encode_value(value: Option<&IndexValue>) -> Vec<u8> {
+pub(crate) fn encode_value(value: Option<&IndexValue>) -> EncodedValue {
+    let tagged = |tag: u8, payload: [u8; 8]| {
+        let mut bytes = [tag, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes[1..].copy_from_slice(&payload);
+        EncodedValue { bytes, len: 9 }
+    };
     match value {
-        None => vec![VALUE_ABSENT],
+        None => EncodedValue {
+            bytes: [VALUE_ABSENT, 0, 0, 0, 0, 0, 0, 0, 0],
+            len: 1,
+        },
         Some(IndexValue::Unique { last_snapshot }) => {
-            let mut v = vec![VALUE_UNIQUE];
-            v.extend_from_slice(&last_snapshot.0.to_be_bytes());
-            v
+            tagged(VALUE_UNIQUE, last_snapshot.0.to_be_bytes())
         }
         Some(IndexValue::Reference { child_count }) => {
-            let mut v = vec![VALUE_REFERENCE];
-            v.extend_from_slice(&child_count.to_be_bytes());
-            v
+            tagged(VALUE_REFERENCE, child_count.to_be_bytes())
         }
     }
 }

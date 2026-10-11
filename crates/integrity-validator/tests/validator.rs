@@ -484,3 +484,47 @@ fn violation_details_count_and_sample_offending_keys() {
     assert_eq!(gone.count(), 2);
     assert_eq!(ints(&gone), vec![one(1), one(2)]);
 }
+
+#[test]
+fn keys_repeated_among_added_rows_matter_even_without_a_net_change() {
+    use integrity_validator::CommitScan;
+    // Spec §8: a key added twice is a duplicate even if the commit also removes it twice.
+    assert!(CommitScan::counts_matter(2, 2));
+    assert!(CommitScan::counts_matter(1, 0) && CommitScan::counts_matter(0, 1));
+    assert!(!CommitScan::counts_matter(1, 1) && !CommitScan::counts_matter(0, 0));
+
+    let v = Validator::new(fixture(EnforcementMode::Enforced));
+    let idx = indexes();
+    let mut scan = v
+        .commit_scan(&TableId::new("customer"), SnapshotId(1))
+        .unwrap();
+    let key = EncodedKey::encode(&int_schema(), &[Some(KeyValue::Integer(7))]).unwrap();
+    scan.counts(PK_CUSTOMER, key, 2, 2).unwrap();
+    let (decision, _) = scan.decide(&idx).unwrap();
+    let Decision::Rejected(violations) = decision else {
+        panic!("accepted a duplicate key")
+    };
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.code == ErrorCode::DuplicatePrimaryKey)
+    );
+}
+
+#[test]
+fn keys_must_be_reported_in_key_order() {
+    let v = Validator::new(fixture(EnforcementMode::Enforced));
+    let idx = indexes();
+    let mut scan = v
+        .commit_scan(&TableId::new("customer"), SnapshotId(1))
+        .unwrap();
+    let k = |i| EncodedKey::encode(&int_schema(), &[Some(KeyValue::Integer(i))]).unwrap();
+    scan.counts(PK_CUSTOMER, k(2), 1, 0).unwrap();
+    scan.counts(PK_CUSTOMER, k(1), 1, 0).unwrap();
+    assert!(matches!(
+        scan.decide(&idx),
+        Err(ValidationError::Delta(
+            integrity_core::DeltaError::NotSorted
+        ))
+    ));
+}

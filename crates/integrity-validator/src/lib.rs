@@ -21,7 +21,7 @@ use std::fmt;
 
 use integrity_core::{
     CommitRows, Constraint, ConstraintKind, Datum, DeltaError, Digest, EncodedKey, EnforcementMode,
-    InvalidCertificate, InvalidConstraint, KeyDelta, KeyDisposition, KeySchema, KeyValue, NetDelta,
+    InvalidCertificate, InvalidConstraint, KeyDisposition, KeySchema, KeyValue, NetDelta,
     RegistrationContext, RowBatch, Side, UniqueSpec, Violation, classify, key_delta_digest,
 };
 use integrity_index::{
@@ -333,11 +333,7 @@ impl Validator {
             ));
         }
         let plan = Plan::build(commit, self.on_table(&commit.table))?;
-        Ok(plan
-            .deltas
-            .into_iter()
-            .map(|(id, d)| (id, d.net()))
-            .collect())
+        Ok(plan.deltas.into_iter().collect())
     }
 
     /// Decides a single-table commit. Reads indexes; never writes them.
@@ -443,10 +439,9 @@ impl Validator {
         let referencing = &ctx.referencing;
         for rc in own {
             let id = rc.constraint.id;
-            let Some(delta) = plan.deltas.get(&id) else {
+            let Some(net) = plan.deltas.get(&id).cloned() else {
                 continue;
             };
-            let net = delta.net();
             match &rc.constraint.kind {
                 ConstraintKind::PrimaryKey(_) | ConstraintKind::Unique(_) => {
                     let duplicate = match rc.constraint.kind {
@@ -494,11 +489,7 @@ impl Validator {
                 return Err(ValidationError::Unprovable(rc.constraint.id));
             };
             // Parent keys that disappear (removed and not re-added).
-            let gone: Vec<EncodedKey> = parent_delta
-                .net()
-                .decreases()
-                .map(|(k, _)| k.clone())
-                .collect();
+            let gone: Vec<EncodedKey> = parent_delta.decreases().map(|(k, _)| k.clone()).collect();
             for (key, value) in gone.iter().zip(probe(indexes, rc.constraint.id, &gone)?) {
                 match value {
                     None => {}
@@ -517,11 +508,7 @@ impl Validator {
         if !plan.violations.is_empty() {
             return Ok((Decision::Rejected(plan.violations), plan.details));
         }
-        let key_deltas: BTreeMap<ConstraintId, NetDelta> = plan
-            .deltas
-            .into_iter()
-            .map(|(id, d)| (id, d.net()))
-            .collect();
+        let key_deltas: BTreeMap<ConstraintId, NetDelta> = plan.deltas;
         let deltas = key_deltas
             .iter()
             .filter(|(_, net)| !net.is_empty())
@@ -639,12 +626,15 @@ impl Validator {
         }
         let candidates: Vec<EncodedKey> = candidates.into_iter().collect();
         let found = probe(indexes, k, &candidates)?;
+        let removed: Vec<(EncodedKey, i128)> = candidates
+            .into_iter()
+            .zip(found)
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| (key, -1))
+            .collect();
+        let removed = NetDelta::from_sorted(removed).map_err(ValidationError::Delta)?;
         let delta = plan.deltas.entry(k).or_default();
-        for (key, value) in candidates.into_iter().zip(found) {
-            if value.is_some() {
-                delta.removed.insert(key).map_err(ValidationError::Delta)?;
-            }
-        }
+        *delta = delta.plus(&removed).map_err(ValidationError::Delta)?;
         Ok(())
     }
 
@@ -708,6 +698,8 @@ pub struct CommitScan<'v> {
     ctx: Context<'v>,
     snapshot: SnapshotId,
     plan: Plan,
+    /// Net changes reported by [`CommitScan::counts`], per constraint, in key order.
+    nets: BTreeMap<ConstraintId, Vec<(EncodedKey, i128)>>,
     /// The first error of each (constraint position, side), reported in that order (the order in
     /// which validating all rows at once meets them).
     errors: BTreeMap<(usize, Side), ValidationError>,
@@ -736,7 +728,7 @@ impl Validator {
                 if rc.schema.is_none() || rc.constraint.kind.key_role().is_none() {
                     return Err(ValidationError::Unprovable(rc.constraint.id));
                 }
-                plan.deltas.insert(rc.constraint.id, KeyDelta::default());
+                plan.deltas.insert(rc.constraint.id, NetDelta::default());
             }
         }
         Ok(CommitScan {
@@ -744,6 +736,7 @@ impl Validator {
             ctx,
             snapshot,
             plan,
+            nets: BTreeMap::new(),
             errors: BTreeMap::new(),
         })
     }
@@ -812,6 +805,13 @@ impl CommitScan<'_> {
         Ok(())
     }
 
+    /// Whether [`CommitScan::counts`] does anything for a key with these counts: keys that
+    /// neither repeat among the added rows nor change their count need not be reported (most
+    /// keys of a rewrite).
+    pub fn counts_matter(added: u64, removed: u64) -> bool {
+        added > 1 || added != removed
+    }
+
     /// Reports that `key` of constraint `id` occurs `added` times among the added rows and
     /// `removed` times among the removed ones (see [`CommitScan`]).
     pub fn counts(
@@ -838,29 +838,26 @@ impl CommitScan<'_> {
         {
             self.plan.record_key(id, code, &key);
         }
-        let delta = self.plan.deltas.entry(id).or_default();
-        if added > removed {
-            delta
-                .added
-                .insert_n(key, added - removed)
-                .map_err(ValidationError::Delta)?;
-        } else if removed > added {
-            delta
-                .removed
-                .insert_n(key, removed - added)
-                .map_err(ValidationError::Delta)?;
+        let change = i128::from(added) - i128::from(removed);
+        if change != 0 {
+            self.nets.entry(id).or_default().push((key, change));
         }
         Ok(())
     }
 
     /// Probes the indexes and decides the commit.
     pub fn decide(
-        self,
+        mut self,
         indexes: &impl IndexSet,
     ) -> Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
         let observed = self.validator.observe(&self.ctx, indexes)?;
         if let Some((_, e)) = self.errors.into_iter().next() {
             return Err(e);
+        }
+        for (id, changes) in self.nets {
+            // Keys were reported in key order, each once; anything else is a caller bug.
+            let net = NetDelta::from_sorted(changes).map_err(ValidationError::Delta)?;
+            self.plan.deltas.insert(id, net);
         }
         Validator::decide(&self.ctx, observed, self.plan, self.snapshot, indexes)
     }

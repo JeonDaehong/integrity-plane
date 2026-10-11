@@ -12,6 +12,66 @@ use crate::{
     resolve,
 };
 
+/// Values by key, in strictly increasing key order: looked up by binary search and extended in
+/// bulk, since keys arrive in key order (a commit's delta, its probes).
+#[derive(Debug, Default)]
+struct Sorted(Vec<(EncodedKey, Option<IndexValue>)>);
+
+impl Sorted {
+    /// The value of `key`. `hint` is where to look first and is left after the key: lookups in
+    /// key order (the usual case) cost one comparison each.
+    fn find(&self, key: &EncodedKey, hint: &mut usize) -> Option<Option<IndexValue>> {
+        if let Some((k, v)) = self.0.get(*hint)
+            && k == key
+        {
+            *hint += 1;
+            return Some(*v);
+        }
+        match self.0.binary_search_by(|(k, _)| k.cmp(key)) {
+            Ok(i) => {
+                *hint = i + 1;
+                Some(self.0[i].1)
+            }
+            Err(i) => {
+                *hint = i;
+                None
+            }
+        }
+    }
+
+    /// Adds `entries` (strictly increasing), replacing the values of keys already present.
+    fn merge(&mut self, entries: Vec<(EncodedKey, Option<IndexValue>)>) {
+        let Some((first, _)) = entries.first() else {
+            return;
+        };
+        if self.0.last().is_none_or(|(last, _)| last < first) {
+            self.0.extend(entries);
+            return;
+        }
+        let old = std::mem::take(&mut self.0);
+        let mut out = Vec::with_capacity(old.len() + entries.len());
+        let (mut old, mut new) = (old.into_iter().peekable(), entries.into_iter().peekable());
+        loop {
+            let order = match (old.peek(), new.peek()) {
+                (None, None) => break,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some((a, _)), Some((b, _))) => a.cmp(b),
+            };
+            match order {
+                std::cmp::Ordering::Less => out.extend(old.next()),
+                std::cmp::Ordering::Greater => out.extend(new.next()),
+                // The new value replaces the old one.
+                std::cmp::Ordering::Equal => {
+                    old.next();
+                    out.extend(new.next());
+                }
+            }
+        }
+        self.0 = out;
+    }
+}
+
 /// An index seen through pending writes. `apply` records writes in the overlay (ignoring epochs);
 /// reads see the overlay first, then the base. `epoch` is the base's.
 ///
@@ -21,8 +81,9 @@ use crate::{
 #[derive(Debug)]
 pub struct Overlay<'a> {
     base: &'a dyn KeyIndex,
-    writes: Mutex<BTreeMap<EncodedKey, Option<IndexValue>>>,
-    read: Mutex<BTreeMap<EncodedKey, Option<IndexValue>>>,
+    /// Locked before `read` wherever both are needed.
+    writes: Mutex<Sorted>,
+    read: Mutex<Sorted>,
 }
 
 impl<'a> Overlay<'a> {
@@ -30,32 +91,60 @@ impl<'a> Overlay<'a> {
     pub fn new(base: &'a dyn KeyIndex) -> Self {
         Self {
             base,
-            writes: Mutex::new(BTreeMap::new()),
-            read: Mutex::new(BTreeMap::new()),
+            writes: Mutex::new(Sorted::default()),
+            read: Mutex::new(Sorted::default()),
         }
     }
 
-    /// Base values of `keys`, from memory or one batched base read for the rest.
-    fn base_values(&self, keys: &[EncodedKey]) -> Result<BTreeMap<EncodedKey, Option<IndexValue>>> {
-        let mut read = self.read.lock().map_err(|_| IndexError::Unavailable)?;
+    /// Reads from the base, in one batch, the values of `keys` neither written nor read before.
+    fn read_through<'k>(
+        &self,
+        writes: &Sorted,
+        read: &mut Sorted,
+        keys: impl Iterator<Item = &'k EncodedKey>,
+    ) -> Result<()> {
+        let (mut w, mut r) = (0, 0);
         let mut missing: Vec<EncodedKey> = keys
-            .iter()
-            .filter(|k| !read.contains_key(*k))
+            .filter(|k| writes.find(k, &mut w).is_none() && read.find(k, &mut r).is_none())
             .cloned()
             .collect();
-        missing.sort();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if !missing.is_sorted() {
+            missing.sort();
+        }
         missing.dedup();
         let found = self.base.get_many(&missing)?;
         if found.len() != missing.len() {
             return Err(IndexError::Corrupt);
         }
-        for (k, v) in missing.into_iter().zip(found) {
-            read.insert(k, v);
+        read.merge(missing.into_iter().zip(found).collect());
+        Ok(())
+    }
+}
+
+/// Values as the overlay sees them, once [`Overlay::read_through`] has run for the keys asked.
+struct Seen<'s> {
+    writes: &'s Sorted,
+    read: &'s Sorted,
+    hints: (usize, usize),
+}
+
+impl<'s> Seen<'s> {
+    fn new(writes: &'s Sorted, read: &'s Sorted) -> Self {
+        Self {
+            writes,
+            read,
+            hints: (0, 0),
         }
-        Ok(keys
-            .iter()
-            .filter_map(|k| read.get(k).map(|v| (k.clone(), *v)))
-            .collect())
+    }
+
+    fn get(&mut self, key: &EncodedKey) -> Result<Option<IndexValue>> {
+        self.writes
+            .find(key, &mut self.hints.0)
+            .or_else(|| self.read.find(key, &mut self.hints.1))
+            .ok_or(IndexError::Corrupt)
     }
 }
 
@@ -67,7 +156,8 @@ impl Overlay<'_> {
         let writes = self
             .writes
             .into_inner()
-            .map_err(|_| IndexError::Unavailable)?;
+            .map_err(|_| IndexError::Unavailable)?
+            .0;
         Ok(StagedDelta { base_epoch, writes })
     }
 }
@@ -85,42 +175,23 @@ impl KeyIndex for Overlay<'_> {
 
     fn get_many(&self, keys: &[EncodedKey]) -> Result<Vec<Option<IndexValue>>> {
         let writes = self.writes.lock().map_err(|_| IndexError::Unavailable)?;
-        let missing: Vec<EncodedKey> = keys
-            .iter()
-            .filter(|k| !writes.contains_key(*k))
-            .cloned()
-            .collect();
-        let base = self.base_values(&missing)?;
-        keys.iter()
-            .map(|k| match writes.get(k) {
-                Some(v) => Ok(*v),
-                None => base.get(k).copied().ok_or(IndexError::Corrupt),
-            })
-            .collect()
+        let mut read = self.read.lock().map_err(|_| IndexError::Unavailable)?;
+        self.read_through(&writes, &mut read, keys.iter())?;
+        let mut seen = Seen::new(&writes, &read);
+        keys.iter().map(|k| seen.get(k)).collect()
     }
 
     fn stage(&self, delta: &IndexDelta) -> Result<StagedDelta> {
         let writes = self.writes.lock().map_err(|_| IndexError::Unavailable)?;
-        let keys: Vec<EncodedKey> = delta
-            .changes
-            .iter()
-            .map(|(k, _)| k.clone())
-            .filter(|k| !writes.contains_key(k))
-            .collect();
-        let base = self.base_values(&keys)?;
-        resolve(self.kind(), delta, self.base.epoch()?, |k| {
-            match writes.get(k) {
-                Some(v) => Ok(*v),
-                None => base.get(k).copied().ok_or(IndexError::Corrupt),
-            }
-        })
+        let mut read = self.read.lock().map_err(|_| IndexError::Unavailable)?;
+        self.read_through(&writes, &mut read, delta.changes.iter().map(|(k, _)| k))?;
+        let mut seen = Seen::new(&writes, &read);
+        resolve(self.kind(), delta, self.base.epoch()?, |k| seen.get(k))
     }
 
     fn apply(&self, staged: StagedDelta, _epoch: IndexEpoch) -> Result<()> {
         let mut writes = self.writes.lock().map_err(|_| IndexError::Unavailable)?;
-        for (key, value) in staged.writes {
-            writes.insert(key, value);
-        }
+        writes.merge(staged.writes);
         Ok(())
     }
 
@@ -132,7 +203,7 @@ impl KeyIndex for Overlay<'_> {
         let writes = self.writes.lock().map_err(|_| IndexError::Unavailable)?;
         let mut merged: BTreeMap<EncodedKey, IndexValue> =
             self.base.entries()?.into_iter().collect();
-        for (k, v) in writes.iter() {
+        for (k, v) in &writes.0 {
             match v {
                 Some(v) => {
                     merged.insert(k.clone(), *v);

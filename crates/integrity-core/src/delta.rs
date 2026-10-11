@@ -11,9 +11,11 @@
 //! Netting first would mask duplicates: `added = {k, k}`, `removed = {k}` nets to `+1`, yet the
 //! post-commit state holds `k` twice.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::key::EncodedKey;
 
@@ -75,7 +77,7 @@ impl KeyMultiset {
     /// keys that are not present) or exceed `u64::MAX`.
     pub fn apply(&mut self, delta: &NetDelta) -> Result<(), DeltaError> {
         let mut updated = Vec::with_capacity(delta.changes.len());
-        for (key, &change) in &delta.changes {
+        for (key, change) in delta.iter() {
             let new = i128::from(self.count(key)) + change;
             if new < 0 {
                 return Err(DeltaError::Underflow);
@@ -122,28 +124,86 @@ pub struct KeyDelta {
 impl KeyDelta {
     /// The net change `added − removed`; keys with no net change are omitted.
     pub fn net(&self) -> NetDelta {
-        let mut changes: BTreeMap<EncodedKey, i128> = BTreeMap::new();
-        for (key, n) in self.added.iter() {
-            changes.insert(key.clone(), i128::from(n));
-        }
-        for (key, n) in self.removed.iter() {
-            *changes.entry(key.clone()).or_insert(0) -= i128::from(n);
-        }
-        changes.retain(|_, c| *c != 0);
-        NetDelta { changes }
+        let added = self.added.iter().map(|(k, n)| (k, i128::from(n)));
+        let removed = self.removed.iter().map(|(k, n)| (k, -i128::from(n)));
+        NetDelta::merged(added, removed, |a, b| Some(a + b))
     }
 }
 
-/// Signed per-key count changes. Never stores zero changes.
+/// Signed per-key count changes, in key order. Never stores zero changes. Cloning is cheap (the
+/// changes are shared): a commit's delta is handed to the certificate and to every index stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetDelta {
-    changes: BTreeMap<EncodedKey, i128>,
+    changes: Arc<[(EncodedKey, i128)]>,
 }
 
 impl NetDelta {
+    /// A delta from changes already in strictly increasing key order, none of them zero (as a
+    /// merge of sorted keys produces them); anything else is [`DeltaError::NotSorted`].
+    pub fn from_sorted(changes: Vec<(EncodedKey, i128)>) -> Result<Self, DeltaError> {
+        let ordered = changes.windows(2).all(|w| w[0].0 < w[1].0);
+        if !ordered || changes.iter().any(|(_, c)| *c == 0) {
+            return Err(DeltaError::NotSorted);
+        }
+        Ok(Self {
+            changes: changes.into(),
+        })
+    }
+
+    /// The per-key sum of `self` and `other`.
+    pub fn plus(&self, other: &NetDelta) -> Result<NetDelta, DeltaError> {
+        let mut overflow = false;
+        let sum = Self::merged(self.iter(), other.iter(), |a, b| {
+            let s = a.checked_add(b);
+            overflow |= s.is_none();
+            s
+        });
+        if overflow {
+            return Err(DeltaError::Overflow);
+        }
+        Ok(sum)
+    }
+
+    /// Merges two key-ordered sequences of changes, combining equal keys with `both` (`None`
+    /// drops the key) and dropping zero results.
+    fn merged<'a>(
+        a: impl Iterator<Item = (&'a EncodedKey, i128)>,
+        b: impl Iterator<Item = (&'a EncodedKey, i128)>,
+        mut both: impl FnMut(i128, i128) -> Option<i128>,
+    ) -> NetDelta {
+        let (mut a, mut b) = (a.peekable(), b.peekable());
+        let mut out = Vec::new();
+        loop {
+            let order = match (a.peek(), b.peek()) {
+                (None, None) => break,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some((x, _)), Some((y, _))) => x.cmp(y),
+            };
+            let item = match order {
+                Ordering::Less => a.next().map(|(k, c)| (k, Some(c))),
+                Ordering::Greater => b.next().map(|(k, c)| (k, Some(c))),
+                Ordering::Equal => match (a.next(), b.next()) {
+                    (Some((k, x)), Some((_, y))) => Some((k, both(x, y))),
+                    _ => None,
+                },
+            };
+            if let Some((k, Some(c))) = item
+                && c != 0
+            {
+                out.push((k.clone(), c));
+            }
+        }
+        NetDelta {
+            changes: out.into(),
+        }
+    }
+
     /// The change for `key` (0 if unchanged).
     pub fn get(&self, key: &EncodedKey) -> i128 {
-        self.changes.get(key).copied().unwrap_or(0)
+        self.changes
+            .binary_search_by(|(k, _)| k.cmp(key))
+            .map_or(0, |i| self.changes[i].1)
     }
 
     /// `true` if no key changes.
@@ -151,9 +211,14 @@ impl NetDelta {
         self.changes.is_empty()
     }
 
+    /// Number of changed keys.
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+
     /// Changed keys with their signed changes, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&EncodedKey, i128)> {
-        self.changes.iter().map(|(k, &c)| (k, c))
+        self.changes.iter().map(|(k, c)| (k, *c))
     }
 
     /// Keys whose count increases.
@@ -169,7 +234,7 @@ impl NetDelta {
     /// The inverse delta: applying `d` then `d.negate()` is the identity.
     pub fn negate(&self) -> Self {
         Self {
-            changes: self.changes.iter().map(|(k, &c)| (k.clone(), -c)).collect(),
+            changes: self.changes.iter().map(|(k, c)| (k.clone(), -c)).collect(),
         }
     }
 }
@@ -181,6 +246,8 @@ pub enum DeltaError {
     Underflow,
     /// A count would exceed `u64::MAX`.
     Overflow,
+    /// Changes given as sorted were out of key order, repeated a key or held a zero change.
+    NotSorted,
 }
 
 impl fmt::Display for DeltaError {
@@ -188,6 +255,7 @@ impl fmt::Display for DeltaError {
         match self {
             DeltaError::Underflow => f.write_str("delta removes a key that is not present"),
             DeltaError::Overflow => f.write_str("key count overflow"),
+            DeltaError::NotSorted => f.write_str("key changes out of order"),
         }
     }
 }

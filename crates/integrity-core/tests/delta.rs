@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use integrity_core::{
-    DeltaError, EncodedKey, KeyDelta, KeyMultiset, KeySchema, KeyValue, TypeFamily,
+    DeltaError, EncodedKey, KeyDelta, KeyMultiset, KeySchema, KeyValue, NetDelta, TypeFamily,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -173,5 +173,54 @@ proptest! {
             m.apply(&d.negate()).unwrap();
             prop_assert_eq!(m, before);
         }
+    }
+}
+
+#[test]
+fn from_sorted_takes_only_strictly_ordered_nonzero_changes() {
+    let d = NetDelta::from_sorted(vec![(k(1), 2), (k(3), -1)]).unwrap();
+    assert_eq!((d.get(&k(1)), d.get(&k(2)), d.get(&k(3))), (2, 0, -1));
+    assert_eq!(d.len(), 2);
+    assert!(NetDelta::from_sorted(Vec::new()).unwrap().is_empty());
+    for bad in [
+        vec![(k(3), 1), (k(1), 1)],
+        vec![(k(1), 1), (k(1), 1)],
+        vec![(k(1), 1), (k(2), 0)],
+    ] {
+        assert_eq!(NetDelta::from_sorted(bad), Err(DeltaError::NotSorted));
+    }
+}
+
+fn changes() -> impl Strategy<Value = BTreeMap<i64, i128>> {
+    proptest::collection::btree_map(0i64..8, -3i128..4, 0..8)
+}
+
+fn net_of(m: &BTreeMap<i64, i128>) -> NetDelta {
+    NetDelta::from_sorted(
+        m.iter()
+            .filter(|&(_, &c)| c != 0)
+            .map(|(&v, &c)| (k(v), c))
+            .collect(),
+    )
+    .unwrap()
+}
+
+proptest! {
+    #[test]
+    fn from_sorted_equals_the_net_of_the_same_counts(added in keys(), removed in keys()) {
+        let d = KeyDelta { added: set(&added), removed: set(&removed) }.net();
+        let rebuilt = NetDelta::from_sorted(d.iter().map(|(key, c)| (key.clone(), c)).collect())
+            .unwrap();
+        prop_assert_eq!(rebuilt, d);
+    }
+
+    #[test]
+    fn plus_adds_changes_key_by_key(a in changes(), b in changes()) {
+        let sum = net_of(&a).plus(&net_of(&b)).unwrap();
+        let mut oracle = a.clone();
+        for (v, c) in &b {
+            *oracle.entry(*v).or_insert(0) += c;
+        }
+        prop_assert_eq!(sum, net_of(&oracle));
     }
 }
