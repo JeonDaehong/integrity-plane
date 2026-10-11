@@ -1172,6 +1172,7 @@ dependencies = [
  "integrity-index",
  "integrity-server",
  "integrity-txn",
+ "object_store",
  "parquet",
  "reqwest",
  "serde_json",

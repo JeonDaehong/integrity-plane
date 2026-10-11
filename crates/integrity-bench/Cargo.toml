@@ -17,7 +17,7 @@ path = "src/main.rs"
 integrity-index.workspace = true
 integrity-txn.workspace = true
 integrity-server = { path = "../integrity-server" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util"] }
 axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde_json.workspace = true
@@ -25,6 +25,7 @@ apache-avro.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 parquet.workspace = true
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
 
 [lints]
 workspace = true

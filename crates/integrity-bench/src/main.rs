@@ -6,7 +6,11 @@
 //! the gateway's own `/metrics`.
 //!
 //! Usage: `integrity-bench [--parent-rows N] [--dir PATH] [--appends N] [--append-rows N]
-//!                         [--writers N] [--hot-commits N]`
+//!                         [--writers N] [--hot-commits N] [--s3 s3://BUCKET/PREFIX]`
+//!
+//! With `--s3`, every data, delete and metadata file is uploaded under the prefix once written
+//! and the Plane reads it from there (credentials and region from the environment, as the
+//! gateway's); the control store stays under `--dir`.
 //!
 //! Prints a Markdown report to stdout.
 
@@ -55,6 +59,8 @@ struct Options {
     /// Large-table mode: seconds to wait after writing many files (the load, onboarding) before
     /// the next measurement, so that background file scanners (antivirus) have settled.
     settle: u64,
+    /// `s3://bucket/prefix` the generated files are uploaded to and read from.
+    s3: Option<String>,
 }
 
 fn options() -> Result<Options, String> {
@@ -69,6 +75,7 @@ fn options() -> Result<Options, String> {
         file_rows: 1_000_000,
         mor_deletes: 50,
         settle: 0,
+        s3: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -90,6 +97,7 @@ fn options() -> Result<Options, String> {
             "--file-rows" => o.file_rows = n()?,
             "--mor-deletes" => o.mor_deletes = n()? as usize,
             "--settle" => o.settle = n()? as u64,
+            "--s3" => o.s3 = Some(value.clone()),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -163,7 +171,9 @@ fn empty_table(uuid: &str) -> Value {
 // ---------- files written the way engines write them ----------
 
 struct Files {
+    /// Where files are written (and read from, without `remote`).
     dir: PathBuf,
+    remote: Option<Remote>,
     next: AtomicI64,
     manifests_of: Mutex<HashMap<i64, Vec<String>>>,
     rows_of: Mutex<HashMap<String, i64>>,
@@ -188,9 +198,67 @@ fn avro(schema: &str, records: Vec<Vec<(&str, Avro)>>) -> Result<Vec<u8>, BoxErr
     Ok(w.into_inner()?)
 }
 
+/// An S3 prefix files are uploaded to once written; the local copy is then removed.
+struct Remote {
+    store: Arc<dyn object_store::ObjectStore>,
+    bucket: String,
+    prefix: String,
+}
+
+impl Remote {
+    /// `s3://bucket/prefix`.
+    fn new(url: &str) -> Result<Self, BoxError> {
+        let rest = url
+            .strip_prefix("s3://")
+            .ok_or("--s3 needs s3://bucket/prefix")?;
+        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, "integrity-bench"));
+        let store = object_store::aws::AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()?;
+        Ok(Self {
+            store: Arc::new(store),
+            bucket: bucket.to_owned(),
+            prefix: prefix.trim_end_matches('/').to_owned(),
+        })
+    }
+}
+
 impl Files {
+    /// Where the Plane reads file `name` from.
     fn location(&self, name: &str) -> String {
-        self.dir.join(name).to_string_lossy().replace('\\', "/")
+        match &self.remote {
+            Some(r) => format!("s3://{}/{}/{name}", r.bucket, r.prefix),
+            None => self.dir.join(name).to_string_lossy().replace('\\', "/"),
+        }
+    }
+
+    /// Makes file `name`, just written under `dir`, readable at `location(name)`.
+    fn publish(&self, name: &str) -> Result<(), BoxError> {
+        use tokio::io::AsyncWriteExt as _;
+        let Some(r) = &self.remote else {
+            return Ok(());
+        };
+        let local = self.dir.join(name);
+        let path = object_store::path::Path::from(format!("{}/{name}", r.prefix));
+        let store = Arc::clone(&r.store);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut file = tokio::fs::File::open(&local).await?;
+                let mut w = object_store::buffered::BufWriter::with_capacity(store, path, 64 << 20);
+                tokio::io::copy(&mut file, &mut w).await?;
+                w.shutdown().await?;
+                Ok::<_, BoxError>(())
+            })
+        })?;
+        std::fs::remove_file(&local)?;
+        Ok(())
+    }
+
+    /// Writes `bytes` as file `name`; returns its location.
+    fn put(&self, name: &str, bytes: Vec<u8>) -> Result<String, BoxError> {
+        std::fs::write(self.dir.join(name), bytes)?;
+        self.publish(name)?;
+        Ok(self.location(name))
     }
 
     /// One Parquet file with columns `id` and `ref`, and a manifest listing it.
@@ -232,11 +300,13 @@ impl Files {
         }
         let schema = Arc::new(arrow_schema::Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let data_path = data_path_for(&self.dir, n);
-        let file = std::fs::File::create(&data_path)?;
+        let data_name = format!("d{n}.parquet");
+        let file = std::fs::File::create(self.dir.join(&data_name))?;
         let mut w = ArrowWriter::try_new(file, schema, None)?;
         w.write(&batch)?;
         w.close()?;
+        self.publish(&data_name)?;
+        let data_path = self.location(&data_name);
         let manifest = avro(
             r#"{"type": "record", "name": "manifest_entry", "fields": [
                 {"name": "status", "type": "int"},
@@ -256,13 +326,12 @@ impl Files {
                 ),
             ]],
         )?;
-        let path = self.location(&format!("m{n}.avro"));
-        std::fs::write(&path, manifest)?;
+        let path = self.put(&format!("m{n}.avro"), manifest)?;
         if let Ok(mut rows) = self.rows_of.lock() {
             rows.insert(path.clone(), ids.len() as i64);
         }
         if let Ok(mut d) = self.data_of.lock() {
-            d.insert(path.clone(), data_path_for(&self.dir, n));
+            d.insert(path.clone(), self.location(&data_name));
         }
         Ok(path)
     }
@@ -288,11 +357,13 @@ impl Files {
                 )),
             ],
         )?;
-        let file_path = self.location(&format!("pd{n}.parquet"));
-        let file = std::fs::File::create(&file_path)?;
+        let delete_name = format!("pd{n}.parquet");
+        let file = std::fs::File::create(self.dir.join(&delete_name))?;
         let mut w = ArrowWriter::try_new(file, schema, None)?;
         w.write(&batch)?;
         w.close()?;
+        self.publish(&delete_name)?;
+        let file_path = self.location(&delete_name);
         let manifest = avro(
             r#"{"type": "record", "name": "manifest_entry", "fields": [
                 {"name": "status", "type": "int"},
@@ -312,8 +383,7 @@ impl Files {
                 ),
             ]],
         )?;
-        let path = self.location(&format!("dm{n}.avro"));
-        std::fs::write(&path, manifest)?;
+        let path = self.put(&format!("dm{n}.avro"), manifest)?;
         if let Ok(mut d) = self.deletes.lock() {
             d.insert(path.clone());
         }
@@ -339,19 +409,12 @@ impl Files {
                 })
                 .collect(),
         )?;
-        let path = self.location(&format!("l{id}.avro"));
-        std::fs::write(&path, bytes)?;
+        let path = self.put(&format!("l{id}.avro"), bytes)?;
         if let Ok(mut m) = self.manifests_of.lock() {
             m.insert(id, manifests.to_vec());
         }
         Ok((id, path))
     }
-}
-
-fn data_path_for(dir: &Path, n: i64) -> String {
-    dir.join(format!("d{n}.parquet"))
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 // ---------- client ----------
@@ -605,6 +668,7 @@ async fn main() -> Result<(), BoxError> {
         upstream: format!("http://{up}"),
         files: Arc::new(Files {
             dir: data.clone(),
+            remote: o.s3.as_deref().map(Remote::new).transpose()?,
             next: AtomicI64::new(1),
             manifests_of: Mutex::new(HashMap::new()),
             rows_of: Mutex::new(HashMap::new()),
