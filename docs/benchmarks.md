@@ -117,6 +117,30 @@ faster. Merge-on-read deletes in large files read only the row group holding the
 that this was the benchmark generating the next scenario's 100 M-row file right after the commit.
 During the commit itself the process grows by about 0.4 GB.)
 
+### Files on Amazon S3 instead of the local disk
+
+Same instance type, commit fba9235 (the Plane as in b20c5aa), 2026-10-11, with
+`--s3 s3://<bucket>/<prefix>`: every file is uploaded to an S3 bucket in the same region and the
+Plane reads it from there; the control store stays on the NVMe disk. "Local NVMe" is the "after"
+column above.
+
+| Scenario | Local NVMe | S3 |
+|---|---|---|
+| Onboarding of 100 M keys | 145 s, 1.5 GB | 155 s, 1.2 GB |
+| Onboarding of 200 M keys | | 292 s, 1.4 GB |
+| Copy-on-write delete of 1 row, 1 M-row file (100 M-row table) | 0.55 s | 0.95 s, 1.2 GB |
+| Compaction of 10 files, 10 M rows | 11.7 s | 14.3 s, 1.5 GB |
+| Copy-on-write delete of 1 row, 10 M-row file (200 M-row table) | 6.7 s | 8.3 s, 1.6 GB |
+| Compaction of 10 files, 100 M rows | 128 s | 147 s, 1.9 GB |
+| Merge-on-read delete of 1 row, 20-file table, first / 5th | 88 ms / 88 ms | 0.97 s / 1.21 s |
+| Merge-on-read delete of 1 row, 100-file table, first / 50th | 86 ms / 86 ms | **4.67 s / 8.52 s** |
+
+Onboarding, copy-on-write and compaction read large ranges and cost 5–70 % more on S3. Merge-on-read
+deletes do not: they read about 8 MB, but as soon as a table has delete files, validation reads
+every manifest of both snapshots and every live position delete file, one request at a time, so
+each commit costs a few hundred sequential S3 requests and grows with the number of manifests and
+of accumulated delete files (`docs/limitations.md`).
+
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 
 | Scenario | Time | Data | Notes |

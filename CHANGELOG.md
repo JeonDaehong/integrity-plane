@@ -12,7 +12,8 @@
   needs 1.5 GB instead of 40.7 GB, in 128 s instead of 304 s (`docs/benchmarks.md`).
 - Merge-on-read deletes read only the row groups holding changed positions: one delete in a
   10 M-row file takes 88 ms instead of up to 7 s.
-- `integrity-bench --settle` waits after large file writes before measuring.
+- `integrity-bench --settle` waits after large file writes before measuring; `--s3` writes the
+  generated files to an S3 prefix and the Plane reads them from there.
 
 ## 0.0.1 — 2026-10-09
 

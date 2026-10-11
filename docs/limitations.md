@@ -68,6 +68,10 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg 0.12, iceberg-rust 0.10, against the
   Iceberg REST fixture catalog; Spark and PyIceberg also against Apache Polaris 1.7 (OAuth2,
   catalog prefix), Lakekeeper 0.13 and Nessie 0.108. On Nessie, `verify` cannot recompute
-  certificates (the catalog serves only the current snapshot). S3 is tested
-  against SeaweedFS (MinIO no longer publishes container images), not against AWS S3.
+  certificates (the catalog serves only the current snapshot). The client tests use S3 through
+  SeaweedFS (MinIO no longer publishes container images); AWS S3 was used only by the benchmarks.
+- Commits to a table with position delete files read every manifest of both snapshots and every
+  live position delete file, sequentially. On local disk this is cheap; on S3 a merge-on-read
+  delete of one row in a 100-file table took 4.7 s, and 8.5 s once 50 delete files had
+  accumulated (`docs/benchmarks.md`).
 - Not tested: power loss (only process kills), Linux and Windows only.
