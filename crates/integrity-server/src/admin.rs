@@ -640,8 +640,7 @@ impl Gateway {
             })
             .collect();
         let unresolved = self
-            .log
-            .unresolved()
+            .awaiting_recovery()
             .map(|u| {
                 u.iter()
                     .filter(|t| members.contains(&t.prepared.identifier))
@@ -699,7 +698,7 @@ impl Gateway {
             .filter(|t| !doc.disabled.contains_key(*t))
             .filter(|t| doc.degraded.contains_key(*t) || transient.contains_key(*t))
             .count();
-        let unresolved = self.log.unresolved().map(|u| u.len()).unwrap_or(0);
+        let unresolved = self.awaiting_recovery().map(|u| u.len()).unwrap_or(0);
         self.metrics.render(
             doc.anchors.len() - degraded - disabled,
             degraded,

@@ -287,6 +287,9 @@ pub struct Gateway {
     domains: std::sync::Mutex<BTreeMap<String, Queue>>,
     /// Tables degraded by a failed index apply in this process (recovery completes it).
     pub(crate) transient: std::sync::Mutex<BTreeMap<String, String>>,
+    /// Accepted commits answered and still being finished (ADR 0022): unresolved in the log, but
+    /// not waiting for recovery.
+    finishing: std::sync::Mutex<BTreeSet<u64>>,
     /// Commit requests received per table identifier (observability; detects retry storms).
     commit_requests: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Prometheus metrics.
@@ -328,6 +331,7 @@ impl Gateway {
             admin: Arc::new(RwLock::new(())),
             domains: std::sync::Mutex::new(BTreeMap::new()),
             transient: std::sync::Mutex::new(BTreeMap::new()),
+            finishing: std::sync::Mutex::new(BTreeSet::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
             metrics: Metrics::default(),
         };
@@ -699,7 +703,7 @@ impl Gateway {
         serde_json::json!({
             "commit_requests": commit_requests,
             "degraded": if degraded.is_empty() { Value::Null } else { serde_json::json!(degraded) },
-            "unresolved_transactions": self.log.unresolved().map(|u| u.len()).ok(),
+            "unresolved_transactions": self.awaiting_recovery().map(|u| u.len()).ok(),
             "bound_tables": bound,
             "constraint_set_versions": doc.versions,
             "disabled": if doc.disabled.is_empty() { Value::Null } else { serde_json::json!(doc.disabled) },
@@ -1410,6 +1414,9 @@ impl Gateway {
                     _queue: held,
                     _shared: shared,
                 };
+                if let Ok(mut f) = self.finishing.lock() {
+                    f.insert(txn.0);
+                }
                 tokio::spawn(Arc::clone(self).finish(accepted));
                 Ok(c.response())
             }
@@ -1461,6 +1468,7 @@ impl Gateway {
     /// Writes an accepted commit's indexes, logs `COMMITTED` and audits it. A failure leaves the
     /// transaction to recovery and the domain refusing commits until then, as a crash would.
     async fn finish(self: Arc<Self>, accepted: Accepted) {
+        let _finished = Finished(&self.finishing, accepted.txn.0);
         fault::hit(FaultPoint::AfterUpstreamBeforeLog);
         let Accepted {
             txn,
@@ -1489,10 +1497,39 @@ impl Gateway {
         self.audit(event);
     }
 
+    /// Unfinished transactions waiting for recovery: those of the log, without the commits being
+    /// finished right now.
+    pub(crate) fn awaiting_recovery(
+        &self,
+    ) -> Result<Vec<integrity_txn::Unresolved>, integrity_txn::TxnError> {
+        let finishing = match self.finishing.lock() {
+            Ok(f) => f.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        Ok(self
+            .log
+            .unresolved()?
+            .into_iter()
+            .filter(|u| !finishing.contains(&u.txn.0))
+            .collect())
+    }
+
     /// Waits until every commit answered so far is finished (ADR 0022): constraint changes wait
     /// for the same.
     pub async fn settled(&self) {
         drop(self.admin.write().await);
+    }
+}
+
+/// Removes a commit from the finishing set when its task ends, however it ends.
+struct Finished<'a>(&'a std::sync::Mutex<BTreeSet<u64>>, u64);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        match self.0.lock() {
+            Ok(mut f) => f.remove(&self.1),
+            Err(p) => p.into_inner().remove(&self.1),
+        };
     }
 }
 

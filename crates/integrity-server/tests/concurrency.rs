@@ -415,7 +415,8 @@ async fn hot_key_run(seed: u64) -> BTreeMap<&'static str, usize> {
             );
         }
     }
-    // Indexes equal the final data.
+    // Indexes equal the final data, once the last answered commits have written them (ADR 0022).
+    env.gateway.settled().await;
     let entries = |id: u64, kind| {
         env.store
             .index(ConstraintId(id), kind)
