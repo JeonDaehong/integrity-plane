@@ -319,6 +319,14 @@ columns = [2]
         Ok(r.status().as_u16())
     }
 
+    /// Waits until the commits answered so far are finished: they write their indexes after the
+    /// answer (ADR 0022), and the audit log waits for that.
+    async fn settle(&self) {
+        reqwest::get(format!("{}/v1/integrity/audit", self.url))
+            .await
+            .unwrap();
+    }
+
     async fn rebuild(&self, constraint: u64) -> Result<u16, reqwest::Error> {
         let r = reqwest::Client::new()
             .post(format!(
@@ -410,6 +418,7 @@ async fn scenario(fault: FaultPoint, answer: Answer) -> (Vec<i64>, BTreeMap<&'st
             .await
             .unwrap(),
     );
+    g.settle().await;
     g.stop();
 
     // 2. The commit that crashes the gateway.
@@ -432,6 +441,7 @@ async fn scenario(fault: FaultPoint, answer: Answer) -> (Vec<i64>, BTreeMap<&'st
             .await
             .unwrap(),
     );
+    g.settle().await;
     g.stop();
 
     // 4. Invariants.
@@ -524,6 +534,7 @@ async fn a_crash_between_index_swaps_of_a_rebuild_is_safe() {
     let g = Gateway::start(&dir, addr, None).await;
     let first = commit_request(&dir, 1, None, &mut manifests);
     assert_eq!(g.commit(&first).await.unwrap(), 200);
+    g.settle().await;
     g.stop();
 
     let g = Gateway::start(&dir, addr, Some(FaultPoint::DuringRebuildSwap)).await;
@@ -536,6 +547,7 @@ async fn a_crash_between_index_swaps_of_a_rebuild_is_safe() {
     assert_eq!(g.rebuild(1).await.unwrap(), 200);
     let third = commit_request(&dir, 3, Some(2), &mut manifests);
     assert_eq!(g.commit(&third).await.unwrap(), 200);
+    g.settle().await;
     g.stop();
 
     let history = main_history(&shared.lock().unwrap().meta);

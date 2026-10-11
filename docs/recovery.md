@@ -21,8 +21,11 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
   `VALIDATED` was therefore never forwarded.
 - `VALIDATED` and `COMMITTING` of a commit about to be forwarded are written in one durable write
   (the same two records).
-- After the upstream answer: success ⇒ indexes applied at the transaction's epoch, all indexes in
-  one atomic transaction, then `COMMITTED`; a 4xx ⇒ `ABORTED`; a 5xx or no answer ⇒ resolved as below.
+- After the upstream answer: success ⇒ the client is answered at once, then indexes are applied at
+  the transaction's epoch (all indexes in one atomic transaction) and `COMMITTED` is appended, while
+  the commit still holds its domain queue and the shared constraint lock (ADR 0022); a 4xx ⇒
+  `ABORTED`; a 5xx or no answer ⇒ resolved as below. If applying or logging fails, the domain refuses
+  commits until recovery or a rebuild, as after a crash.
 - Terminal records store the response, returned again for a repeated `Idempotency-Key`.
 
 ## Resolution (on start and before every commit)
@@ -47,7 +50,7 @@ unresolved:
 | Fault point | Upstream outcome | Result |
 |---|---|---|
 | `AfterPreparedLog`, `AfterValidatedLog`, `BeforeUpstream` | not reached | aborted, indexes unchanged |
-| `AfterUpstreamBeforeLog`, `DuringIndexApply`, `BeforeCommittedLog` | committed | indexes completed by recovery |
+| `AfterUpstreamBeforeLog`, `DuringIndexApply`, `BeforeCommittedLog` | committed, client already answered (ADR 0022) | indexes completed by recovery |
 | `AfterUpstreamUnknown` | committed, answered 500 | indexes completed by recovery |
 | `AfterUpstreamUnknown` | refused, answered 500 | aborted, indexes unchanged |
 

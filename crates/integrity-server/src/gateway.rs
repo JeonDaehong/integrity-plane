@@ -23,12 +23,12 @@ use integrity_iceberg::{
 };
 use integrity_index::{IndexKind, KeyIndex, PersistentIndex, PersistentStore};
 use integrity_txn::{
-    Decision as TxnDecision, FaultPoint, Prepared, TxnLog, TxnState, Validated, fault,
+    Decision as TxnDecision, FaultPoint, Prepared, TxnId, TxnLog, TxnState, Validated, fault,
 };
 use integrity_types::{ConstraintId, ConstraintSetVersion, ErrorCode, SnapshotId};
 use integrity_validator::Validator;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
 use crate::config::ConstraintConfig;
 use crate::error::ApiError;
@@ -280,7 +280,9 @@ pub struct Gateway {
     pub(crate) require_signatures: bool,
     /// Held shared by every commit request, exclusively by constraint changes and rebuilds
     /// (ADR 0011).
-    pub(crate) admin: tokio::sync::RwLock<()>,
+    /// Held shared by every commit (until it is finished, ADR 0022) and exclusively by constraint
+    /// changes (ADR 0011).
+    pub(crate) admin: Arc<RwLock<()>>,
     /// One queue per integrity domain, keyed by the domain's smallest table identifier.
     domains: std::sync::Mutex<BTreeMap<String, Queue>>,
     /// Tables degraded by a failed index apply in this process (recovery completes it).
@@ -323,7 +325,7 @@ impl Gateway {
             scan_memory: crate::config::DEFAULT_SCAN_MEMORY as usize,
             signer: None,
             require_signatures: false,
-            admin: tokio::sync::RwLock::new(()),
+            admin: Arc::new(RwLock::new(())),
             domains: std::sync::Mutex::new(BTreeMap::new()),
             transient: std::sync::Mutex::new(BTreeMap::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
@@ -604,7 +606,7 @@ impl Gateway {
 
     /// Serves one request.
     pub async fn handle(
-        &self,
+        self: &Arc<Self>,
         method: Method,
         path_and_query: &str,
         headers: HeaderMap,
@@ -625,8 +627,9 @@ impl Gateway {
             )
             .into_response(),
             Route::Commit(table) => {
-                // Constraints cannot change between this check and the response (ADR 0011).
-                let _shared = self.admin.read().await;
+                // Constraints cannot change between this check and the end of the commit (ADR 0011,
+                // ADR 0022).
+                let shared = Arc::clone(&self.admin).read_owned().await;
                 let doc = self.registry.snapshot();
                 let identifier = table.identifier();
                 if !doc.is_constrained(&identifier) {
@@ -639,7 +642,8 @@ impl Gateway {
                     self.audit(event);
                     self.proxy(method, path_and_query, &headers, body).await
                 } else {
-                    self.commit(&table, path_and_query, headers, body).await
+                    self.commit(&table, path_and_query, headers, body, shared)
+                        .await
                 }
             }
             Route::Proxy => self.proxy(method, path_and_query, &headers, body).await,
@@ -1001,14 +1005,15 @@ impl Gateway {
     }
 
     async fn commit(
-        &self,
+        self: &Arc<Self>,
         table: &TablePath,
         path_and_query: &str,
         headers: HeaderMap,
         body: Bytes,
+        shared: OwnedRwLockReadGuard<()>,
     ) -> Response {
         let outcome = self
-            .commit_inner(table, path_and_query, headers, body)
+            .commit_inner(table, path_and_query, headers, body, shared)
             .await;
         let counter = match &outcome {
             Ok(r) if r.status().is_success() => &self.metrics.accepted,
@@ -1023,11 +1028,12 @@ impl Gateway {
     }
 
     async fn commit_inner(
-        &self,
+        self: &Arc<Self>,
         table: &TablePath,
         path_and_query: &str,
         headers: HeaderMap,
         body: Bytes,
+        shared: OwnedRwLockReadGuard<()>,
     ) -> Result<Response, ApiError> {
         let request_id = headers
             .get("idempotency-key")
@@ -1062,7 +1068,7 @@ impl Gateway {
         }
 
         let waiting = Instant::now();
-        let _queue = queue.lock().await;
+        let held = queue.lock_owned().await;
         self.metrics.queue_wait.observe(waiting.elapsed());
         self.recover(&headers, Some(&members)).await?;
         if let Some(d) = request_id.as_deref().and_then(|r| self.log.decision_for(r)) {
@@ -1383,16 +1389,8 @@ impl Gateway {
         };
         match captured {
             Some(c) if (200..300).contains(&c.status) => {
-                fault::hit(FaultPoint::AfterUpstreamBeforeLog);
-                if let Err(e) = pipeline::apply(&self.store, &staged, &indexes, epoch) {
-                    // The commit happened; recovery re-applies, and nothing else commits meanwhile.
-                    self.mark_transient(&identifier, &e.message);
-                    return Ok(c.response());
-                }
-                fault::hit(FaultPoint::BeforeCommittedLog);
-                self.log
-                    .finish(txn, TxnState::Committed, c.decision())
-                    .map_err(log_error)?;
+                // The commit happened: answer now and write the indexes after, still holding the
+                // domain queue and the shared constraint lock (ADR 0022).
                 let mut event = AuditEvent::new("COMMIT_ACCEPTED", Some(&identifier));
                 event.actor = Some(actor.clone());
                 event.txn = Some(txn.0);
@@ -1401,7 +1399,18 @@ impl Gateway {
                 event.verdict = Some("ACCEPTED".into());
                 event.certificate = certificates.last().cloned();
                 event.constraints = governing_ids;
-                self.audit(event);
+                let accepted = Accepted {
+                    txn,
+                    epoch,
+                    staged,
+                    indexes,
+                    decision: c.decision(),
+                    identifier,
+                    event,
+                    _queue: held,
+                    _shared: shared,
+                };
+                tokio::spawn(Arc::clone(self).finish(accepted));
                 Ok(c.response())
             }
             Some(c) if (400..500).contains(&c.status) => {
@@ -1431,6 +1440,59 @@ impl Gateway {
                 }
             }
         }
+    }
+}
+
+/// An accepted commit whose client was answered, still to be finished (ADR 0022). Holds the domain
+/// queue and the shared constraint lock until it is dropped.
+struct Accepted {
+    txn: TxnId,
+    epoch: u64,
+    staged: Vec<(ConstraintId, integrity_index::StagedDelta)>,
+    indexes: BTreeMap<ConstraintId, PersistentIndex>,
+    decision: TxnDecision,
+    identifier: String,
+    event: AuditEvent,
+    _queue: OwnedMutexGuard<()>,
+    _shared: OwnedRwLockReadGuard<()>,
+}
+
+impl Gateway {
+    /// Writes an accepted commit's indexes, logs `COMMITTED` and audits it. A failure leaves the
+    /// transaction to recovery and the domain refusing commits until then, as a crash would.
+    async fn finish(self: Arc<Self>, accepted: Accepted) {
+        fault::hit(FaultPoint::AfterUpstreamBeforeLog);
+        let Accepted {
+            txn,
+            epoch,
+            staged,
+            indexes,
+            decision,
+            identifier,
+            event,
+            _queue,
+            _shared,
+        } = accepted;
+        let store = self.store.clone();
+        let applied =
+            tokio::task::spawn_blocking(move || pipeline::apply(&store, &staged, &indexes, epoch))
+                .await;
+        match applied {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return self.mark_transient(&identifier, &e.message),
+            Err(e) => return self.mark_transient(&identifier, &format!("index write: {e}")),
+        }
+        fault::hit(FaultPoint::BeforeCommittedLog);
+        if let Err(e) = self.log.finish(txn, TxnState::Committed, decision) {
+            return self.mark_transient(&identifier, &format!("transaction log: {e}"));
+        }
+        self.audit(event);
+    }
+
+    /// Waits until every commit answered so far is finished (ADR 0022): constraint changes wait
+    /// for the same.
+    pub async fn settled(&self) {
+        drop(self.admin.write().await);
     }
 }
 

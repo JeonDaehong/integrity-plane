@@ -105,8 +105,9 @@ must be onboarded; a `main` head that is neither the anchor nor certified means 
 Plane, which refuses with `BYPASS_DETECTED` and degrades the domain), requirements are checked, the commit is classified, each new `main` snapshot is
 validated against an overlay of the persistent indexes, certificates are injected, and the request is
 forwarded. Every step is recorded in the transaction log (RFC 0004, `docs/recovery.md`): index changes are
-applied only after the upstream commit succeeds, a crash at any point is resolved on restart, and a
-repeated `Idempotency-Key` gets the recorded answer. Decisions use the status mapping of
+applied only after the upstream commit succeeds (after the client is answered, still inside the
+domain's queue: [ADR 0022](adr/0022-answer-before-the-index-write.md)), a crash at any point is
+resolved on restart, and a repeated `Idempotency-Key` gets the recorded answer. Decisions use the status mapping of
 [RFC 0003](rfc/0003-http-status-mapping.md). Everything else, including table creation and loads, is
 forwarded unchanged; `/v1/config` is stripped of `uri` overrides and idempotency support.
 
@@ -155,7 +156,7 @@ names or key values.
 
 A domain is the FK-connected component of a table among the configured constraints. Each domain
 has one commit queue (an async lock): validation, publication upstream and index application of a
-commit happen while holding it, so the "child insert vs. parent delete" race cannot occur. Commits in
+commit happen while holding it (the index application after the client is answered, ADR 0022), so the "child insert vs. parent delete" race cannot occur. Commits in
 different domains run in parallel. Recovery before a commit only resolves that domain's unfinished
 transactions; another domain may be publishing its own at the same moment.
 

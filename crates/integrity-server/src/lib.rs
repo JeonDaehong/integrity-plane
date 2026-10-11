@@ -139,6 +139,8 @@ async fn audit(
         return unauthorized();
     }
     let since = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Commits already answered are in the log once finished (ADR 0022).
+    g.settled().await;
     reply(g.audit_events(q.get("table").map(String::as_str), since))
 }
 
@@ -182,6 +184,7 @@ async fn transaction(
     if !authorized(&g, &headers) {
         return unauthorized();
     }
+    g.settled().await;
     g.transaction(id).map_or_else(
         || not_found("transaction"),
         |v| axum::Json(v).into_response(),

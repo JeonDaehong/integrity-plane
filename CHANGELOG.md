@@ -12,6 +12,11 @@
   needs 1.5 GB instead of 40.7 GB, in 128 s instead of 304 s (`docs/benchmarks.md`).
 - Merge-on-read deletes read only the row groups holding changed positions: one delete in a
   10 M-row file takes 88 ms instead of up to 7 s.
+- An accepted commit is answered as soon as upstream accepts it; its index write and `COMMITTED`
+  record follow while it still holds its domain queue (ADR 0022). The audit and transaction APIs
+  wait for answered commits to finish.
+- Rewrites (copy-on-write, compaction) validate several times faster: keys sorted by prefix, no
+  per-row allocations, and reading, row comparison and key checks on separate threads.
 - Key deltas, staged index writes and the validation overlay are kept in key order instead of
   per-key maps (ADR 0021): commits that change many keys validate several times faster.
 - Each manifest and delete file of a commit is read once, up to 16 at a time (ADR 0020): on
