@@ -31,5 +31,6 @@ pub use io::{Budgeted, FileIo, MemoryIo, ReadError};
 pub use metadata::TableMetadata;
 pub use parquet_keys::{
     ExtractError, extract_rows, extract_rows_from, for_each_batch_from, for_each_batch_where,
+    for_each_selected,
 };
 pub use request::{CommitRequest, MalformedRequest, Requirement, Update};

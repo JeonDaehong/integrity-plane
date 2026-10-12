@@ -426,3 +426,123 @@ fn wide_files_are_read_for_their_key_columns_only() {
         "read {read} of {size} bytes: more than the key column"
     );
 }
+
+/// Decoding only selected rows gives exactly the rows at those positions, with their positions,
+/// across row group boundaries, and reads no row group without a selected row.
+#[test]
+fn selected_rows_match_the_whole_file_at_their_positions() {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use integrity_iceberg::{Budgeted, MemoryIo, for_each_selected};
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::file::properties::WriterProperties;
+
+    let meta = |id: &str| {
+        std::collections::HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(meta("1")),
+        Field::new("tag", DataType::Utf8, true).with_metadata(meta("2")),
+    ]));
+    let n = 25_000i64;
+    let tags: Vec<Option<String>> = (0..n)
+        .map(|i| (i % 7 != 0).then(|| format!("t{}", i % 13)))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..n).map(|i| i * 3).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(tags)),
+        ],
+    )
+    .unwrap();
+    let mut file = Vec::new();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(10_000)) // row groups of 10 000, 10 000 and 5 000 rows
+        .set_data_page_row_count_limit(1_000)
+        .build();
+    let mut w = ArrowWriter::try_new(&mut file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let mut io = MemoryIo::new();
+    io.insert("f.parquet", file);
+    let columns = [
+        (FieldId(2), LogicalType::String),
+        (FieldId(1), LogicalType::Long),
+    ];
+    let all = integrity_iceberg::extract_rows_from(&io, "f.parquet", &columns).unwrap();
+
+    let selections: Vec<BTreeSet<u64>> = vec![
+        BTreeSet::new(),
+        BTreeSet::from([0]),
+        BTreeSet::from([24_999]),
+        BTreeSet::from([9_999, 10_000, 19_999, 20_000]),
+        (0..25_000).step_by(100).collect(),
+        (3..25_000).step_by(997).collect(),
+        (12_000..12_400).collect(),
+        (0..25_000).collect(),
+    ];
+    for picked in &selections {
+        let mut got = Vec::new();
+        let mut at = Vec::new();
+        let rows = for_each_selected::<integrity_iceberg::ExtractError>(
+            &io,
+            "f.parquet",
+            &columns,
+            picked,
+            |batch, positions| {
+                assert_eq!(batch.len(), positions.len());
+                got.extend(batch.rows().iter().cloned());
+                at.extend_from_slice(positions);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows, n as u64);
+        assert_eq!(at, picked.iter().copied().collect::<Vec<_>>());
+        let want: Vec<_> = picked
+            .iter()
+            .map(|&p| all.rows()[p as usize].clone())
+            .collect();
+        assert_eq!(got, want, "{} selected rows", picked.len());
+    }
+
+    // Positions in the middle row group only: the other row groups are not read.
+    let whole = Budgeted::new(&io, u64::MAX);
+    integrity_iceberg::extract_rows_from(&whole, "f.parquet", &columns).unwrap();
+    let middle = Budgeted::new(&io, u64::MAX);
+    for_each_selected::<integrity_iceberg::ExtractError>(
+        &middle,
+        "f.parquet",
+        &columns,
+        &BTreeSet::from([15_000]),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    // The footer read (up to 64 KiB) is common to both.
+    assert!(
+        middle.used() + 50_000 < whole.used(),
+        "read {} of {} bytes",
+        middle.used(),
+        whole.used()
+    );
+
+    // A position past the end belongs to no row group: nothing is decoded for it, and the caller
+    // checks positions against the returned row count.
+    let mut seen = 0;
+    let rows = for_each_selected::<integrity_iceberg::ExtractError>(
+        &io,
+        "f.parquet",
+        &columns,
+        &BTreeSet::from([5, 25_000]),
+        |batch, _| {
+            seen += batch.len();
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((rows, seen), (n as u64, 1));
+}

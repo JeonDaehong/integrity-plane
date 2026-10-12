@@ -265,5 +265,31 @@ pub async fn run(b: &Bench, o: &Options) -> Result<String, BoxError> {
         ));
     }
 
+    // Merge-on-read delete of 1 % of all rows, spread over every file: every 100th row (from row
+    // 50, clear of the single deletes above) of every live data file, in one delete file.
+    let mut list = current(b, "big").await?;
+    let (rows_of, data_of) = (
+        b.files.rows_of.lock().map_err(|_| "lock")?.clone(),
+        b.files.data_of.lock().map_err(|_| "lock")?.clone(),
+    );
+    let mut spread = Vec::new();
+    for m in &list {
+        if let (Some(d), Some(&n)) = (data_of.get(m), rows_of.get(m)) {
+            spread.extend((50..n).step_by(100).map(|p| (d.clone(), p)));
+        }
+    }
+    let deleted = spread.len();
+    list.push(b.files.position_deletes(&spread)?);
+    drop(spread);
+    mark(&started, "merge-on-read-spread", "starts");
+    let (status, took, validation, read) = measured(b, "big", Change::Raw(list, "delete")).await?;
+    mark(&started, "merge-on-read-spread", "ends");
+    line(format!(
+        "| Merge-on-read delete of 1 % of all rows ({deleted}), spread over every file | end-to-end {}; validation {} | read {} | status {status} |",
+        seconds(took),
+        seconds(validation),
+        mib(read)
+    ));
+
     Ok(out)
 }

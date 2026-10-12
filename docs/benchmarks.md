@@ -194,6 +194,44 @@ per changed key) now follows the answer. A merge-on-read delete spread over ever
 columns of every row group it touches, and a compaction sorts every key and row of both sides
 (`docs/limitations.md`).
 
+### A nightly ETL job through the Plane
+
+The statements above write and little else, so their multipliers overstate what a job pays.
+`compat/spark_etl_bench.py` runs a whole nightly job on the same setup (Spark 3.5 / Iceberg 1.10,
+data on S3, one `m6id.4xlarge`, commit 7ffbb42, 2026-10-12): it reads a raw customer feed (100 K
+changes) and 6 M raw order events, upserts customer(id PK, code UNIQUE) with MERGE, keeps each
+order's latest event, joins customers and a product table, upserts 3 M orders into orders(id PK,
+cust FK → customer) with MERGE (1.5 M updates, 1.5 M inserts; 30 M orders at the start) and rebuilds
+an unconstrained per-customer summary from all orders. Medians of 2 nights per write mode, each night
+alternating which side runs first.
+
+| Step | Copy-on-write: direct | Plane | Merge-on-read: direct | Plane |
+|---|---|---|---|---|
+| customer MERGE | 3.4 s | 8.0 s | 3.2 s | 5.2 s |
+| events → dedup → joins → orders MERGE | 13.5 s | 21.0 s | 13.5 s | 19.8 s |
+| summary rebuild (no constraints) | 6.6 s | 6.4 s | 7.0 s | 7.4 s |
+| **Whole job** | **23.5 s** | **35.4 s (+51 %)** | **23.7 s** | **32.4 s (+36 %)** |
+| of which validation | | 11.9 s | | 8.5 s |
+
+Both sides end with the same 35 984 601 orders (same ids and amount total) and 1 080 000
+customers. The Plane adds 9–12 s to a job Spark finishes in 24 s; a job with heavier reads, joins or
+aggregations pays the same seconds on a larger total. Most of it is rewrite validation: the
+copy-on-write customer MERGE rewrites every customer file (its changes are spread over the table)
+and validates all 1 M rows against PK and UNIQUE.
+
+### Merge-on-read deletes spread over a table (ADR 0023, local)
+
+`integrity-bench --scale 10000000 --file-rows 1000000` on the local Windows machine, before and after
+decoding only the changed rows of kept data files:
+
+| Scenario | Before | After |
+|---|---|---|
+| Merge-on-read delete of 1 % of all rows (100 000), spread over all 10 files | 930 ms | 321 ms |
+| Merge-on-read delete of 1 row (validation) | 85 ms | 11 ms |
+
+What is read is unchanged (80 MiB, the key column of every touched row group); converting every key
+of those row groups was the cost.
+
 ### Large tables and appends, version C (local NVMe)
 
 Same instance, commit fe42956, files on the instance's disk as in the sections above

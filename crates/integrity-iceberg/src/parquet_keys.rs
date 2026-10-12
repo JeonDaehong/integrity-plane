@@ -30,7 +30,7 @@ use integrity_core::{Datum, KeyValue, LogicalType, RowBatch, TypeFamily};
 use integrity_types::{ErrorCode, FieldId};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-    ParquetRecordBatchReaderBuilder,
+    ParquetRecordBatchReaderBuilder, RowSelection,
 };
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::Type;
@@ -160,7 +160,7 @@ pub fn extract_rows_from(
     let footer = guarded(|| Footer::read(io, location, columns))?;
     let mut all = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
     for rg in 0..footer.metadata.metadata().num_row_groups() {
-        let mut reader = guarded(|| footer.row_group(io, location, rg))?;
+        let mut reader = guarded(|| footer.row_group(io, location, rg, None))?;
         while guarded(|| reader.next_into(columns, &mut all))? {}
     }
     Ok(all)
@@ -196,7 +196,7 @@ pub fn for_each_batch_where<E: From<ExtractError>>(
         let rows = u64::try_from(footer.metadata.metadata().row_group(rg).num_rows())
             .map_err(|_| parquet_err("negative row count in a row group"))?;
         if wanted(start, rows) {
-            let mut reader = guarded(|| footer.row_group(io, location, rg))?;
+            let mut reader = guarded(|| footer.row_group(io, location, rg, None))?;
             let mut at = start;
             loop {
                 let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
@@ -212,6 +212,60 @@ pub fn for_each_batch_where<E: From<ExtractError>>(
             }
         }
         start += rows;
+    }
+    Ok(start)
+}
+
+/// Like [`for_each_batch_where`], decoding only the rows at `positions` (file positions, in
+/// order): row groups without one are not read, and in the others the decoder skips every other
+/// row instead of converting it. Hands `f` each batch with the file positions of its rows, in
+/// order. Returns the number of rows of the whole file (from the footer); each row group read must
+/// decode to exactly the selected rows. Merge-on-read deletes spread over a file need only the
+/// deleted rows' keys.
+pub fn for_each_selected<E: From<ExtractError>>(
+    io: &(impl crate::io::FileIo + ?Sized),
+    location: &str,
+    columns: &[(FieldId, LogicalType)],
+    positions: &std::collections::BTreeSet<u64>,
+    mut f: impl FnMut(RowBatch, &[u64]) -> Result<(), E>,
+) -> Result<u64, E> {
+    let footer = guarded(|| Footer::read(io, location, columns))?;
+    let mut start = 0u64;
+    for rg in 0..footer.metadata.metadata().num_row_groups() {
+        let rows = u64::try_from(footer.metadata.metadata().row_group(rg).num_rows())
+            .map_err(|_| parquet_err("negative row count in a row group"))?;
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| parquet_err("row count overflows"))?;
+        let picked: Vec<u64> = positions.range(start..end).copied().collect();
+        if !picked.is_empty() {
+            let total = usize::try_from(rows).map_err(|_| parquet_err("row group too large"))?;
+            let selection = RowSelection::from_consecutive_ranges(
+                picked.iter().map(|&p| {
+                    let i = (p - start) as usize;
+                    i..i + 1
+                }),
+                total,
+            );
+            let mut reader = guarded(|| footer.row_group(io, location, rg, Some(selection)))?;
+            let mut done = 0usize;
+            loop {
+                let mut batch = RowBatch::new(columns.iter().map(|(f, _)| *f).collect());
+                if !guarded(|| reader.next_into(columns, &mut batch))? {
+                    break;
+                }
+                let n = batch.len();
+                let at = picked
+                    .get(done..done + n)
+                    .ok_or_else(|| parquet_err("a row group decodes to more rows than selected"))?;
+                f(batch, at)?;
+                done += n;
+            }
+            if done != picked.len() {
+                return Err(parquet_err("a row group decodes to fewer rows than selected").into());
+            }
+        }
+        start = end;
     }
     Ok(start)
 }
@@ -301,12 +355,14 @@ impl Footer {
         })
     }
 
-    /// Reads the requested column chunks of row group `rg` and opens a reader over them.
+    /// Reads the requested column chunks of row group `rg` and opens a reader over them, decoding
+    /// only the rows of `selection` (relative to the row group) when there is one.
     fn row_group(
         &self,
         io: &(impl crate::io::FileIo + ?Sized),
         location: &str,
         rg: usize,
+        selection: Option<RowSelection>,
     ) -> Result<RowGroupReader, ExtractError> {
         let mut sparse = Sparse {
             len: self.len,
@@ -326,13 +382,15 @@ impl Footer {
                 sparse.ranges.push((start, bytes));
             }
         }
-        let reader =
+        let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(sparse, self.metadata.clone())
                 .with_projection(self.mask.clone())
                 .with_row_groups(vec![rg])
-                .with_batch_size(BATCH_SIZE)
-                .build()
-                .map_err(parquet_err)?;
+                .with_batch_size(BATCH_SIZE);
+        if let Some(selection) = selection {
+            builder = builder.with_row_selection(selection);
+        }
+        let reader = builder.build().map_err(parquet_err)?;
         Ok(RowGroupReader(reader))
     }
 }
