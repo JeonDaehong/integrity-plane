@@ -742,7 +742,7 @@ impl Validator {
     }
 }
 
-impl CommitScan<'_> {
+impl<'v> CommitScan<'v> {
     /// The constraints whose keys [`CommitScan::feed`] emits.
     pub fn keyed(&self) -> Vec<ConstraintId> {
         self.ctx
@@ -805,6 +805,24 @@ impl CommitScan<'_> {
         Ok(())
     }
 
+    /// The removed side of this scan, to be fed on another thread (ADR 0024): removed rows only
+    /// yield keys (or prove the indexes inconsistent), so they need none of the scan's state.
+    /// Feed it every removed row instead of [`CommitScan::feed`], then hand it back with
+    /// [`CommitScan::absorb`].
+    pub fn removed(&self) -> RemovedScan<'v> {
+        RemovedScan {
+            own: self.ctx.own.clone(),
+            errors: BTreeMap::new(),
+        }
+    }
+
+    /// Takes back what [`CommitScan::removed`] found: as if its rows had been fed here.
+    pub fn absorb(&mut self, removed: RemovedScan<'_>) {
+        for (pos, e) in removed.errors {
+            self.errors.entry((pos, Side::Removed)).or_insert(e);
+        }
+    }
+
     /// Whether [`CommitScan::counts`] does anything for a key with these counts: keys that
     /// neither repeat among the added rows nor change their count need not be reported (most
     /// keys of a rewrite).
@@ -860,6 +878,53 @@ impl CommitScan<'_> {
             self.plan.deltas.insert(id, net);
         }
         Validator::decide(&self.ctx, observed, self.plan, self.snapshot, indexes)
+    }
+}
+
+/// The removed side of a [`CommitScan`] (see [`CommitScan::removed`]).
+#[derive(Debug)]
+pub struct RemovedScan<'v> {
+    own: Vec<&'v ResolvedConstraint>,
+    /// The first error of each constraint position.
+    errors: BTreeMap<usize, ValidationError>,
+}
+
+impl RemovedScan<'_> {
+    /// [`CommitScan::feed`] of removed rows.
+    pub fn feed<E>(
+        &mut self,
+        rows: &RowBatch,
+        mut emit: impl FnMut(ConstraintId, EncodedKey) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (pos, rc) in self.own.iter().enumerate() {
+            if self.errors.contains_key(&pos) {
+                continue;
+            }
+            let id = rc.constraint.id;
+            let mut failed: Option<E> = None;
+            let result = match &rc.constraint.kind {
+                ConstraintKind::NotNull(_) => Ok(()),
+                kind => match kind.key() {
+                    Some(key) => Plan::removed_keys(rc, key, rows, |k| {
+                        emit(id, k).map_err(|e| {
+                            failed = Some(e);
+                            ValidationError::Unprovable(id)
+                        })
+                    }),
+                    None => Err(ValidationError::Unprovable(id)),
+                },
+            };
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if let Err(e) = result {
+                self.errors.insert(pos, e);
+            }
+        }
+        Ok(())
     }
 }
 

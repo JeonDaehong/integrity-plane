@@ -257,7 +257,8 @@ proptest! {
     fn streaming_a_commit_decides_like_reading_it_whole(
         (parent, step, not_null) in case(),
         row_group in 1usize..6,
-        memory in 1usize..3000,
+        // Small budgets spill and sort on threads of their own; a large one sorts in memory.
+        memory in prop_oneof![1usize..3000, Just(64usize << 20)],
     ) {
         if let Err(e) = compare(&parent, &step, not_null, row_group, memory) {
             prop_assert!(false, "{}", e);

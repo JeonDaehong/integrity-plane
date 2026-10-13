@@ -12,12 +12,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::thread::ScopedJoinHandle;
 
 use integrity_core::{EncodedKey, LogicalType, RowBatch, Side, Violation, encode_row_into};
 use integrity_iceberg::{
-    Budgeted, FileChanges, FileIo, InspectError, MainChange, NewSnapshot, Operation, TableMetadata,
-    check_operation, check_sides, commit_rows, diff_snapshots, for_each_commit_batch,
+    Budgeted, CommitDeletes, FileChanges, FileIo, InspectError, MainChange, NewSnapshot, Operation,
+    TableMetadata, check_operation, check_sides, commit_rows, diff_snapshots, for_each_side_batch,
 };
 use integrity_index::{
     IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex, PersistentStore,
@@ -309,24 +310,192 @@ fn invalid(e: ValidationError) -> ApiError {
     ApiError::new(e.code(), e.to_string())
 }
 
-/// A pair of sorters, one per side.
-struct Sides([KeySorter; 2]);
+/// Bytes of keys a sorter takes on the feeding thread before it moves to a thread of its own, and
+/// bytes sent to that thread at once; less when the sorter's memory budget is smaller (it spills
+/// anyway).
+const CHUNK: usize = 256 * 1024;
 
-impl Sides {
-    fn new(scratch: &Path, budget: usize) -> Self {
-        Sides([
-            KeySorter::new(scratch, budget),
-            KeySorter::new(scratch, budget),
-        ])
+/// A sorter thread's result.
+type Sorted<'s, T> = ScopedJoinHandle<'s, Result<T, ApiError>>;
+
+/// Moves a sorter to a thread of its own: the sender of its chunks, and its result.
+type Spawn<'s, T> = Box<dyn FnOnce(KeySorter) -> (SyncSender<Vec<u8>>, Sorted<'s, T>) + Send + 's>;
+
+/// The feeding end of a [`KeySorter`] (ADR 0024). A sorter starts on the feeding thread; once it
+/// has taken `limit` bytes it moves to a thread of its own and is sent byte strings packed in
+/// chunks, so that sorting and spilling run beside the thread that encodes the keys. Small commits
+/// start no thread.
+struct Feeder<'s, T> {
+    state: State<'s, T>,
+    finish: fn(KeySorter) -> Result<T, IndexError>,
+    /// [`CHUNK`], or the sorter's budget when smaller.
+    limit: usize,
+}
+
+enum State<'s, T> {
+    Here {
+        sorter: KeySorter,
+        bytes: usize,
+        spawn: Spawn<'s, T>,
+    },
+    There {
+        chunk: Vec<u8>,
+        send: SyncSender<Vec<u8>>,
+        sorted: Sorted<'s, T>,
+    },
+    /// Only while moving.
+    Moving,
+}
+
+/// What a closed [`Feeder`] gives: its sorter's result, or the thread computing it.
+enum Finished<'s, T> {
+    Here(Result<T, ApiError>),
+    There(Sorted<'s, T>),
+}
+
+impl<T> Finished<'_, T> {
+    fn threaded(&self) -> bool {
+        matches!(self, Finished::There(_))
     }
 
-    fn side(&mut self, side: Side) -> &mut KeySorter {
-        match side {
-            Side::Added => &mut self.0[0],
-            Side::Removed => &mut self.0[1],
+    fn result(self) -> Result<T, ApiError> {
+        match self {
+            Finished::Here(r) => r,
+            Finished::There(h) => joined(h),
         }
     }
 }
+
+impl<'s, T: Send + 's> Feeder<'s, T> {
+    /// A feeder whose sorter keeps about `budget` bytes in memory and returns `finish(sorter)`.
+    fn new(
+        s: &'s std::thread::Scope<'s, '_>,
+        scratch: &'s Path,
+        budget: usize,
+        finish: fn(KeySorter) -> Result<T, IndexError>,
+    ) -> Self {
+        let spawn: Spawn<'s, T> = Box::new(move |sorter| {
+            let (send, chunks) = sync_channel::<Vec<u8>>(QUEUED_BATCHES);
+            let sorted = s.spawn(move || sort_chunks(sorter, &chunks, finish));
+            (send, sorted)
+        });
+        Self {
+            state: State::Here {
+                sorter: KeySorter::new(scratch, budget),
+                bytes: 0,
+                spawn,
+            },
+            finish,
+            limit: CHUNK.min(budget).max(1),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), ApiError> {
+        let grown = match &mut self.state {
+            State::Here {
+                sorter,
+                bytes: taken,
+                ..
+            } => {
+                sorter.push_bytes(bytes).map_err(spill)?;
+                *taken += bytes.len();
+                *taken >= self.limit
+            }
+            State::There { chunk, send, .. } => {
+                let len = u32::try_from(bytes.len()).map_err(|_| spill(IndexError::Corrupt))?;
+                chunk.extend_from_slice(&len.to_le_bytes());
+                chunk.extend_from_slice(bytes);
+                if chunk.len() >= self.limit {
+                    let full = std::mem::replace(chunk, Vec::with_capacity(self.limit + 64));
+                    send.send(full).map_err(|_| stopped_sorting())?;
+                }
+                false
+            }
+            State::Moving => return Err(spill(IndexError::Corrupt)),
+        };
+        if grown
+            && let State::Here { sorter, spawn, .. } =
+                std::mem::replace(&mut self.state, State::Moving)
+        {
+            let (send, sorted) = spawn(sorter);
+            self.state = State::There {
+                chunk: Vec::with_capacity(self.limit + 64),
+                send,
+                sorted,
+            };
+        }
+        Ok(())
+    }
+
+    /// Sends what is left and closes the feeder: whether that worked, and the sorter's result.
+    fn close(self) -> (Result<(), ApiError>, Finished<'s, T>) {
+        match self.state {
+            State::Here { sorter, .. } => {
+                (Ok(()), Finished::Here((self.finish)(sorter).map_err(spill)))
+            }
+            State::There {
+                chunk,
+                send,
+                sorted,
+            } => {
+                let sent = if chunk.is_empty() {
+                    Ok(())
+                } else {
+                    send.send(chunk).map_err(|_| stopped_sorting())
+                };
+                (sent, Finished::There(sorted))
+            }
+            State::Moving => (
+                Err(spill(IndexError::Corrupt)),
+                Finished::Here(Err(spill(IndexError::Corrupt))),
+            ),
+        }
+    }
+}
+
+/// A sorter's thread: pushes the byte strings of every chunk, then returns `finish(sorter)`.
+fn sort_chunks<T>(
+    mut sorter: KeySorter,
+    chunks: &std::sync::mpsc::Receiver<Vec<u8>>,
+    finish: fn(KeySorter) -> Result<T, IndexError>,
+) -> Result<T, ApiError> {
+    for chunk in chunks {
+        let mut at = 0;
+        while at < chunk.len() {
+            let len = chunk
+                .get(at..at + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_le_bytes)
+                .ok_or_else(|| spill(IndexError::Corrupt))? as usize;
+            let bytes = chunk
+                .get(at + 4..at + 4 + len)
+                .ok_or_else(|| spill(IndexError::Corrupt))?;
+            sorter.push_bytes(bytes).map_err(spill)?;
+            at += 4 + len;
+        }
+    }
+    finish(sorter).map_err(spill)
+}
+
+/// Closes `feeders`: the first failure to send, and every sorter's result in order.
+fn close_all<'s, T: Send + 's>(
+    feeders: impl IntoIterator<Item = Feeder<'s, T>>,
+) -> (Result<(), ApiError>, Vec<Finished<'s, T>>) {
+    let mut sent = Ok(());
+    let mut finished = Vec::new();
+    for f in feeders {
+        let (s, done) = f.close();
+        if sent.is_ok() {
+            sent = s;
+        }
+        finished.push(done);
+    }
+    (sent, finished)
+}
+
+/// What the threads of a streamed validation return: whether both sides hold the same rows (a
+/// `replace`), the merged keys of each constraint, and the number of rows added and removed.
+type Scanned = (Option<Result<bool, ApiError>>, Vec<Merged>, (u64, u64));
 
 impl Streamed<'_> {
     /// Validates the step: what `check_operation` and `validate_with_details` decide for the
@@ -341,106 +510,208 @@ impl Streamed<'_> {
             .validator
             .commit_scan(self.table, self.snapshot)
             .map_err(invalid)?;
+        let deletes = CommitDeletes::read(io, changes).map_err(Failed::Inspect)?;
         let keyed = scan.keyed();
         let replace = self.operation == Operation::Replace;
         let sorters_needed = 2 * keyed.len() + if replace { 2 } else { 0 };
         let budget = self.memory / sorters_needed.max(1);
-        let mut keys: BTreeMap<ConstraintId, Sides> = keyed
-            .iter()
-            .map(|id| (*id, Sides::new(self.scratch, budget)))
-            .collect();
-        let mut rows_of = replace.then(|| Sides::new(self.scratch, budget));
-        let (mut adds, mut removes, mut read) = (false, false, 0u64);
-        // Three threads: one decodes the files, one encodes and sorts the rows of a `replace`,
-        // and this one checks and sorts the keys, in the order the files are read. Each channel
-        // holds a few batches, so memory stays bounded.
-        std::thread::scope(|s| -> Result<(), ApiError> {
-            let (send_batch, batches) = sync_channel::<(Side, Arc<RowBatch>)>(QUEUED_BATCHES);
-            let reader = s.spawn(move || {
-                for_each_commit_batch(io, changes, self.columns, |side, batch| {
-                    send_batch
-                        .send((side, Arc::new(batch)))
-                        .map_err(|_| Failed::Stopped)
-                })
-            });
+        let mut removed_scan = scan.removed();
+        // A side without data files to read, and no kept files, has no rows.
+        let has = |side| {
+            changes.positions.is_some()
+                || match side {
+                    Side::Added => !changes.added.is_empty(),
+                    Side::Removed => !changes.removed.is_empty(),
+                }
+        };
+        // Threads (ADR 0024): each side is read on its own thread and fed on its own: the added
+        // rows here (NULL rules and keys, in the order the files are read), the removed rows on
+        // another (keys only); for a `replace`, one encodes the rows of both sides. Every side of
+        // every constraint (and of the rows) is sorted on a thread of its own once it is large,
+        // and then each constraint's two sides are merged on one, each side read ahead on its
+        // own. Each channel holds a few batches or chunks, so memory stays bounded. The results
+        // are used in the order validating at once would use them: the rows first, then the keys
+        // by constraint.
+        let (same_rows, merged, counts) = std::thread::scope(|s| -> Result<Scanned, ApiError> {
+            let deletes = &deletes;
+            let read_side = |side: Side| {
+                let (send, batches) = sync_channel::<Arc<RowBatch>>(QUEUED_BATCHES);
+                let reader = has(side).then(|| {
+                    s.spawn(move || {
+                        for_each_side_batch(io, changes, deletes, self.columns, side, |batch| {
+                            send.send(Arc::new(batch)).map_err(|_| Failed::Stopped)
+                        })
+                    })
+                });
+                (reader, batches)
+            };
+            let (added_reader, added_batches) = read_side(Side::Added);
+            let (removed_reader, removed_batches) = read_side(Side::Removed);
+
+            let new_keys = || Feeder::new(s, self.scratch, budget, KeySorter::finish);
+            let mut added_feeders: BTreeMap<ConstraintId, _> =
+                keyed.iter().map(|id| (*id, new_keys())).collect();
+            let mut removed_feeders: BTreeMap<ConstraintId, _> =
+                keyed.iter().map(|id| (*id, new_keys())).collect();
             let (send_rows, rows) = sync_channel::<(Side, Arc<RowBatch>)>(QUEUED_BATCHES);
-            let row_sorter = rows_of.take().map(|mut sides| {
-                s.spawn(move || -> Result<Sides, ApiError> {
+            let row_encoder = replace.then(|| {
+                let new_rows = || Feeder::new(s, self.scratch, budget, KeySorter::finish_bytes);
+                let mut sides = [new_rows(), new_rows()];
+                s.spawn(move || {
                     let mut bytes = Vec::new();
                     for (side, batch) in rows {
-                        let sorter = sides.side(side);
+                        let feeder = &mut sides[usize::from(side == Side::Removed)];
                         for row in batch.rows() {
                             encode_row_into(row, &mut bytes);
-                            sorter.push_bytes(&bytes).map_err(spill)?;
+                            feeder.push(&bytes)?;
                         }
                     }
-                    Ok(sides)
+                    Ok::<_, ApiError>(sides)
                 })
             });
-            let mut fed = Ok(());
-            // Leaving the loop early drops the receiver, which stops the reader.
-            for (side, batch) in batches {
-                read += batch.len() as u64;
-                match side {
-                    Side::Added => adds = true,
-                    Side::Removed => removes = true,
+            let send_rows = row_encoder.is_some().then_some(send_rows);
+
+            // The removed side: keys only.
+            let removed_rows = send_rows.clone();
+            let feed_removed = move || {
+                let mut count = 0u64;
+                let mut fed = Ok(());
+                // Leaving the loop early drops the receiver, which stops the reader.
+                for batch in removed_batches {
+                    count += batch.len() as u64;
+                    if let Some(rows) = &removed_rows
+                        && rows.send((Side::Removed, Arc::clone(&batch))).is_err()
+                    {
+                        break;
+                    }
+                    fed = removed_scan.feed(&batch, |id, key| feed(&mut removed_feeders, id, &key));
+                    if fed.is_err() {
+                        break;
+                    }
                 }
-                // A row sorter that stopped reports its error below.
-                if row_sorter.is_some() && send_rows.send((side, Arc::clone(&batch))).is_err() {
+                let (sent, finished) = close_all(removed_feeders.into_values());
+                (removed_scan, count, fed.and(sent), finished)
+            };
+            let removed_feed = if removed_reader.is_some() {
+                Ok(s.spawn(feed_removed))
+            } else {
+                Err(feed_removed())
+            };
+
+            // The added side, here.
+            let mut added_count = 0u64;
+            let mut fed = Ok(());
+            for batch in added_batches {
+                added_count += batch.len() as u64;
+                // A row encoder that stopped reports its error below.
+                if let Some(rows) = &send_rows
+                    && rows.send((Side::Added, Arc::clone(&batch))).is_err()
+                {
                     break;
                 }
-                fed = scan.feed(side, &batch, |id, key| -> Result<(), ApiError> {
-                    keys.get_mut(&id)
-                        .ok_or_else(|| invalid(ValidationError::MissingIndex(id)))?
-                        .side(side)
-                        .push(&key)
-                        .map_err(spill)
+                fed = scan.feed(Side::Added, &batch, |id, key| {
+                    feed(&mut added_feeders, id, &key)
                 });
                 if fed.is_err() {
                     break;
                 }
             }
             drop(send_rows);
-            let sorted_rows = row_sorter.map(joined);
-            let read_all = joined(reader);
-            fed?;
-            if let Some(sides) = sorted_rows {
-                rows_of = Some(sides?);
-            }
-            match read_all {
-                Ok(()) => Ok(()),
-                Err(Failed::Stopped) => Err(ApiError::new(
-                    ErrorCode::IndexDegraded,
-                    "validation stopped reading",
-                )),
-                Err(f) => Err(f.into()),
-            }
-        })?;
+            let (sent, added_sorted) = close_all(added_feeders.into_values());
+            let (removed_scan, removed_count, removed_fed, removed_sorted) =
+                removed_feed.map_or_else(|done| done, joined);
+            scan.absorb(removed_scan);
 
-        // The rows of both sides (a `replace`) are compared while each constraint's keys are
-        // sorted and merged, each on its own thread; the results are then used in the order
-        // validating at once would use them: the rows first, then the keys by constraint.
-        let (same_rows, merged): (Option<Result<bool, ApiError>>, Vec<Merged>) =
-            std::thread::scope(|s| {
-                let rows = rows_of.take().map(|Sides([added, removed])| {
-                    s.spawn(move || {
-                        same(
-                            added.finish_bytes().map_err(spill)?,
-                            removed.finish_bytes().map_err(spill)?,
-                        )
-                        .map_err(spill)
-                    })
-                });
-                let handles: Vec<_> = keyed
-                    .iter()
-                    .map(|id| {
-                        let sides = keys.remove(id);
-                        s.spawn(move || sides.map_or(Ok(Vec::new()), merge_sides))
-                    })
-                    .collect();
-                (rows.map(joined), handles.into_iter().map(joined).collect())
+            // Every thread is joined before anything is reported: a sorter that stopped explains
+            // why the feeding stopped.
+            let rows_sorted = row_encoder.map(|encoder| {
+                let (sent, finished) = close_all(joined(encoder)?);
+                sent?;
+                Ok::<_, ApiError>(finished)
             });
-        check_sides(self.operation, adds, removes, || {
+            let large = added_sorted
+                .iter()
+                .chain(&removed_sorted)
+                .any(Finished::threaded)
+                || rows_sorted
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(Finished::threaded);
+            let rows_sorted = rows_sorted.map(|finished| {
+                finished.and_then(|f| {
+                    f.into_iter()
+                        .map(Finished::result)
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            });
+            let sorted: Vec<(Result<_, ApiError>, Result<_, ApiError>)> = added_sorted
+                .into_iter()
+                .map(Finished::result)
+                .zip(removed_sorted.into_iter().map(Finished::result))
+                .collect();
+            let reads = [added_reader, removed_reader].map(|r| r.map(joined));
+            if let Some(e) = sorted
+                .iter()
+                .flat_map(|(a, r)| [a.as_ref().err(), r.as_ref().err()])
+                .flatten()
+                .next()
+            {
+                return Err(e.clone());
+            }
+            fed?;
+            removed_fed?;
+            sent?;
+            for read in reads.into_iter().flatten() {
+                match read {
+                    Ok(()) => {}
+                    Err(Failed::Stopped) => {
+                        return Err(ApiError::new(
+                            ErrorCode::IndexDegraded,
+                            "validation stopped reading",
+                        ));
+                    }
+                    Err(f) => return Err(f.into()),
+                }
+            }
+            let rows_sorted = rows_sorted.transpose()?;
+            if !large {
+                // A small commit: everything sorted in memory, merged here.
+                let same_rows = rows_sorted.map(|sides| match <[_; 2]>::try_from(sides) {
+                    Ok([a, r]) => same(a, r).map_err(spill),
+                    Err(_) => Err(spill(IndexError::Corrupt)),
+                });
+                let merged = sorted
+                    .into_iter()
+                    .map(|(a, r)| merge_sides(a?, r?))
+                    .collect();
+                return Ok((same_rows, merged, (added_count, removed_count)));
+            }
+            // The rows are compared while each constraint's sides are merged.
+            let comparing = match rows_sorted.map(<[_; 2]>::try_from) {
+                Some(Ok([a, r])) => {
+                    let (a, r) = (ahead(s, a), ahead(s, r));
+                    Some(s.spawn(move || same(a, r).map_err(spill)))
+                }
+                Some(Err(_)) => return Err(spill(IndexError::Corrupt)),
+                None => None,
+            };
+            let merging = sorted
+                .into_iter()
+                .map(|(a, r)| -> Result<_, ApiError> {
+                    let (a, r) = (ahead(s, a?), ahead(s, r?));
+                    Ok(s.spawn(move || merge_sides(a, r)))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let same_rows = comparing.map(joined);
+            Ok((
+                same_rows,
+                merging.into_iter().map(joined).collect(),
+                (added_count, removed_count),
+            ))
+        })?;
+        let (added_count, removed_count) = counts;
+        check_sides(self.operation, added_count > 0, removed_count > 0, || {
             same_rows.unwrap_or(Ok(true)).map_err(Failed::Api)
         })?;
         for (id, counted) in keyed.iter().zip(merged) {
@@ -449,12 +720,78 @@ impl Streamed<'_> {
             }
         }
         let decided = scan.decide(indexes).map_err(invalid)?;
-        Ok((decided, read))
+        Ok((decided, added_count + removed_count))
+    }
+}
+
+/// Hands `key` of constraint `id` to its sorter.
+fn feed<'s, T: Send + 's>(
+    feeders: &mut BTreeMap<ConstraintId, Feeder<'s, T>>,
+    id: ConstraintId,
+    key: &EncodedKey,
+) -> Result<(), ApiError> {
+    feeders
+        .get_mut(&id)
+        .ok_or_else(|| invalid(ValidationError::MissingIndex(id)))?
+        .push(key.as_bytes())
+}
+
+fn stopped_sorting() -> ApiError {
+    ApiError::new(ErrorCode::IndexDegraded, "validation sort stopped")
+}
+
+/// Records sent from a reading thread at once.
+const AHEAD: usize = 4096;
+
+/// A sorted side read ahead on a thread of its own (ADR 0024): the two sides of a merge are read
+/// at once, and the merging thread only compares.
+struct Ahead<T> {
+    batches: std::sync::mpsc::Receiver<Vec<Result<T, IndexError>>>,
+    batch: std::vec::IntoIter<Result<T, IndexError>>,
+}
+
+impl<T> Iterator for Ahead<T> {
+    type Item = Result<T, IndexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.batch.next() {
+                return Some(item);
+            }
+            // The sender is dropped once the side is read (or failed, its error sent last).
+            self.batch = self.batches.recv().ok()?.into_iter();
+        }
+    }
+}
+
+/// Reads `sorted` ahead on a thread of the scope `s`; dropping the result stops the thread.
+fn ahead<'s, T: Send + 's>(
+    s: &'s std::thread::Scope<'s, '_>,
+    sorted: impl Iterator<Item = Result<T, IndexError>> + Send + 's,
+) -> Ahead<T> {
+    let (send, batches) = sync_channel(2);
+    s.spawn(move || {
+        let mut batch = Vec::with_capacity(AHEAD);
+        for item in sorted {
+            let failed = item.is_err();
+            batch.push(item);
+            if batch.len() == AHEAD || failed {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(AHEAD));
+                if send.send(full).is_err() || failed {
+                    return;
+                }
+            }
+        }
+        let _ = send.send(batch);
+    });
+    Ahead {
+        batches,
+        batch: Vec::new().into_iter(),
     }
 }
 
 /// The result of a scoped thread; its panic, if any, continues on the caller.
-fn joined<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+fn joined<T>(h: ScopedJoinHandle<'_, T>) -> T {
     h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
@@ -464,11 +801,16 @@ type Counted = (EncodedKey, u64, u64);
 /// The keys of one constraint that matter, merged from both sides.
 type Merged = Result<Vec<Counted>, ApiError>;
 
+/// Sorted distinct keys with their counts.
+trait Keys: Iterator<Item = Result<(EncodedKey, u64), IndexError>> {}
+
+impl<I: Iterator<Item = Result<(EncodedKey, u64), IndexError>>> Keys for I {}
+
 /// Merges the two sorted sides of one constraint: each distinct key once, with its count on each
 /// side, keeping only the keys that matter to the validator ([`CommitScan::counts_matter`]).
-fn merge_sides(Sides([added, removed]): Sides) -> Result<Vec<Counted>, ApiError> {
-    let mut added = added.finish().map_err(spill)?.peekable();
-    let mut removed = removed.finish().map_err(spill)?.peekable();
+fn merge_sides(added: impl Keys, removed: impl Keys) -> Merged {
+    let mut added = added.peekable();
+    let mut removed = removed.peekable();
     let mut out = Vec::new();
     loop {
         let next = match (added.peek(), removed.peek()) {
@@ -506,9 +848,7 @@ fn merge_sides(Sides([added, removed]): Sides) -> Result<Vec<Counted>, ApiError>
     Ok(out)
 }
 
-fn take(
-    it: &mut std::iter::Peekable<integrity_index::SortedKeys>,
-) -> Result<(EncodedKey, u64), ApiError> {
+fn take(it: &mut impl Keys) -> Result<(EncodedKey, u64), ApiError> {
     match it.next() {
         Some(Ok(item)) => Ok(item),
         Some(Err(e)) => Err(spill(e)),
@@ -518,8 +858,8 @@ fn take(
 
 /// Whether two sorted streams of distinct byte strings with counts are equal.
 fn same(
-    mut a: integrity_index::SortedBytes,
-    mut b: integrity_index::SortedBytes,
+    mut a: impl Iterator<Item = Result<(Vec<u8>, u64), IndexError>>,
+    mut b: impl Iterator<Item = Result<(Vec<u8>, u64), IndexError>>,
 ) -> Result<bool, IndexError> {
     loop {
         match (a.next().transpose()?, b.next().transpose()?) {

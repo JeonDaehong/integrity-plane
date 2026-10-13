@@ -28,6 +28,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0021](0021-sorted-key-deltas.md) | Sorted key deltas | Accepted |
 | [0022](0022-answer-before-the-index-write.md) | Answer before the index write | Accepted |
 | [0023](0023-decode-only-changed-rows.md) | Decode only the changed rows of kept data files | Accepted |
+| [0024](0024-both-sides-at-once.md) | Read, feed, sort and merge both sides of a commit at once | Accepted |
 
 The decisions spec §31 requires for 0.1 are all recorded: Iceberg first (0012), proxy gateway (0010),
 indexes as derived state (0013), counts instead of locators (0014), serial domain queues (0015) and

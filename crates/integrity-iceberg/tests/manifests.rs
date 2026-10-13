@@ -14,8 +14,8 @@ use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use integrity_core::{Datum, KeyValue, LogicalType, Side};
 use integrity_iceberg::{
-    FileChanges, FileIo, InspectError, MemoryIo, Operation, check_operation, commit_rows,
-    diff_snapshots, for_each_commit_batch, for_each_live_batch,
+    CommitDeletes, FileChanges, FileIo, InspectError, MemoryIo, Operation, check_operation,
+    commit_rows, diff_snapshots, for_each_commit_batch, for_each_live_batch, for_each_side_batch,
 };
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -911,10 +911,32 @@ fn streamed_sides(t: &Table, parent: &str, new: &str) -> (String, String) {
         }
         Ok::<_, InspectError>(())
     });
+    let streamed = s.is_ok();
     let s = match s {
         Ok(()) => format!("{added:?} / {removed:?}"),
         Err(e) => e.to_string(),
     };
+    // Each side read on its own (ADR 0024) gives the same rows in the same order, or fails too.
+    let per_side = CommitDeletes::read(&t.io, &changes).and_then(|deletes| {
+        let mut sides = Vec::new();
+        for side in [Side::Added, Side::Removed] {
+            let mut rows = Vec::new();
+            for_each_side_batch(&t.io, &changes, &deletes, &columns, side, |b| {
+                assert!(!b.is_empty(), "empty batches are not handed over");
+                rows.extend(b.rows().iter().cloned());
+                Ok::<_, InspectError>(())
+            })?;
+            sides.push(rows);
+        }
+        Ok(format!("{:?} / {:?}", sides[0], sides[1]))
+    });
+    match &per_side {
+        Ok(p) => assert_eq!(p, &s, "each side alone"),
+        Err(e) => assert!(
+            !streamed,
+            "a side alone failed ({e}) where both sides streamed"
+        ),
+    }
     let c = match t.rows(&changes) {
         Ok(r) => format!("{:?} / {:?}", r.added.rows(), r.removed.rows()),
         Err(e) => e.to_string(),

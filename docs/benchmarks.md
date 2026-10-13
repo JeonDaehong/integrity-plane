@@ -232,6 +232,21 @@ decoding only the changed rows of kept data files:
 What is read is unchanged (80 MiB, the key column of every touched row group); converting every key
 of those row groups was the cost.
 
+### Both sides of a commit at once (ADR 0024, local)
+
+`integrity-bench --scale 12000000 --file-rows 1000000` and the standard scenarios on the local
+Windows machine, before and after reading, feeding, sorting and merging the two sides of a commit
+on threads of their own (ranges of two to four runs each; this machine's timings vary by up to
+20 %):
+
+| Scenario | Before | After |
+|---|---|---|
+| Compaction of 10 files (10 M rows) into one, validation | 5.0–5.7 s | 3.2–4.0 s |
+| Copy-on-write delete of 1 row, 1 M-row file, validation | 0.36–0.51 s | 0.19–0.34 s |
+| Child append of 1 M rows (PK + FK), validation p50 (one side only) | 2.0 s | 2.0 s |
+| Single-row FK append, time in `validate` (p50 of 100) | 1.5–1.6 ms | 1.2–1.3 ms |
+| Merge-on-read delete of 1 % of all rows, spread over every file | 0.32–0.50 s | 0.32–0.48 s |
+
 ### Large tables and appends, version C (local NVMe)
 
 Same instance, commit fe42956, files on the instance's disk as in the sections above

@@ -520,19 +520,65 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
     columns: &[(FieldId, LogicalType)],
     mut f: impl FnMut(Side, RowBatch) -> Result<(), E>,
 ) -> Result<(), E> {
-    if !changes.equality_deletes.is_empty() {
-        return Err(unsupported("equality deletes are read with commit_rows").into());
+    let deletes = CommitDeletes::read(io, changes)?;
+    for side in [Side::Added, Side::Removed] {
+        deletes.whole_files(io, changes, columns, side, |batch| f(side, batch))?;
     }
-    let empty = BTreeSet::new();
-    let (before, after) = match &changes.positions {
-        None => (HashMap::new(), HashMap::new()),
-        Some(pd) => deleted_positions(io, pd)?,
-    };
-    // Live rows of whole data files.
-    for (side, files, gone) in [
-        (Side::Added, &changes.added, &after),
-        (Side::Removed, &changes.removed, &before),
-    ] {
+    deletes.kept_files(io, changes, columns, None, &mut f)
+}
+
+/// Like [`for_each_commit_batch`] for the rows of one side only, in the same order, so that the
+/// two sides can be read on two threads (ADR 0024). `deletes` are the commit's, read once.
+pub fn for_each_side_batch<E: From<InspectError>>(
+    io: &impl FileIo,
+    changes: &FileChanges,
+    deletes: &CommitDeletes,
+    columns: &[(FieldId, LogicalType)],
+    side: Side,
+    mut f: impl FnMut(RowBatch) -> Result<(), E>,
+) -> Result<(), E> {
+    deletes.whole_files(io, changes, columns, side, &mut f)?;
+    deletes.kept_files(io, changes, columns, Some(side), &mut |_, batch| f(batch))
+}
+
+/// The deleted positions of a commit's data files before and after it, from its position delete
+/// files (each read once).
+#[derive(Debug, Default)]
+pub struct CommitDeletes {
+    before: Deleted,
+    after: Deleted,
+}
+
+impl CommitDeletes {
+    /// Reads the position delete files of both snapshots. Commits with equality deletes are
+    /// refused: they go through `commit_rows`.
+    pub fn read(io: &impl FileIo, changes: &FileChanges) -> Result<Self, InspectError> {
+        if !changes.equality_deletes.is_empty() {
+            return Err(unsupported("equality deletes are read with commit_rows"));
+        }
+        Ok(match &changes.positions {
+            None => Self::default(),
+            Some(pd) => {
+                let (before, after) = deleted_positions(io, pd)?;
+                Self { before, after }
+            }
+        })
+    }
+
+    /// Live rows of the data files the commit adds (`Side::Added`) or removes.
+    fn whole_files<E: From<InspectError>>(
+        &self,
+        io: &impl FileIo,
+        changes: &FileChanges,
+        columns: &[(FieldId, LogicalType)],
+        side: Side,
+        mut f: impl FnMut(RowBatch) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let empty = BTreeSet::new();
+        let (files, gone) = match side {
+            Side::Added => (&changes.added, &self.after),
+            Side::Removed => (&changes.removed, &self.before),
+        };
         for file in files {
             let gone = gone.get(&file.path).unwrap_or(&empty);
             stream_file(io, file, columns, &[gone], &mut |batch, start| {
@@ -540,25 +586,44 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
                 if live.is_empty() {
                     Ok(())
                 } else {
-                    f(side, live).map_err(Failed::Caller)
+                    f(live).map_err(Failed::Caller)
                 }
             })?;
         }
+        Ok(())
     }
-    // Kept data files whose deleted positions the commit changes.
-    if let Some(pd) = &changes.positions {
+
+    /// Rows of kept data files whose deleted positions the commit changes: newly deleted rows are
+    /// removed, rows whose deletion is undone are added. With `only`, the rows of that side.
+    fn kept_files<E: From<InspectError>>(
+        &self,
+        io: &impl FileIo,
+        changes: &FileChanges,
+        columns: &[(FieldId, LogicalType)],
+        only: Option<Side>,
+        f: &mut impl FnMut(Side, RowBatch) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Some(pd) = &changes.positions else {
+            return Ok(());
+        };
+        let empty = BTreeSet::new();
         for (path, file) in &pd.kept {
-            let b = before.get(path).unwrap_or(&empty);
-            let a = after.get(path).unwrap_or(&empty);
+            let b = self.before.get(path).unwrap_or(&empty);
+            let a = self.after.get(path).unwrap_or(&empty);
             if b == a {
                 continue;
             }
             let newly: BTreeSet<i64> = a.difference(b).copied().collect();
-            // Only the changed rows are decoded, in the row groups holding one.
-            let changed: BTreeSet<u64> = a
-                .symmetric_difference(b)
-                .filter_map(|&p| u64::try_from(p).ok())
-                .collect();
+            // Only the changed rows (of the side asked for) are decoded, in the row groups
+            // holding one.
+            let changed: BTreeSet<u64> = match only {
+                None => a.symmetric_difference(b).copied().collect::<Vec<_>>(),
+                Some(Side::Removed) => newly.iter().copied().collect(),
+                Some(Side::Added) => b.difference(a).copied().collect(),
+            }
+            .into_iter()
+            .filter_map(|p| u64::try_from(p).ok())
+            .collect();
             stream_rows(io, file, columns, &[a, b], &changed, |batch, at| {
                 let mut removed = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
                 let mut added = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
@@ -579,8 +644,8 @@ pub fn for_each_commit_batch<E: From<InspectError>>(
                 Ok(())
             })?;
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The caller's error, or one of reading a file.
@@ -601,8 +666,9 @@ impl<E> From<InspectError> for Failed<E> {
     }
 }
 
-/// Streams the rows of one data file to `g(batch, position of its first row)`, then checks the file's row count against the manifest
-/// and that every position of every set in `deleted` is within the file.
+/// Streams the rows of one data file to `g(batch, position of its first row)`, then checks the
+/// file's row count against the manifest and that every position of every set in `deleted` is
+/// within the file.
 fn stream_file<E: From<InspectError>>(
     io: &impl FileIo,
     file: &DataFile,
