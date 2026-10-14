@@ -249,3 +249,75 @@ fn apply_all_is_atomic_across_indexes_and_replayable() {
     let sf = foreign.stage(&delta(1, &[(1, 1)])).unwrap();
     assert!(store.apply_all(&[(&foreign, &sf)], IndexEpoch(9)).is_err());
 }
+
+/// The writes of `staged`, as `apply_streamed` takes them.
+fn writes_of(
+    staged: &integrity_index::StagedDelta,
+) -> Vec<Result<(integrity_core::EncodedKey, Option<IndexValue>), IndexError>> {
+    staged
+        .writes()
+        .map(|(k, v)| Ok((k.clone(), v.copied())))
+        .collect()
+}
+
+#[test]
+fn a_streamed_apply_equals_apply_all_and_refuses_writes_that_do_not_match() {
+    let dir = TempDir::new("apply-streamed");
+    let store = PersistentStore::open(dir.path().join("index.redb")).unwrap();
+    let a = store.index(ConstraintId(1), IndexKind::Unique).unwrap();
+    let b = store.index(ConstraintId(2), IndexKind::Reference).unwrap();
+    commit(&a, &delta(1, &[(1, 1), (5, 1)])).unwrap();
+    let sa = a.stage(&delta(2, &[(1, -1), (2, 1), (3, 1)])).unwrap();
+    let sb = b.stage(&delta(2, &[(1, 3), (4, 1)])).unwrap();
+
+    // Whatever is wrong with one stream, nothing of the batch is applied.
+    let mut short = writes_of(&sa);
+    short.pop();
+    let mut swapped = writes_of(&sa);
+    swapped.swap(0, 1);
+    let mut changed = writes_of(&sa);
+    changed[1] = Ok((k(2), None));
+    let mut extra = writes_of(&sa);
+    extra.push(Ok((k(9), None)));
+    let failing = vec![
+        Err(IndexError::Storage("read failed".into())),
+        Ok((k(1), None)),
+    ];
+    for bad in [short, swapped, changed, extra, failing] {
+        let result = store.apply_streamed(
+            vec![
+                (&b, sb.header(), Box::new(writes_of(&sb).into_iter())),
+                (&a, sa.header(), Box::new(bad.into_iter())),
+            ],
+            IndexEpoch(3),
+        );
+        assert!(result.is_err());
+        assert_eq!(a.epoch().unwrap(), IndexEpoch(1));
+        assert_eq!(b.epoch().unwrap(), IndexEpoch(0));
+        assert_eq!(b.get_many(&[k(1)]).unwrap(), vec![None]);
+    }
+
+    // The right writes apply exactly as apply_all would, and replay as a no-op.
+    let twin_dir = TempDir::new("apply-streamed-twin");
+    let twin = PersistentStore::open(twin_dir.path().join("index.redb")).unwrap();
+    let ta = twin.index(ConstraintId(1), IndexKind::Unique).unwrap();
+    let tb = twin.index(ConstraintId(2), IndexKind::Reference).unwrap();
+    commit(&ta, &delta(1, &[(1, 1), (5, 1)])).unwrap();
+    twin.apply_all(&[(&ta, &sa), (&tb, &sb)], IndexEpoch(3))
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .apply_streamed(
+                vec![
+                    (&a, sa.header(), Box::new(writes_of(&sa).into_iter())),
+                    (&b, sb.header(), Box::new(writes_of(&sb).into_iter())),
+                ],
+                IndexEpoch(3),
+            )
+            .unwrap();
+    }
+    assert_eq!(a.entries().unwrap(), ta.entries().unwrap());
+    assert_eq!(b.entries().unwrap(), tb.entries().unwrap());
+    assert_eq!(a.epoch().unwrap(), IndexEpoch(3));
+    assert_eq!(b.epoch().unwrap(), IndexEpoch(3));
+}

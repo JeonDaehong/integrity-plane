@@ -25,7 +25,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{
     ApplyAction, IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, Result,
-    StagedDelta, decide_apply, decode_value, encode_value, resolve,
+    StagedDelta, StagedDigest, StagedHeader, decide_apply, decode_value, encode_value, resolve,
 };
 
 const META: TableDefinition<u64, &[u8]> = TableDefinition::new("oip/index-meta/v1");
@@ -72,6 +72,9 @@ impl Shared {
 pub struct PersistentStore {
     shared: Arc<Shared>,
 }
+
+/// The writes of a staged delta, in strictly increasing key order (`None` deletes the key).
+pub type Writes<'a> = Box<dyn Iterator<Item = Result<(EncodedKey, Option<IndexValue>)>> + 'a>;
 
 impl PersistentStore {
     /// Opens the store at `path`, creating it if absent, and verifies every checksum.
@@ -190,9 +193,28 @@ impl PersistentStore {
         batch: &[(&PersistentIndex, &StagedDelta)],
         epoch: IndexEpoch,
     ) -> Result<()> {
+        let streams = batch
+            .iter()
+            .map(|(index, staged)| {
+                let writes = staged.writes().map(|(k, v)| Ok((k.clone(), v.copied())));
+                (*index, staged.header(), Box::new(writes) as Writes<'_>)
+            })
+            .collect();
+        self.apply_streamed(streams, epoch)
+    }
+
+    /// [`PersistentStore::apply_all`] for staged deltas read as streams of their writes (ADR
+    /// 0025): each stream must yield exactly its header's writes, in strictly increasing key
+    /// order, with its digest; otherwise nothing is applied ([`IndexError::Corrupt`]). Memory does
+    /// not grow with the number of writes.
+    pub fn apply_streamed(
+        &self,
+        batch: Vec<(&PersistentIndex, StagedHeader, Writes<'_>)>,
+        epoch: IndexEpoch,
+    ) -> Result<()> {
         if batch
             .iter()
-            .any(|(index, _)| !Arc::ptr_eq(&index.shared, &self.shared))
+            .any(|(index, _, _)| !Arc::ptr_eq(&index.shared, &self.shared))
         {
             return Err(IndexError::Storage("index of another store".into()));
         }
@@ -200,8 +222,9 @@ impl PersistentStore {
             let mut txn = db.begin_write().map_err(storage)?;
             txn.set_two_phase_commit(true);
             let mut wrote = false;
-            for (index, staged) in batch {
-                wrote |= index.write_in(&txn, staged, epoch)?;
+            for (index, header, writes) in batch {
+                // An error drops the transaction: nothing of the batch is applied.
+                wrote |= index.write_in(&txn, &header, writes, epoch)?;
             }
             if wrote {
                 txn.commit().map_err(storage)?;
@@ -501,44 +524,57 @@ impl PersistentIndex {
     fn apply_in(&self, db: &Database, staged: &StagedDelta, epoch: IndexEpoch) -> Result<()> {
         let mut txn = db.begin_write().map_err(storage)?;
         txn.set_two_phase_commit(true);
-        if self.write_in(&txn, staged, epoch)? {
+        let writes = staged.writes().map(|(k, v)| Ok((k.clone(), v.copied())));
+        if self.write_in(&txn, &staged.header(), Box::new(writes), epoch)? {
             txn.commit().map_err(storage)?;
         }
         Ok(())
     }
 
-    /// Writes `staged` within `txn`; `false` if it was already applied (nothing written).
+    /// Writes a staged delta within `txn`; `false` if it was already applied (nothing written,
+    /// `writes` not read). Fails, leaving `txn` to be dropped, if `writes` do not match `header`.
     fn write_in(
         &self,
         txn: &redb::WriteTransaction,
-        staged: &StagedDelta,
+        header: &StagedHeader,
+        writes: Writes<'_>,
         epoch: IndexEpoch,
     ) -> Result<bool> {
         {
             let mut meta_table = txn.open_table(META).map_err(storage)?;
             let meta = self.read_meta(&meta_table)?;
-            match decide_apply(staged, epoch, meta.epoch, meta.last_applied)? {
+            match decide_apply(header, epoch, meta.epoch, meta.last_applied)? {
                 ApplyAction::AlreadyApplied => return Ok(false),
                 ApplyAction::Write => {}
             }
-            let digest = staged.digest();
+            let mut digest = StagedDigest::new(header.base_epoch, header.writes);
+            let mut previous: Option<EncodedKey> = None;
             let mut table = txn.open_table(self.table()).map_err(storage)?;
-            for (key, value) in staged.writes() {
+            for write in writes {
+                let (key, value) = write?;
+                if previous.as_ref().is_some_and(|p| *p >= key) {
+                    return Err(IndexError::Corrupt);
+                }
+                digest.update(&key, value.as_ref())?;
                 match value {
                     Some(v) => {
                         table
-                            .insert(key.as_bytes(), encode_value(Some(v)).as_slice())
+                            .insert(key.as_bytes(), encode_value(Some(&v)).as_slice())
                             .map_err(storage)?;
                     }
                     None => {
                         table.remove(key.as_bytes()).map_err(storage)?;
                     }
                 }
+                previous = Some(key);
+            }
+            if digest.finish()? != header.digest {
+                return Err(IndexError::Corrupt);
             }
             let updated = Meta {
                 kind: self.kind,
                 epoch,
-                last_applied: Some((epoch, digest)),
+                last_applied: Some((epoch, header.digest)),
             };
             meta_table
                 .insert(self.id, updated.encode().as_slice())

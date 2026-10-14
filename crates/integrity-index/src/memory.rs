@@ -57,7 +57,7 @@ impl KeyIndex for MemoryIndex {
 
     fn apply(&self, staged: StagedDelta, epoch: IndexEpoch) -> Result<()> {
         let mut state = self.state.write().map_err(|_| IndexError::Unavailable)?;
-        match decide_apply(&staged, epoch, state.epoch, state.last_applied)? {
+        match decide_apply(&staged.header(), epoch, state.epoch, state.last_applied)? {
             ApplyAction::AlreadyApplied => return Ok(()),
             ApplyAction::Write => {}
         }

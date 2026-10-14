@@ -15,6 +15,7 @@
 mod memory;
 mod overlay;
 mod persistent;
+mod run;
 mod sort;
 
 use std::fmt;
@@ -24,7 +25,8 @@ use integrity_types::SnapshotId;
 
 pub use memory::MemoryIndex;
 pub use overlay::Overlay;
-pub use persistent::{IndexBuild, PersistentIndex, PersistentStore};
+pub use persistent::{IndexBuild, PersistentIndex, PersistentStore, Writes};
+pub use run::{FinishedRun, Records, Run};
 pub use sort::{KeySorter, SortedBytes, SortedKeys};
 
 /// Monotonically increasing version of an index's contents. A new index starts at epoch 0.
@@ -83,10 +85,70 @@ pub struct StagedDelta {
     writes: Vec<(EncodedKey, Option<IndexValue>)>,
 }
 
+/// What identifies a staged delta without its writes (ADR 0003, ADR 0025): enough to apply it
+/// from a stream of its writes and to recognize a replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedHeader {
+    /// The epoch the delta was resolved against.
+    pub base_epoch: IndexEpoch,
+    /// Number of writes.
+    pub writes: u64,
+    /// [`StagedDelta::digest`].
+    pub digest: [u8; 32],
+}
+
+/// [`StagedDelta::digest`], computed one write at a time.
+#[derive(Debug)]
+pub struct StagedDigest {
+    hasher: blake3::Hasher,
+    left: u64,
+}
+
+impl StagedDigest {
+    /// Starts the digest of a delta resolved at `base_epoch` with `writes` writes.
+    pub fn new(base_epoch: IndexEpoch, writes: u64) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"oip-staged-delta-v1");
+        hasher.update(&base_epoch.0.to_be_bytes());
+        hasher.update(&writes.to_be_bytes());
+        Self {
+            hasher,
+            left: writes,
+        }
+    }
+
+    /// Adds the next write; more writes than announced is [`IndexError::Corrupt`].
+    pub fn update(&mut self, key: &EncodedKey, value: Option<&IndexValue>) -> Result<()> {
+        self.left = self.left.checked_sub(1).ok_or(IndexError::Corrupt)?;
+        self.hasher
+            .update(&(key.as_bytes().len() as u64).to_be_bytes());
+        self.hasher.update(key.as_bytes());
+        self.hasher.update(encode_value(value).as_slice());
+        Ok(())
+    }
+
+    /// The digest; fewer writes than announced is [`IndexError::Corrupt`].
+    pub fn finish(self) -> Result<[u8; 32]> {
+        if self.left != 0 {
+            return Err(IndexError::Corrupt);
+        }
+        Ok(*self.hasher.finalize().as_bytes())
+    }
+}
+
 impl StagedDelta {
     /// The epoch the delta was resolved against.
     pub fn base_epoch(&self) -> IndexEpoch {
         self.base_epoch
+    }
+
+    /// Its [`StagedHeader`].
+    pub fn header(&self) -> StagedHeader {
+        StagedHeader {
+            base_epoch: self.base_epoch,
+            writes: self.writes.len() as u64,
+            digest: self.digest(),
+        }
     }
 
     /// New value per key; `None` deletes the key.
@@ -158,16 +220,12 @@ impl StagedDelta {
     /// BLAKE3 digest of the canonical encoding: the identity used to recognize a replayed
     /// `apply` (ADR 0003).
     pub fn digest(&self) -> [u8; 32] {
-        let mut h = blake3::Hasher::new();
-        h.update(b"oip-staged-delta-v1");
-        h.update(&self.base_epoch.0.to_be_bytes());
-        h.update(&(self.writes.len() as u64).to_be_bytes());
+        let mut h = StagedDigest::new(self.base_epoch, self.writes.len() as u64);
         for (key, value) in &self.writes {
-            h.update(&(key.as_bytes().len() as u64).to_be_bytes());
-            h.update(key.as_bytes());
-            h.update(encode_value(value.as_ref()).as_slice());
+            // Exactly as many writes as announced: neither call can fail.
+            let _ = h.update(key, value.as_ref());
         }
-        *h.finalize().as_bytes()
+        h.finish().unwrap_or_default()
     }
 }
 
@@ -315,14 +373,14 @@ pub(crate) enum ApplyAction {
 }
 
 pub(crate) fn decide_apply(
-    staged: &StagedDelta,
+    staged: &StagedHeader,
     epoch: IndexEpoch,
     current: IndexEpoch,
     last_applied: Option<(IndexEpoch, [u8; 32])>,
 ) -> Result<ApplyAction> {
     if epoch <= current {
         return match last_applied {
-            Some((last_epoch, digest)) if last_epoch == epoch && digest == staged.digest() => {
+            Some((last_epoch, digest)) if last_epoch == epoch && digest == staged.digest => {
                 Ok(ApplyAction::AlreadyApplied)
             }
             _ => Err(IndexError::EpochConflict {
@@ -346,19 +404,22 @@ const VALUE_UNIQUE: u8 = 0x01;
 const VALUE_REFERENCE: u8 = 0x02;
 
 /// An encoded index value, without a heap allocation (one is written per changed key).
-pub(crate) struct EncodedValue {
+#[derive(Debug)]
+pub struct EncodedValue {
     bytes: [u8; 9],
     len: usize,
 }
 
 impl EncodedValue {
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    /// The encoded bytes.
+    pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
 
-/// Canonical 1- or 9-byte encoding of an index value (`None` = absent).
-pub(crate) fn encode_value(value: Option<&IndexValue>) -> EncodedValue {
+/// Canonical 1- or 9-byte encoding of an index value (`None` = absent), as in a staged delta
+/// (RFC 0004, RFC 0006).
+pub fn encode_value(value: Option<&IndexValue>) -> EncodedValue {
     let tagged = |tag: u8, payload: [u8; 8]| {
         let mut bytes = [tag, 0, 0, 0, 0, 0, 0, 0, 0];
         bytes[1..].copy_from_slice(&payload);
@@ -376,6 +437,14 @@ pub(crate) fn encode_value(value: Option<&IndexValue>) -> EncodedValue {
             tagged(VALUE_REFERENCE, child_count.to_be_bytes())
         }
     }
+}
+
+/// Decodes [`encode_value`] output, absent included; anything else is corruption.
+pub fn decode_staged_value(bytes: &[u8]) -> Result<Option<IndexValue>> {
+    if bytes == [VALUE_ABSENT] {
+        return Ok(None);
+    }
+    decode_value(bytes).map(Some)
 }
 
 /// Decodes a stored (present) value; anything else is corruption.
