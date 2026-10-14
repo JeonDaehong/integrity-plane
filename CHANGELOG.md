@@ -9,8 +9,8 @@ Second pre-release. **Pre-alpha, not production-ready**: see
 key encoding, certificate format, transaction log records or status mapping (upgrading a 0.0.1
 control store in place is not tested). This release is about memory and speed on large tables.
 
-With Spark 3.5 on Amazon S3 (one m6id.4xlarge, `docs/benchmarks.md`), against 0.0.1 at commit
-9318c84: an initial load of 30 M rows through the Plane takes 38 s instead of 164 s (6 s directly),
+With Spark 3.5 on Amazon S3 (one m6id.4xlarge, `docs/benchmarks.md`), against commit 9318c84 (the
+first Spark measurement, part-way through this release): an initial load of 30 M rows through the Plane takes 38 s instead of 164 s (6 s directly),
 compacting 33 M rows 59 s instead of 111 s (33 s directly), and a whole nightly ETL job 30–31 s
 against 22–24 s directly.
 
