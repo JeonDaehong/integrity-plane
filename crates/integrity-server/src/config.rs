@@ -171,6 +171,23 @@ pub struct TxnLogConfig {
     /// `"30m"`, the advertised `idempotency-key-lifetime`.
     #[serde(default = "default_retention", deserialize_with = "retention")]
     pub retention: Duration,
+    /// Writes per staged chunk in the log (RFC 0006); a tuning knob, at least 1.
+    #[serde(default = "default_chunk_writes", deserialize_with = "chunk_writes")]
+    pub chunk_writes: usize,
+}
+
+fn default_chunk_writes() -> usize {
+    integrity_txn::log::DEFAULT_CHUNK_WRITES
+}
+
+fn chunk_writes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    let n = usize::deserialize(d)?;
+    if n == 0 {
+        return Err(serde::de::Error::custom(
+            "txn_log.chunk_writes must be at least 1",
+        ));
+    }
+    Ok(n)
 }
 
 fn default_retention() -> Duration {
@@ -181,6 +198,7 @@ impl Default for TxnLogConfig {
     fn default() -> Self {
         Self {
             retention: default_retention(),
+            chunk_writes: default_chunk_writes(),
         }
     }
 }
@@ -452,6 +470,14 @@ max_inline_validation_bytes = "2GiB"
         assert_eq!(c.txn_log.retention, Duration::from_secs(604_800));
         let short = Config::from_toml(&format!("{BASE}\n[txn_log]\nretention = \"29m\"\n"));
         assert!(short.unwrap_err().to_string().contains("shorter than 30m"));
+        assert_eq!(c.txn_log.chunk_writes, 100_000);
+        let zero = Config::from_toml(&format!(
+            "{BASE}
+[txn_log]
+chunk_writes = 0
+"
+        ));
+        assert!(zero.is_err());
     }
 
     #[test]

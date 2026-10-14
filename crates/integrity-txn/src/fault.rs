@@ -9,6 +9,8 @@
 pub enum FaultPoint {
     /// After `PREPARED` is durable, during validation.
     AfterPreparedLog,
+    /// Some chunks of a large staged delta are durable, `VALIDATED` is not (RFC 0006).
+    BetweenStagedChunks,
     /// After `VALIDATED` (with staged deltas) is durable.
     AfterValidatedLog,
     /// After `COMMITTING`, before the request reaches upstream.
@@ -27,8 +29,9 @@ pub enum FaultPoint {
 
 impl FaultPoint {
     /// Every point, in protocol order.
-    pub const ALL: [FaultPoint; 8] = [
+    pub const ALL: [FaultPoint; 9] = [
         FaultPoint::AfterPreparedLog,
+        FaultPoint::BetweenStagedChunks,
         FaultPoint::AfterValidatedLog,
         FaultPoint::BeforeUpstream,
         FaultPoint::AfterUpstreamBeforeLog,
@@ -42,6 +45,7 @@ impl FaultPoint {
     pub fn name(self) -> &'static str {
         match self {
             FaultPoint::AfterPreparedLog => "AfterPreparedLog",
+            FaultPoint::BetweenStagedChunks => "BetweenStagedChunks",
             FaultPoint::AfterValidatedLog => "AfterValidatedLog",
             FaultPoint::BeforeUpstream => "BeforeUpstream",
             FaultPoint::AfterUpstreamBeforeLog => "AfterUpstreamBeforeLog",

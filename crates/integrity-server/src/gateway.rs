@@ -23,7 +23,8 @@ use integrity_iceberg::{
 };
 use integrity_index::{IndexKind, KeyIndex, PersistentIndex, PersistentStore};
 use integrity_txn::{
-    Decision as TxnDecision, FaultPoint, Prepared, TxnId, TxnLog, TxnState, Validated, fault,
+    Decision as TxnDecision, FaultPoint, Prepared, StagedEntry, TxnId, TxnLog, TxnState, Validated,
+    fault,
 };
 use integrity_types::{ConstraintId, ConstraintSetVersion, ErrorCode, SnapshotId};
 use integrity_validator::Validator;
@@ -895,21 +896,26 @@ impl Gateway {
                             if meta.snapshot(SnapshotId(v.final_snapshot)).is_some() =>
                         {
                             let mut indexes = BTreeMap::new();
-                            for (id, _) in &u.staged {
-                                let kind = self.index_kind(*id).ok_or_else(|| {
+                            for id in u.staged.iter().map(StagedEntry::constraint_id) {
+                                let kind = self.index_kind(id).ok_or_else(|| {
                                     ApiError::new(
                                         ErrorCode::IndexDegraded,
                                         format!("no configured index for {id}"),
                                     )
                                 })?;
-                                let index = self.store.index(*id, kind).map_err(|e| {
+                                let index = self.store.index(id, kind).map_err(|e| {
                                     ApiError::new(ErrorCode::IndexDegraded, e.to_string())
                                 })?;
-                                indexes.insert(*id, index);
+                                indexes.insert(id, index);
                             }
-                            if let Err(e) =
-                                pipeline::apply(&self.store, &u.staged, &indexes, v.epoch)
-                            {
+                            if let Err(e) = pipeline::apply(
+                                &self.store,
+                                &self.log,
+                                u.txn,
+                                &u.staged,
+                                &indexes,
+                                v.epoch,
+                            ) {
                                 self.mark_transient(&u.prepared.identifier, &e.message);
                                 return Err(e);
                             }
@@ -1368,8 +1374,10 @@ impl Gateway {
             )
         })?);
 
-        // VALIDATED (with the staged deltas) and COMMITTING in one durable write (RFC 0004 records).
-        self.log
+        // VALIDATED (with the staged deltas) and COMMITTING in one durable write (RFC 0004
+        // records, staged deltas in chunks: RFC 0006).
+        let staged = self
+            .log
             .validated_and_committing(
                 txn,
                 Validated {
@@ -1457,7 +1465,7 @@ impl Gateway {
 struct Accepted {
     txn: TxnId,
     epoch: u64,
-    staged: Vec<(ConstraintId, integrity_index::StagedDelta)>,
+    staged: Vec<StagedEntry>,
     indexes: BTreeMap<ConstraintId, PersistentIndex>,
     decision: TxnDecision,
     identifier: String,
@@ -1483,10 +1491,11 @@ impl Gateway {
             _queue,
             _shared,
         } = accepted;
-        let store = self.store.clone();
-        let applied =
-            tokio::task::spawn_blocking(move || pipeline::apply(&store, &staged, &indexes, epoch))
-                .await;
+        let gateway = Arc::clone(&self);
+        let applied = tokio::task::spawn_blocking(move || {
+            pipeline::apply(&gateway.store, &gateway.log, txn, &staged, &indexes, epoch)
+        })
+        .await;
         match applied {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return self.mark_transient(&identifier, &e.message),

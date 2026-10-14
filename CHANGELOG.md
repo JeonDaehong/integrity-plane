@@ -6,6 +6,10 @@
   finished transactions after `[txn_log] retention` (default `24h`, at least `30m`; RFC 0006):
   it no longer grows with write volume, and keeps only recent transactions in memory. A request
   repeating a pruned idempotency key is validated as a new request.
+- A commit's staged index changes are logged in chunks of `[txn_log] chunk_writes` (default
+  100 000) and applied by streaming them from the log into one index transaction (RFC 0006, ADR
+  0025): logging and applying no longer hold a commit's changes in memory. A log written by 0.0.2
+  still recovers; 0.0.2 cannot recover a commit logged in chunks.
 
 ## 0.0.2 — 2026-10-14
 

@@ -82,6 +82,37 @@ fn ok(status: u16) -> Decision {
     }
 }
 
+/// What `staged` looks like read back from the log: header and writes per constraint.
+type Logged = Vec<(
+    ConstraintId,
+    integrity_index::StagedHeader,
+    Vec<(EncodedKey, Option<integrity_index::IndexValue>)>,
+)>;
+
+fn as_logged(staged: &[(ConstraintId, StagedDelta)]) -> Logged {
+    staged
+        .iter()
+        .map(|(id, d)| {
+            let writes = d.writes().map(|(k, v)| (k.clone(), v.copied())).collect();
+            (*id, d.header(), writes)
+        })
+        .collect()
+}
+
+fn read_back(log: &TxnLog, u: &integrity_txn::Unresolved) -> Logged {
+    u.staged
+        .iter()
+        .map(|e| {
+            let writes = log
+                .staged_writes(u.txn, e)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (e.constraint_id(), e.header().unwrap(), writes)
+        })
+        .collect()
+}
+
 #[test]
 fn state_machine_allows_exactly_the_rfc_transitions() {
     use TxnState::*;
@@ -165,7 +196,11 @@ fn unresolved_transactions_carry_what_recovery_needs() {
     assert_eq!(log.state(a), Some(TxnState::Aborted));
     for u in &unresolved {
         assert_eq!(u.validated, Some(validated()));
-        assert_eq!(u.staged, staged(), "staged deltas replay identically");
+        assert_eq!(
+            read_back(&log, u),
+            as_logged(&staged()),
+            "staged deltas replay identically"
+        );
         assert_eq!(u.prepared.load_path, "/v1/namespaces/db/tables/orders");
     }
     // A decision only exists once a transaction finished.
@@ -315,7 +350,7 @@ fn validated_and_committing_is_one_write_of_both_records() {
     let u = log.unresolved().unwrap();
     assert_eq!(u.len(), 1);
     assert_eq!((u[0].txn, u[0].state), (txn, TxnState::Committing));
-    assert_eq!(u[0].staged, staged());
+    assert_eq!(read_back(&log, &u[0]), as_logged(&staged()));
     log.finish(txn, TxnState::Committed, ok(200)).unwrap();
     assert!(log.unresolved().unwrap().is_empty());
     drop(log);

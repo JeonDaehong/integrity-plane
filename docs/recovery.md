@@ -17,7 +17,11 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
 ```
 
 - `VALIDATED` is written, durably, together with the staged index deltas (the exact values to
-  write) before anything is forwarded.
+  write) before anything is forwarded. The deltas are logged in chunks (RFC 0006, 100 000 writes
+  each by default): every chunk but the last of each delta in a durable write of its own, the last
+  ones with `VALIDATED`. Chunks of a transaction that never reached `VALIDATED` are deleted with
+  its `ABORTED` record or at start. Applying a commit, and recovery finishing one, read the chunks
+  back and write them into one index transaction, checking their count and digest first.
 - `COMMITTING` is written immediately before the request goes upstream. A transaction in
   `VALIDATED` was therefore never forwarded.
 - `VALIDATED` and `COMMITTING` of a commit about to be forwarded are written in one durable write

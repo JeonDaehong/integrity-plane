@@ -39,6 +39,7 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         config.control_store.path.join("txn.redb"),
         LogOptions {
             retention: config.txn_log.retention,
+            chunk_writes: config.txn_log.chunk_writes,
             ..LogOptions::default()
         },
     )?;

@@ -18,6 +18,7 @@ use serde_json::json;
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("oip/txn-log/v1");
 const STAGED: TableDefinition<u64, &[u8]> = TableDefinition::new("oip/txn-staged/v1");
+const STAGED_V2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oip/txn-staged/v2");
 
 const HOUR: u64 = 3_600_000;
 
@@ -65,6 +66,7 @@ impl Clock {
         LogOptions {
             retention,
             clock: Arc::new(move || now.load(Ordering::SeqCst)),
+            ..LogOptions::default()
         }
     }
 }
@@ -127,8 +129,40 @@ fn rows(dir: &Dir) -> (u64, u64) {
     let db = Database::create(dir.log()).unwrap();
     let read = db.begin_read().unwrap();
     let log = read.open_table(LOG).unwrap().len().unwrap();
-    let staged = read.open_table(STAGED).unwrap().len().unwrap();
+    let staged = read.open_table(STAGED).unwrap().len().unwrap()
+        + read.open_table(STAGED_V2).unwrap().len().unwrap();
     (log, staged)
+}
+
+/// What `staged` looks like read back from the log: header and writes per constraint.
+type Logged = Vec<(
+    ConstraintId,
+    integrity_index::StagedHeader,
+    Vec<(EncodedKey, Option<integrity_index::IndexValue>)>,
+)>;
+
+fn as_logged(staged: &[(ConstraintId, StagedDelta)]) -> Logged {
+    staged
+        .iter()
+        .map(|(id, d)| {
+            let writes = d.writes().map(|(k, v)| (k.clone(), v.copied())).collect();
+            (*id, d.header(), writes)
+        })
+        .collect()
+}
+
+fn read_back(log: &TxnLog, u: &integrity_txn::Unresolved) -> Logged {
+    u.staged
+        .iter()
+        .map(|e| {
+            let writes = log
+                .staged_writes(u.txn, e)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (e.constraint_id(), e.header().unwrap(), writes)
+        })
+        .collect()
 }
 
 #[test]
@@ -153,7 +187,7 @@ fn staged_deltas_go_with_the_terminal_record() {
     let log = open(&dir, &clock);
     let u = log.unresolved().unwrap();
     assert_eq!(u.len(), 1);
-    assert_eq!(u[0].staged, staged());
+    assert_eq!(read_back(&log, &u[0]), as_logged(&staged()));
 }
 
 #[test]

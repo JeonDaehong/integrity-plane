@@ -270,6 +270,8 @@ catalog_uri = "http://{upstream}"
 timeout_secs = 5
 [control_store]
 path = "{control}"
+[txn_log]
+chunk_writes = 2
 [[constraint]]
 id = 1
 table = "db.t"
@@ -470,6 +472,8 @@ async fn scenario(fault: FaultPoint, answer: Answer) -> (Vec<i64>, BTreeMap<&'st
 async fn every_fault_point_recovers_to_the_upstream_state() {
     let cases = [
         (FaultPoint::AfterPreparedLog, Answer::Normal, vec![1, 3]),
+        // Each commit writes 3 keys, logged in chunks of 2 (RFC 0006).
+        (FaultPoint::BetweenStagedChunks, Answer::Normal, vec![1, 3]),
         (FaultPoint::AfterValidatedLog, Answer::Normal, vec![1, 3]),
         (FaultPoint::BeforeUpstream, Answer::Normal, vec![1, 3]),
         (

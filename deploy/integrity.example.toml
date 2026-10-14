@@ -37,6 +37,9 @@ scan_memory = "512MiB"
 # Finished transactions (and their idempotency keys) are kept this long, then deleted (RFC 0006).
 # At least 30m, the idempotency-key-lifetime advertised to clients.
 retention = "24h"
+# Writes per logged chunk of a commit's staged index changes; bounds the memory of logging and
+# applying a large commit. Rarely worth changing.
+# chunk_writes = 100000
 
 # Sign certificates (RFC 0005). The key file is created on first start if missing; publish its public
 # key (GET /v1/integrity/keys) to verifiers, who pin it with `integrity verify --trusted-key`.
