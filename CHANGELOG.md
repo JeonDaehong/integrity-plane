@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.0.2 — 2026-10-14
+
+Second pre-release. **Pre-alpha, not production-ready**: see
+[`docs/limitations.md`](docs/limitations.md) before trying it. No change to constraint semantics,
+key encoding, certificate format, transaction log records or status mapping (upgrading a 0.0.1
+control store in place is not tested). This release is about memory and speed on large tables.
+
+With Spark 3.5 on Amazon S3 (one m6id.4xlarge, `docs/benchmarks.md`), against 0.0.1 at commit
+9318c84: an initial load of 30 M rows through the Plane takes 38 s instead of 164 s (6 s directly),
+compacting 33 M rows 59 s instead of 111 s (33 s directly), and a whole nightly ETL job 30–31 s
+against 22–24 s directly.
+
 - Onboarding and rebuild run with bounded memory (ADR 0011 amendment): rows are read a row group at
   a time, keys are sorted externally within `limits.scan_memory` (default 512 MiB), and the new
   indexes are built beside the live ones and installed in one transaction. On one AWS
@@ -21,6 +33,19 @@
   per-key maps (ADR 0021): commits that change many keys validate several times faster.
 - Each manifest and delete file of a commit is read once, up to 16 at a time (ADR 0020): on
   Amazon S3 a merge-on-read delete in a 100-file table takes 0.5–0.65 s instead of 4.7–8.5 s.
+- Merge-on-read deletes decode only the changed rows of the data files they keep (ADR 0023): a
+  delete spread over every row group still reads those key column chunks but no longer converts
+  every key in them. On S3 a Spark delete of 1 % of 33 M rows takes 13.0 s through the Plane
+  instead of 16.4 s (3.6 s directly).
+- The two sides of a commit (rows added and rows removed) are read, sorted and merged on threads
+  of their own (ADR 0024): with Spark on S3, compacting 33 M rows validates in 32 s instead of
+  50 s.
+- Key extraction reads only the footer and the key column chunks of each Parquet file, with ranged
+  reads, instead of whole data files; deletion vector blobs are read by offset and size (ADR 0006
+  amendment).
+- Commits still being finished after their answer are no longer reported as awaiting recovery.
+- `compat/spark_bench.py` and `compat/spark_etl_bench.py` time Spark statements and a nightly ETL
+  job directly against the catalog and through the Plane; the README says when the Plane fits.
 - `integrity-bench --settle` waits after large file writes before measuring; `--s3` writes the
   generated files to an S3 prefix and the Plane reads them from there.
 
