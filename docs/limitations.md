@@ -71,9 +71,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   certificates (the catalog serves only the current snapshot). The client tests use S3 through
   SeaweedFS (MinIO no longer publishes container images); AWS S3 was used only by the benchmarks.
 - Validating a commit costs time per row it adds, removes or rewrites: with Spark on S3,
-  inserting 1 M rows takes 4.6 s through the Plane against 0.7 s directly, an initial load of
-  30 M rows 38 s against 6 s, compacting 33 M rows 77 s against 33 s (`docs/benchmarks.md`). A
-  whole nightly ETL job (reads, joins, two MERGEs, an aggregate) took 32–35 s against 24 s.
+  inserting 1 M rows takes 4.6–5.1 s through the Plane against 0.7 s directly, an initial load of
+  30 M rows 38 s against 6 s, compacting 33 M rows 59 s against 33 s (`docs/benchmarks.md`). A
+  whole nightly ETL job (reads, joins, two MERGEs, an aggregate) took 30–31 s against 22–24 s.
   Sorting and probing every key, and for a rewrite comparing every row, dominate. A commit's
   memory also grows with the keys it changes (unlike copy-on-write rewrites and compactions, whose
   unchanged keys cancel out).

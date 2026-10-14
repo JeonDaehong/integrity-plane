@@ -165,29 +165,38 @@ What a real engine pays: `compat/spark_bench.py` runs the same Spark 3.5 / Icebe
 through two catalogs on one Spark session, `direct` (the Iceberg reference REST catalog) and
 `plane` (the gateway in front of the same catalog), on tables of the same shape: customer(id PK,
 1 M rows) and events(id PK, cust FK → customer, payload). Data on Amazon S3, gateway and Spark
-(`local[*]`) on one `m6id.4xlarge`, 2026-10-11. Times are the whole statement as Spark sees it;
-"validation" is the gateway's own validation time. Three versions of the Plane: A is commit 9318c84,
-B commit 9ac0446 (sorted key deltas, ADR 0021), C commit fe42956 (rewrites validated on several
-threads without per-row allocations, and the client answered before the index write, ADR 0022).
+(`local[*]`) on one `m6id.4xlarge`, 2026-10-11 and (version D) 2026-10-14. Times are the whole
+statement as Spark sees it; "validation" is the gateway's own validation time. Four versions of the
+Plane: A is commit 9318c84, B commit 9ac0446 (sorted key deltas, ADR 0021), C commit fe42956
+(rewrites validated on several threads without per-row allocations, and the client answered before
+the index write, ADR 0022), D commit 0ab0071 (only the changed rows of kept data files decoded,
+ADR 0023; both sides of a commit read, sorted and merged at once, ADR 0024).
 
-| Statement | Direct | Plane A | Plane B | **Plane C** | Validation A → C |
-|---|---|---|---|---|---|
-| INSERT 30 M rows (initial load, PK + FK) | 5.9 s | 163.9 s | 72.4 s | **38.3 s** | 113.3 s → 26.0 s |
-| INSERT 1 M rows (median of 3) | 0.7 s | 11.4 s | 6.3 s | **4.6 s** | 7.8 s → 3.1 s |
-| MERGE copy-on-write, 500 K updates + 500 K inserts | 3.3 s | 13.2 s | 10.4 s | **9.1 s** | 6.7 s → 4.2 s |
-| DELETE copy-on-write, 100 K rows | 2.1 s | 7.2 s | 7.0 s | **6.2 s** | 5.0 s → 4.2 s |
-| DELETE merge-on-read, 1 % of all rows | 3.6 s | 20.7 s | 20.1 s | **16.4 s** | 12.5 s → 11.6 s |
-| UPDATE merge-on-read, 100 K rows | 1.6 s | 2.4 s | 2.3 s | **2.3 s** | 0.9 s → 0.9 s |
-| MERGE merge-on-read, 100 K updates + 100 K inserts | 7.3 s | 10.7 s | 10.8 s | **10.1 s** | 2.6 s → 2.1 s |
-| DELETE merge-on-read, 1 row (median of 3) | 1.2 s | 2.0 s | 2.1 s | **2.0 s** | 0.7 s → 0.7 s |
-| Compaction (`rewrite_data_files`, all files) | 32.8 s | 110.9 s | 103.5 s | **76.8 s** | 79.6 s → 50.0 s |
+| Statement | Direct | Plane A | Plane B | Plane C | **Plane D** | Validation A → C → D |
+|---|---|---|---|---|---|---|
+| INSERT 30 M rows (initial load, PK + FK) | 5.9 s | 163.9 s | 72.4 s | 38.3 s | **37.7 s** | 113.3 s → 26.0 s → 25.1 s |
+| INSERT 1 M rows (median of 3) | 0.7 s | 11.4 s | 6.3 s | 4.6 s | **5.1 s** | 7.8 s → 3.1 s → 3.1 s |
+| MERGE copy-on-write, 500 K updates + 500 K inserts | 3.3 s | 13.2 s | 10.4 s | 9.1 s | **8.5 s** | 6.7 s → 4.2 s → 3.3 s |
+| DELETE copy-on-write, 100 K rows | 2.1 s | 7.2 s | 7.0 s | 6.2 s | **4.7 s** | 5.0 s → 4.2 s → 2.7 s |
+| DELETE merge-on-read, 1 % of all rows | 3.6 s | 20.7 s | 20.1 s | 16.4 s | **13.0 s** | 12.5 s → 11.6 s → 9.1 s |
+| UPDATE merge-on-read, 100 K rows | 1.6 s | 2.4 s | 2.3 s | 2.3 s | **2.1 s** | 0.9 s → 0.9 s → 0.6 s |
+| MERGE merge-on-read, 100 K updates + 100 K inserts | 7.3 s | 10.7 s | 10.8 s | 10.1 s | **10.3 s** | 2.6 s → 2.1 s → 2.0 s |
+| DELETE merge-on-read, 1 row (median of 3) | 1.2 s | 2.0 s | 2.1 s | 2.0 s | **1.9 s** | 0.7 s → 0.7 s → 0.5 s |
+| Compaction (`rewrite_data_files`, all files) | 32.8 s | 110.9 s | 103.5 s | 76.8 s | **58.6 s** | 79.6 s → 50.0 s → 31.8 s |
 
-("Direct" is from run C; across runs it moved by at most a few tenths of a second, compaction by
-up to 6 s.) Both sides end with the same 33 166 997 rows and distinct ids in every run.
+("Direct" is from run C; across runs it moved by at most a few tenths of a second, merge-on-read
+MERGE by 0.6 s and compaction by up to 6 s.) Both sides end with the same 33 166 997 rows and
+distinct ids in every run. The 1 M-row append in D validated as fast as in C (3.1 s); its total
+moved by half a second outside validation.
+
+Version D mostly helps statements that remove or rewrite rows: compaction 76.8 → 58.6 s (validation
+50.0 → 31.8 s), the merge-on-read delete of 1 % of all rows 16.4 → 13.0 s, the copy-on-write delete
+6.2 → 4.7 s. A spread merge-on-read delete still reads the key column of every row group it
+touches.
 
 Statements that change few or a hundred thousand rows cost about a second more. Statements that
-add or rewrite millions of rows cost two to six times the engine's own work, down from up to 28
-times. What remains, for a 1 M-row append (local disk, before ADR 0022): about 0.4 s to read and
+add or rewrite millions of rows cost 1.8 (compaction) to seven times the engine's own work, down
+from up to 28 times. What remains, for a 1 M-row append (local disk, before ADR 0022): about 0.4 s to read and
 extract keys, 0.6 s to sort and merge them, 0.6 s for probes, 0.25 s to stage and 0.2 s for the
 transaction log record are on the commit's path; the index write (about 1.3 s, one B-tree insert
 per changed key) now follows the answer. A merge-on-read delete spread over every file reads the key
@@ -198,26 +207,28 @@ columns of every row group it touches, and a compaction sorts every key and row 
 
 The statements above write and little else, so their multipliers overstate what a job pays.
 `compat/spark_etl_bench.py` runs a whole nightly job on the same setup (Spark 3.5 / Iceberg 1.10,
-data on S3, one `m6id.4xlarge`, commit 7ffbb42, 2026-10-12): it reads a raw customer feed (100 K
+data on S3, one `m6id.4xlarge`; version C is commit 7ffbb42 on 2026-10-12, version D commit 0ab0071
+on 2026-10-14): it reads a raw customer feed (100 K
 changes) and 6 M raw order events, upserts customer(id PK, code UNIQUE) with MERGE, keeps each
 order's latest event, joins customers and a product table, upserts 3 M orders into orders(id PK,
 cust FK → customer) with MERGE (1.5 M updates, 1.5 M inserts; 30 M orders at the start) and rebuilds
 an unconstrained per-customer summary from all orders. Medians of 2 nights per write mode, each night
-alternating which side runs first.
+alternating which side runs first. Each run has its own direct column; percentages are against the
+direct time of the same run.
 
-| Step | Copy-on-write: direct | Plane | Merge-on-read: direct | Plane |
-|---|---|---|---|---|
-| customer MERGE | 3.4 s | 8.0 s | 3.2 s | 5.2 s |
-| events → dedup → joins → orders MERGE | 13.5 s | 21.0 s | 13.5 s | 19.8 s |
-| summary rebuild (no constraints) | 6.6 s | 6.4 s | 7.0 s | 7.4 s |
-| **Whole job** | **23.5 s** | **35.4 s (+51 %)** | **23.7 s** | **32.4 s (+36 %)** |
-| of which validation | | 11.9 s | | 8.5 s |
+| Step | Copy-on-write: direct C / D | Plane C | **Plane D** | Merge-on-read: direct C / D | Plane C | **Plane D** |
+|---|---|---|---|---|---|---|
+| customer MERGE | 3.4 / 3.4 s | 8.0 s | **6.6 s** | 3.2 / 3.3 s | 5.2 s | **4.9 s** |
+| events → dedup → joins → orders MERGE | 13.5 / 13.4 s | 21.0 s | **18.3 s** | 13.5 / 12.4 s | 19.8 s | **18.0 s** |
+| summary rebuild (no constraints) | 6.6 / 6.6 s | 6.4 s | **6.4 s** | 7.0 / 6.7 s | 7.4 s | **6.6 s** |
+| **Whole job** | **23.5 / 23.5 s** | 35.4 s (+51 %) | **31.3 s (+33 %)** | **23.7 / 22.4 s** | 32.4 s (+36 %) | **29.6 s (+32 %)** |
+| of which validation | | 11.9 s | **8.3 s** | | 8.5 s | **6.7 s** |
 
 Both sides end with the same 35 984 601 orders (same ids and amount total) and 1 080 000
-customers. The Plane adds 9–12 s to a job Spark finishes in 24 s; a job with heavier reads, joins or
-aggregations pays the same seconds on a larger total. Most of it is rewrite validation: the
-copy-on-write customer MERGE rewrites every customer file (its changes are spread over the table)
-and validates all 1 M rows against PK and UNIQUE.
+customers in both runs. With version D the Plane adds 7–8 s to a job Spark finishes in 22–24 s
+(9–12 s with C); a job with heavier reads, joins or aggregations pays the same seconds on a larger
+total. Most of it is rewrite validation: the copy-on-write customer MERGE rewrites every customer
+file (its changes are spread over the table) and validates all 1 M rows against PK and UNIQUE.
 
 ### Merge-on-read deletes spread over a table (ADR 0023, local)
 
