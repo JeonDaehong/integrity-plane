@@ -57,8 +57,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 ## Operations
 
 - Single node. The control store is local files; there is no replication.
-- The transaction log keeps every staged index delta and is never truncated; it grows with write
-  volume.
+- The transaction log keeps finished transactions for `[txn_log] retention` (default 24 h), then
+  deletes them; idempotency keys are honoured for that long. The audit log and the per-transaction
+  error reports in `registry.redb` are never pruned.
 - The persistent index takes about 100 bytes per key.
 - Losing `registry.redb` cannot be detected from the other files; constraints from the
   configuration file are re-imported and tables with data must be onboarded again.

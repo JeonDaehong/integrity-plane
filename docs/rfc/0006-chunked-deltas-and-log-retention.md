@@ -117,15 +117,16 @@ and fails closed. The index store format does not change.
 - A terminal record (`COMMITTED`, `ABORTED`, `REJECTED`) and the deletion of the transaction's
   staged deltas (v1 value or every v2 chunk) are one durable write.
 - Terminal payloads gain `finished_at` (Unix milliseconds). A terminal record without it (written by
-  0.0.2 or earlier) counts as finished when the log is opened.
+  0.0.2 or earlier) counts as finished when the log was first opened by a version that prunes; that
+  time is recorded once as `opened_at` in `oip/txn-meta/v1`.
 - A new setting `[txn_log] retention` (duration, default `24h`, minimum `30m`, the advertised
   `idempotency-key-lifetime`). At open and then at most once a minute after a terminal record, every
   record of each transaction that has been terminal for longer than `retention` is deleted, in one
   durable write per at most 10 000 transactions. Its request id is forgotten with it.
-- A new table `oip/txn-meta/v1` holds `next_txn` (u64), rewritten in every pruning write, so that
-  transaction ids stay strictly increasing and are never reused when the newest transactions have
-  been pruned. At open, `next_txn` is the larger of this value and one past the largest id in the
-  log.
+- A new table `oip/txn-meta/v1` holds `next_txn` and `next_seq` (u64), rewritten in every pruning
+  write, so that transaction ids and record sequence numbers stay strictly increasing and are never
+  reused when the newest transactions have been pruned. At open, each is the larger of the stored
+  value and one past the largest in the log.
 - In memory, the log keeps the state and request id of transactions that are unresolved or within
   `retention`; payloads (prepared, validated, recorded responses) are read from the log when needed.
 

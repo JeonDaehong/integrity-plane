@@ -11,7 +11,7 @@ use integrity_server::config::Config;
 use integrity_server::fileio::ObjectStoreIo;
 use integrity_server::store::Registry;
 use integrity_server::{Gateway, router};
-use integrity_txn::TxnLog;
+use integrity_txn::{LogOptions, TxnLog};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -35,7 +35,13 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_toml_with_env(&std::fs::read_to_string(path)?, std::env::vars())?;
     std::fs::create_dir_all(&config.control_store.path)?;
     let store = PersistentStore::open(config.control_store.path.join("indexes.redb"))?;
-    let log = TxnLog::open(config.control_store.path.join("txn.redb"))?;
+    let log = TxnLog::open_with(
+        config.control_store.path.join("txn.redb"),
+        LogOptions {
+            retention: config.txn_log.retention,
+            ..LogOptions::default()
+        },
+    )?;
     let registry = Registry::open(
         config.control_store.path.join("registry.redb"),
         &config.constraints,

@@ -1075,7 +1075,9 @@ impl Gateway {
         let held = queue.lock_owned().await;
         self.metrics.queue_wait.observe(waiting.elapsed());
         self.recover(&headers, Some(&members)).await?;
-        if let Some(d) = request_id.as_deref().and_then(|r| self.log.decision_for(r)) {
+        if let Some(r) = request_id.as_deref()
+            && let Some(d) = self.log.decision_for(r).map_err(log_error)?
+        {
             return Ok(replay(&d));
         }
         if let Some(reason) = self.degraded(&doc, &members) {

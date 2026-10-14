@@ -1,6 +1,7 @@
 # Recovery
 
 > Normative source: spec §16 and §19, [RFC 0004](rfc/0004-transaction-log-v1.md),
+> [RFC 0006](rfc/0006-chunked-deltas-and-log-retention.md) for retention,
 > [ADR 0011](adr/0011-registry-anchors-and-rebuild.md) for rebuild.
 
 ## Transaction log
@@ -26,7 +27,16 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
   the commit still holds its domain queue and the shared constraint lock (ADR 0022); a 4xx ⇒
   `ABORTED`; a 5xx or no answer ⇒ resolved as below. If applying or logging fails, the domain refuses
   commits until recovery or a rebuild, as after a crash.
-- Terminal records store the response, returned again for a repeated `Idempotency-Key`.
+- Terminal records store the response, returned again for a repeated `Idempotency-Key`, and
+  when it was given. The terminal record and the deletion of the transaction's staged deltas are
+  one durable write: only unresolved transactions keep staged deltas.
+- Transactions are kept for `[txn_log] retention` after their terminal record (default `24h`, at
+  least `30m`, the advertised idempotency key lifetime), then deleted, at start and at most once a
+  minute after a terminal record. A pruned transaction is unknown to
+  `GET /v1/integrity/transactions/{id}`, and a request repeating its `Idempotency-Key` is validated
+  as a new request (a repeated append of the same keys is rejected as a duplicate). The next
+  transaction id is recorded with every pruning, so ids are never reused. The audit log keeps its
+  own history.
 
 ## Resolution (on start and before every commit)
 

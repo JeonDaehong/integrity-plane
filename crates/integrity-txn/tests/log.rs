@@ -127,8 +127,8 @@ fn a_commit_survives_reopen_with_its_decision() {
     };
     let log = TxnLog::open(dir.log()).unwrap();
     assert_eq!(log.state(txn), Some(TxnState::Committed));
-    assert_eq!(log.decision_for("req-1"), Some(ok(200)));
-    assert_eq!(log.decision_for("other"), None);
+    assert_eq!(log.decision_for("req-1"), Ok(Some(ok(200))));
+    assert_eq!(log.decision_for("other"), Ok(None));
     assert!(log.unresolved().unwrap().is_empty());
     let summary = log.summary(txn).unwrap();
     assert_eq!(summary.state, TxnState::Committed);
@@ -169,7 +169,7 @@ fn unresolved_transactions_carry_what_recovery_needs() {
         assert_eq!(u.prepared.load_path, "/v1/namespaces/db/tables/orders");
     }
     // A decision only exists once a transaction finished.
-    assert_eq!(log.decision_for("b"), None);
+    assert_eq!(log.decision_for("b"), Ok(None));
 }
 
 #[test]

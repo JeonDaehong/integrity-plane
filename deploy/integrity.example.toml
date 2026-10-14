@@ -33,6 +33,11 @@ max_inline_validation_bytes = "2GiB"
 # store.
 scan_memory = "512MiB"
 
+[txn_log]
+# Finished transactions (and their idempotency keys) are kept this long, then deleted (RFC 0006).
+# At least 30m, the idempotency-key-lifetime advertised to clients.
+retention = "24h"
+
 # Sign certificates (RFC 0005). The key file is created on first start if missing; publish its public
 # key (GET /v1/integrity/keys) to verifiers, who pin it with `integrity verify --trusted-key`.
 # [signing]

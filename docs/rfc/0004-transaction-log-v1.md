@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-09
 - Affects: txn log format
+- Amended by: [RFC 0006](0006-chunked-deltas-and-log-retention.md) (staged chunks, retention)
 
 ## Summary
 

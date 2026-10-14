@@ -1,9 +1,11 @@
-//! The durable transaction log (spec §16, RFC 0004).
+//! The durable transaction log (spec §16, RFC 0004, retention RFC 0006).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use integrity_index::StagedDelta;
 use integrity_types::ConstraintId;
@@ -15,7 +17,50 @@ use crate::{TxnError, TxnId, TxnState};
 
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("oip/txn-log/v1");
 const STAGED: TableDefinition<u64, &[u8]> = TableDefinition::new("oip/txn-staged/v1");
+const META: TableDefinition<&str, u64> = TableDefinition::new("oip/txn-meta/v1");
 const VERSION: u8 = 1;
+
+/// Default `[txn_log] retention` (RFC 0006).
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(24 * 3600);
+/// Smallest allowed retention: the `idempotency-key-lifetime` advertised in `/v1/config`.
+pub const MIN_RETENTION: Duration = Duration::from_secs(30 * 60);
+/// Pruning runs at most this often after terminal records (milliseconds).
+const PRUNE_EVERY_MS: u64 = 60_000;
+/// Transactions pruned per durable write.
+const PRUNE_BATCH: usize = 10_000;
+
+/// The current time in Unix milliseconds.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// How the log keeps finished transactions.
+#[derive(Clone)]
+pub struct LogOptions {
+    /// How long a transaction is kept after its terminal record (RFC 0006).
+    pub retention: Duration,
+    /// Where `finished_at` and the pruning cutoff come from.
+    pub clock: Clock,
+}
+
+impl Default for LogOptions {
+    fn default() -> Self {
+        Self {
+            retention: DEFAULT_RETENTION,
+            clock: Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for LogOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LogOptions")
+            .field("retention", &self.retention)
+            .finish_non_exhaustive()
+    }
+}
 
 /// What is known when a commit arrives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +116,15 @@ pub struct Unresolved {
     pub staged: Vec<(ConstraintId, StagedDelta)>,
 }
 
+/// The payload of a terminal record: the decision and, since RFC 0006, when it was made.
+#[derive(Serialize, Deserialize)]
+struct Terminal {
+    status: u16,
+    body: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_at: Option<u64>,
+}
+
 /// Everything recorded about one transaction (`GET /v1/integrity/transactions/{id}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxnSummary {
@@ -84,12 +138,15 @@ pub struct TxnSummary {
     pub decision: Option<Decision>,
 }
 
+/// What the log keeps in memory about a transaction; its payloads are read back from `seqs`.
 #[derive(Debug, Clone, Default)]
 struct Txn {
     state: Option<TxnState>,
-    prepared: Option<Prepared>,
-    validated: Option<Validated>,
-    decision: Option<Decision>,
+    /// Its records, in order.
+    seqs: Vec<u64>,
+    request_id: Option<String>,
+    /// When it reached its terminal state (Unix milliseconds).
+    finished_at: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -100,6 +157,8 @@ struct Index {
     by_request: BTreeMap<String, u64>,
     /// Transactions not in a terminal state (what recovery must resolve).
     open: BTreeSet<u64>,
+    /// When pruning last ran (Unix milliseconds).
+    last_prune: u64,
 }
 
 fn is_terminal(state: TxnState) -> bool {
@@ -110,10 +169,26 @@ fn is_terminal(state: TxnState) -> bool {
 }
 
 /// The transaction log. All writes are durable two-phase commits.
-#[derive(Debug)]
 pub struct TxnLog {
     db: Database,
     index: Mutex<Index>,
+    options: LogOptions,
+}
+
+impl fmt::Debug for TxnLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxnLog")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
+
+fn poisoned<T>(_: T) -> TxnError {
+    TxnError::Storage("log lock poisoned".into())
+}
+
+fn corrupt<T>(_: T) -> TxnError {
+    TxnError::Corrupt
 }
 
 fn storage(e: impl Into<redb::Error>) -> TxnError {
@@ -243,60 +318,213 @@ pub fn allowed(from: Option<TxnState>, to: TxnState) -> bool {
 }
 
 impl TxnLog {
-    /// Opens (or creates) the log, verifying every record.
+    /// Opens (or creates) the log with the default [`LogOptions`], verifying every record.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TxnError> {
+        Self::open_with(path, LogOptions::default())
+    }
+
+    /// Opens (or creates) the log, verifying every record; deletes the staged deltas of finished
+    /// transactions and prunes those past the retention period (RFC 0006).
+    pub fn open_with(path: impl AsRef<Path>, options: LogOptions) -> Result<Self, TxnError> {
         let path = path.as_ref();
         let db = catch_unwind(AssertUnwindSafe(|| Database::create(path)))
-            .map_err(|_| TxnError::Corrupt)?
+            .map_err(corrupt)?
             .map_err(storage)?;
+        let now = (options.clock)();
         let mut index = Index {
             next_txn: 1,
             ..Index::default()
         };
-        let txn = db.begin_write().map_err(storage)?;
+        let mut w = db.begin_write().map_err(storage)?;
+        w.set_two_phase_commit(true);
         {
-            let log = txn.open_table(LOG).map_err(storage)?;
-            txn.open_table(STAGED).map_err(storage)?;
+            let log = w.open_table(LOG).map_err(storage)?;
+            let mut staged = w.open_table(STAGED).map_err(storage)?;
+            let mut meta = w.open_table(META).map_err(storage)?;
+            // Terminal records written before RFC 0006 have no `finished_at`: they count as
+            // finished when a log was first opened by a version that prunes.
+            let legacy_finished_at = match meta.get("opened_at").map_err(storage)? {
+                Some(v) => v.value(),
+                None => now,
+            };
+            meta.insert("opened_at", legacy_finished_at)
+                .map_err(storage)?;
+            if let Some(v) = meta.get("next_txn").map_err(storage)? {
+                index.next_txn = index.next_txn.max(v.value());
+            }
+            if let Some(v) = meta.get("next_seq").map_err(storage)? {
+                index.next_seq = index.next_seq.max(v.value());
+            }
             for item in log.iter().map_err(storage)? {
                 let (seq, record) = item.map_err(storage)?;
+                let seq = seq.value();
                 let (state, id, payload) = decode_record(record.value())?;
-                index.next_seq = seq.value() + 1;
+                index.next_seq = index.next_seq.max(seq + 1);
                 index.next_txn = index.next_txn.max(id.0 + 1);
                 let t = index.txns.entry(id.0).or_default();
                 if !allowed(t.state, state) {
                     return Err(TxnError::Corrupt);
                 }
                 t.state = Some(state);
-                if is_terminal(state) {
-                    index.open.remove(&id.0);
-                } else {
-                    index.open.insert(id.0);
-                }
+                t.seqs.push(seq);
                 match state {
                     TxnState::Prepared => {
-                        let p: Prepared =
-                            serde_json::from_slice(&payload).map_err(|_| TxnError::Corrupt)?;
-                        if let Some(r) = &p.request_id {
-                            index.by_request.insert(r.clone(), id.0);
-                        }
-                        t.prepared = Some(p);
+                        let p: Prepared = serde_json::from_slice(&payload).map_err(corrupt)?;
+                        t.request_id = p.request_id;
                     }
                     TxnState::Validated => {
-                        t.validated =
-                            Some(serde_json::from_slice(&payload).map_err(|_| TxnError::Corrupt)?);
+                        serde_json::from_slice::<Validated>(&payload).map_err(corrupt)?;
                     }
                     TxnState::Committing => {}
                     TxnState::Committed | TxnState::Aborted | TxnState::Rejected => {
-                        t.decision =
-                            Some(serde_json::from_slice(&payload).map_err(|_| TxnError::Corrupt)?);
+                        let d: Terminal = serde_json::from_slice(&payload).map_err(corrupt)?;
+                        t.finished_at = Some(d.finished_at.unwrap_or(legacy_finished_at));
                     }
                 }
             }
+            // Staged deltas are only kept for transactions recovery may still apply.
+            let mut stale = Vec::new();
+            for item in staged.iter().map_err(storage)? {
+                let id = item.map_err(storage)?.0.value();
+                let needed = index
+                    .txns
+                    .get(&id)
+                    .and_then(|t| t.state)
+                    .is_some_and(|s| matches!(s, TxnState::Validated | TxnState::Committing));
+                if !needed {
+                    stale.push(id);
+                }
+            }
+            for id in stale {
+                staged.remove(id).map_err(storage)?;
+            }
         }
-        txn.commit().map_err(storage)?;
-        Ok(Self {
+        w.commit().map_err(storage)?;
+        let Index {
+            txns,
+            by_request,
+            open,
+            ..
+        } = &mut index;
+        for (id, t) in txns.iter() {
+            if let Some(r) = &t.request_id {
+                by_request.insert(r.clone(), *id);
+            }
+            if !t.state.is_some_and(is_terminal) {
+                open.insert(*id);
+            }
+        }
+        let log = Self {
             db,
             index: Mutex::new(index),
+            options,
+        };
+        log.prune(now)?;
+        Ok(log)
+    }
+
+    /// Deletes every transaction that has been terminal for longer than the retention period, in
+    /// durable writes of at most [`PRUNE_BATCH`] transactions, each also recording the next
+    /// transaction id and sequence number so that neither is reused (RFC 0006).
+    fn prune(&self, now: u64) -> Result<(), TxnError> {
+        let retention = u64::try_from(self.options.retention.as_millis()).unwrap_or(u64::MAX);
+        let mut index = self.index.lock().map_err(poisoned)?;
+        index.last_prune = now;
+        loop {
+            let batch: Vec<u64> = index
+                .txns
+                .iter()
+                .filter(|(_, t)| {
+                    t.finished_at
+                        .is_some_and(|f| f.saturating_add(retention) < now)
+                })
+                .map(|(id, _)| *id)
+                .take(PRUNE_BATCH)
+                .collect();
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let mut w = self.db.begin_write().map_err(storage)?;
+            w.set_two_phase_commit(true);
+            {
+                let mut log = w.open_table(LOG).map_err(storage)?;
+                let mut staged = w.open_table(STAGED).map_err(storage)?;
+                let mut meta = w.open_table(META).map_err(storage)?;
+                for id in &batch {
+                    if let Some(t) = index.txns.get(id) {
+                        for seq in &t.seqs {
+                            log.remove(*seq).map_err(storage)?;
+                        }
+                    }
+                    staged.remove(*id).map_err(storage)?;
+                }
+                meta.insert("next_txn", index.next_txn).map_err(storage)?;
+                meta.insert("next_seq", index.next_seq).map_err(storage)?;
+            }
+            w.commit().map_err(storage)?;
+            for id in batch {
+                if let Some(t) = index.txns.remove(&id)
+                    && let Some(r) = t.request_id
+                    && index.by_request.get(&r) == Some(&id)
+                {
+                    index.by_request.remove(&r);
+                }
+            }
+        }
+    }
+
+    /// The records at `seqs`, decoded.
+    fn read(&self, seqs: &[u64]) -> Result<Vec<(TxnState, Vec<u8>)>, TxnError> {
+        let read = self.db.begin_read().map_err(storage)?;
+        let log = read.open_table(LOG).map_err(storage)?;
+        seqs.iter()
+            .map(|seq| {
+                let record = log.get(*seq).map_err(storage)?.ok_or(TxnError::Corrupt)?;
+                let (state, _, payload) = decode_record(record.value())?;
+                Ok((state, payload))
+            })
+            .collect()
+    }
+
+    /// The in-memory entry of `txn`, if the log still has it.
+    fn entry(&self, txn: TxnId) -> Result<Option<Txn>, TxnError> {
+        Ok(self
+            .index
+            .lock()
+            .map_err(poisoned)?
+            .txns
+            .get(&txn.0)
+            .cloned())
+    }
+
+    /// Everything recorded about `t`, read back from the log.
+    fn load(&self, t: &Txn) -> Result<TxnSummary, TxnError> {
+        let mut prepared = None;
+        let mut validated = None;
+        let mut decision = None;
+        for (state, payload) in self.read(&t.seqs)? {
+            match state {
+                TxnState::Prepared => {
+                    prepared = Some(serde_json::from_slice(&payload).map_err(corrupt)?);
+                }
+                TxnState::Validated => {
+                    validated = Some(serde_json::from_slice(&payload).map_err(corrupt)?);
+                }
+                TxnState::Committing => {}
+                TxnState::Committed | TxnState::Aborted | TxnState::Rejected => {
+                    let d: Terminal = serde_json::from_slice(&payload).map_err(corrupt)?;
+                    decision = Some(Decision {
+                        status: d.status,
+                        body: d.body,
+                    });
+                }
+            }
+        }
+        Ok(TxnSummary {
+            state: t.state.ok_or(TxnError::Corrupt)?,
+            prepared: prepared.ok_or(TxnError::Corrupt)?,
+            validated,
+            decision,
         })
     }
 
@@ -310,17 +538,15 @@ impl TxnLog {
         self.append_all(txn, &[(state, payload)], staged)
     }
 
-    /// Appends consecutive records of one transaction in a single durable write.
+    /// Appends consecutive records of one transaction in a single durable write. A terminal
+    /// record deletes the transaction's staged deltas in the same write (RFC 0006).
     fn append_all(
         &self,
         txn: TxnId,
         records: &[(TxnState, &[u8])],
         staged: Option<&[(ConstraintId, StagedDelta)]>,
     ) -> Result<(), TxnError> {
-        let mut index = self
-            .index
-            .lock()
-            .map_err(|_| TxnError::Storage("log lock poisoned".into()))?;
+        let mut index = self.index.lock().map_err(poisoned)?;
         let mut current = index.txns.get(&txn.0).and_then(|t| t.state);
         for &(state, _) in records {
             if !allowed(current, state) {
@@ -341,17 +567,22 @@ impl TxnLog {
                 log.insert(first_seq + n as u64, record.as_slice())
                     .map_err(storage)?;
             }
+            let mut table = w.open_table(STAGED).map_err(storage)?;
             if let Some(staged) = staged {
-                let mut table = w.open_table(STAGED).map_err(storage)?;
                 table
                     .insert(txn.0, encode_staged(staged).as_slice())
                     .map_err(storage)?;
+            }
+            if current.is_some_and(is_terminal) {
+                table.remove(txn.0).map_err(storage)?;
             }
         }
         w.commit().map_err(storage)?;
         index.next_seq = first_seq + records.len() as u64;
         if let Some(state) = current {
-            index.txns.entry(txn.0).or_default().state = Some(state);
+            let t = index.txns.entry(txn.0).or_default();
+            t.state = Some(state);
+            t.seqs.extend(first_seq..first_seq + records.len() as u64);
             if is_terminal(state) {
                 index.open.remove(&txn.0);
             } else {
@@ -364,10 +595,7 @@ impl TxnLog {
     /// Starts a transaction (`PREPARED`).
     pub fn begin(&self, prepared: Prepared) -> Result<TxnId, TxnError> {
         let id = {
-            let mut index = self
-                .index
-                .lock()
-                .map_err(|_| TxnError::Storage("log lock poisoned".into()))?;
+            let mut index = self.index.lock().map_err(poisoned)?;
             let id = index.next_txn;
             index.next_txn += 1;
             TxnId(id)
@@ -375,14 +603,11 @@ impl TxnLog {
         let payload =
             serde_json::to_vec(&prepared).map_err(|e| TxnError::Storage(e.to_string()))?;
         self.append(id, TxnState::Prepared, &payload, None)?;
-        let mut index = self
-            .index
-            .lock()
-            .map_err(|_| TxnError::Storage("log lock poisoned".into()))?;
+        let mut index = self.index.lock().map_err(poisoned)?;
         if let Some(r) = &prepared.request_id {
             index.by_request.insert(r.clone(), id.0);
         }
-        index.txns.entry(id.0).or_default().prepared = Some(prepared);
+        index.txns.entry(id.0).or_default().request_id = prepared.request_id;
         Ok(id)
     }
 
@@ -395,11 +620,7 @@ impl TxnLog {
     ) -> Result<(), TxnError> {
         let payload =
             serde_json::to_vec(&validated).map_err(|e| TxnError::Storage(e.to_string()))?;
-        self.append(txn, TxnState::Validated, &payload, Some(staged))?;
-        if let Ok(mut index) = self.index.lock() {
-            index.txns.entry(txn.0).or_default().validated = Some(validated);
-        }
-        Ok(())
+        self.append(txn, TxnState::Validated, &payload, Some(staged))
     }
 
     /// Records `VALIDATED` (with the staged deltas) and `COMMITTING` in one durable write, for a
@@ -420,11 +641,7 @@ impl TxnLog {
                 (TxnState::Committing, b"{}".as_slice()),
             ],
             Some(staged),
-        )?;
-        if let Ok(mut index) = self.index.lock() {
-            index.txns.entry(txn.0).or_default().validated = Some(validated);
-        }
-        Ok(())
+        )
     }
 
     /// Marks the commit as being forwarded upstream (`COMMITTING`).
@@ -432,22 +649,33 @@ impl TxnLog {
         self.append(txn, TxnState::Committing, b"{}", None)
     }
 
-    /// Records a terminal state and the response given.
+    /// Records a terminal state and the response given, and prunes transactions past the
+    /// retention period if that has not been done for a minute.
     pub fn finish(&self, txn: TxnId, state: TxnState, decision: Decision) -> Result<(), TxnError> {
-        if !matches!(
-            state,
-            TxnState::Committed | TxnState::Aborted | TxnState::Rejected
-        ) {
+        if !is_terminal(state) {
             return Err(TxnError::IllegalTransition {
                 from: None,
                 to: state,
             });
         }
-        let payload =
-            serde_json::to_vec(&decision).map_err(|e| TxnError::Storage(e.to_string()))?;
+        let now = (self.options.clock)();
+        let payload = serde_json::to_vec(&Terminal {
+            status: decision.status,
+            body: decision.body,
+            finished_at: Some(now),
+        })
+        .map_err(|e| TxnError::Storage(e.to_string()))?;
         self.append(txn, state, &payload, None)?;
-        if let Ok(mut index) = self.index.lock() {
-            index.txns.entry(txn.0).or_default().decision = Some(decision);
+        let due = {
+            let mut index = self.index.lock().map_err(poisoned)?;
+            if let Some(t) = index.txns.get_mut(&txn.0) {
+                t.finished_at = Some(now);
+            }
+            now.saturating_sub(index.last_prune) >= PRUNE_EVERY_MS
+        };
+        if due {
+            // The terminal record is durable; a pruning that fails is retried by a later one.
+            let _ = self.prune(now);
         }
         Ok(())
     }
@@ -462,64 +690,68 @@ impl TxnLog {
         self.index.lock().map_or(u64::MAX, |i| i.next_txn)
     }
 
-    /// Everything recorded about a transaction.
+    /// Everything recorded about a transaction, unless it was pruned.
     pub fn summary(&self, txn: TxnId) -> Option<TxnSummary> {
-        let index = self.index.lock().ok()?;
-        let t = index.txns.get(&txn.0)?;
-        Some(TxnSummary {
-            state: t.state?,
-            prepared: t.prepared.clone()?,
-            validated: t.validated.clone(),
-            decision: t.decision.clone(),
-        })
+        let t = self.entry(txn).ok()??;
+        self.load(&t).ok()
     }
 
     /// The recorded decision of a finished transaction.
     pub fn decision(&self, txn: TxnId) -> Option<Decision> {
-        self.index.lock().ok()?.txns.get(&txn.0)?.decision.clone()
+        self.summary(txn)?.decision
     }
 
-    /// Whether a transaction with this request id was ever started (finished or not).
+    /// Whether a transaction with this request id was started (finished or not) and not pruned.
     pub fn knows_request(&self, request_id: &str) -> bool {
         self.index
             .lock()
             .is_ok_and(|i| i.by_request.contains_key(request_id))
     }
 
-    /// The recorded decision for a request id, if its transaction finished.
-    pub fn decision_for(&self, request_id: &str) -> Option<Decision> {
-        let index = self.index.lock().ok()?;
-        let t = index.txns.get(index.by_request.get(request_id)?)?;
-        t.decision.clone()
+    /// The recorded decision for a request id, if its transaction finished and was not pruned.
+    /// Fails if the log cannot be read: the caller must not execute the request again then.
+    pub fn decision_for(&self, request_id: &str) -> Result<Option<Decision>, TxnError> {
+        let t = {
+            let index = self.index.lock().map_err(poisoned)?;
+            match index
+                .by_request
+                .get(request_id)
+                .and_then(|id| index.txns.get(id))
+            {
+                Some(t) if t.state.is_some_and(is_terminal) => t.clone(),
+                _ => return Ok(None),
+            }
+        };
+        Ok(self.load(&t)?.decision)
     }
 
     /// Transactions recovery must resolve, oldest first.
     pub fn unresolved(&self) -> Result<Vec<Unresolved>, TxnError> {
         let pending: Vec<(u64, Txn)> = {
-            let index = self
-                .index
-                .lock()
-                .map_err(|_| TxnError::Storage("log lock poisoned".into()))?;
+            let index = self.index.lock().map_err(poisoned)?;
             index
                 .open
                 .iter()
                 .filter_map(|id| index.txns.get(id).map(|t| (*id, t.clone())))
                 .collect()
         };
-        let read = self.db.begin_read().map_err(storage)?;
-        let staged_table = read.open_table(STAGED).map_err(storage)?;
         let mut out = Vec::new();
         for (id, t) in pending {
-            let staged = match staged_table.get(id).map_err(storage)? {
-                Some(bytes) => decode_staged(bytes.value())?,
-                None if t.validated.is_some() => return Err(TxnError::Corrupt),
-                None => Vec::new(),
+            let summary = self.load(&t)?;
+            let staged = {
+                let read = self.db.begin_read().map_err(storage)?;
+                let staged_table = read.open_table(STAGED).map_err(storage)?;
+                match staged_table.get(id).map_err(storage)? {
+                    Some(bytes) => decode_staged(bytes.value())?,
+                    None if summary.validated.is_some() => return Err(TxnError::Corrupt),
+                    None => Vec::new(),
+                }
             };
             out.push(Unresolved {
                 txn: TxnId(id),
-                state: t.state.ok_or(TxnError::Corrupt)?,
-                prepared: t.prepared.ok_or(TxnError::Corrupt)?,
-                validated: t.validated,
+                state: summary.state,
+                prepared: summary.prepared,
+                validated: summary.validated,
                 staged,
             });
         }

@@ -408,9 +408,10 @@ What this shows:
   still validates and logs inside the queue (spec §11), which lengthens every round of the race.
 - **Run-to-run variance** on this desktop machine is large (about ±30 % between consecutive runs);
   compare runs made back to back.
-- **Storage:** the persistent index takes about 100 bytes per key (1 GiB for 10 M keys). The
-  transaction log keeps the staged index delta of every commit and is never truncated in 0.1, so it
-  grows with write volume.
+- **Storage:** the persistent index takes about 100 bytes per key (1 GiB for 10 M keys). When
+  these numbers were taken the transaction log kept the staged index delta of every commit; since
+  RFC 0006 it keeps them only until the commit is resolved, and finished transactions for
+  `[txn_log] retention`.
 
 ## History
 

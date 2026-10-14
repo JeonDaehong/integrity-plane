@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The transaction log deletes a commit's staged index deltas with its terminal record and prunes
+  finished transactions after `[txn_log] retention` (default `24h`, at least `30m`; RFC 0006):
+  it no longer grows with write volume, and keeps only recent transactions in memory. A request
+  repeating a pruned idempotency key is validated as a new request.
+
 ## 0.0.2 — 2026-10-14
 
 Second pre-release. **Pre-alpha, not production-ready**: see

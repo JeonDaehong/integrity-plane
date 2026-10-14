@@ -4,6 +4,7 @@
 //! afterwards they are managed through the integrity API.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,9 @@ pub struct Config {
     /// Error reporting.
     #[serde(default)]
     pub errors: ErrorsConfig,
+    /// Transaction log retention (RFC 0006).
+    #[serde(default)]
+    pub txn_log: TxnLogConfig,
     /// Certificate signing (RFC 0005); absent = certificates are not signed.
     #[serde(default)]
     pub signing: Option<SigningConfig>,
@@ -157,6 +161,59 @@ impl Default for LimitsConfig {
             scan_memory: default_scan_memory(),
         }
     }
+}
+
+/// `[txn_log]` (RFC 0006).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TxnLogConfig {
+    /// How long a finished transaction (and its idempotency key) is kept, e.g. `"24h"`; at least
+    /// `"30m"`, the advertised `idempotency-key-lifetime`.
+    #[serde(default = "default_retention", deserialize_with = "retention")]
+    pub retention: Duration,
+}
+
+fn default_retention() -> Duration {
+    integrity_txn::log::DEFAULT_RETENTION
+}
+
+impl Default for TxnLogConfig {
+    fn default() -> Self {
+        Self {
+            retention: default_retention(),
+        }
+    }
+}
+
+fn retention<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    let text = String::deserialize(d)?;
+    let retention = parse_duration(&text).map_err(serde::de::Error::custom)?;
+    if retention < integrity_txn::log::MIN_RETENTION {
+        return Err(serde::de::Error::custom(format!(
+            "txn_log.retention {text:?} is shorter than 30m, the advertised idempotency-key-lifetime"
+        )));
+    }
+    Ok(retention)
+}
+
+/// Parses `"90s"`, `"30m"`, `"24h"`, `"7d"`.
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
+    let t = text.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("not a duration: {text:?}"))?;
+    let factor: u64 = match unit.trim() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        other => return Err(format!("unknown duration unit {other:?} in {text:?}")),
+    };
+    n.checked_mul(factor)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration too large: {text:?}"))
 }
 
 /// `[storage]`: S3-compatible object storage (credentials may also come from the environment).
@@ -378,6 +435,23 @@ max_inline_validation_bytes = "2GiB"
         assert!(parse_byte_size("GiB").is_err());
         let c = Config::from_toml(BASE).unwrap();
         assert_eq!(c.limits.max_inline_validation_bytes, 2 << 30);
+    }
+
+    #[test]
+    fn txn_log_retention_is_a_duration_of_at_least_30_minutes() {
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1_800));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert!(parse_duration("7").is_err());
+        assert!(parse_duration("h").is_err());
+        assert!(parse_duration("1w").is_err());
+        let c = Config::from_toml(BASE).unwrap();
+        assert_eq!(c.txn_log.retention, Duration::from_secs(86_400));
+        let c = Config::from_toml(&format!("{BASE}\n[txn_log]\nretention = \"7d\"\n")).unwrap();
+        assert_eq!(c.txn_log.retention, Duration::from_secs(604_800));
+        let short = Config::from_toml(&format!("{BASE}\n[txn_log]\nretention = \"29m\"\n"));
+        assert!(short.unwrap_err().to_string().contains("shorter than 30m"));
     }
 
     #[test]
