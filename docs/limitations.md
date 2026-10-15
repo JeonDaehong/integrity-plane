@@ -22,8 +22,10 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Validation reads the footer and the key column chunks of every data file a commit adds or
   removes (ranged reads), so its cost follows the key columns, not the file size; manifests are
   read whole. About 5 µs per changed key on the benchmark machine.
-- Commit validation streams rows and sorts keys within `limits.scan_memory` (ADR 0019), so large
-  rewrites need scratch disk instead of memory; commits with equality deletes are still read
+- Commit validation streams rows and sorts keys within `limits.scan_memory` (ADR 0019), and a
+  commit of one snapshot is then decided, staged, logged and applied in chunks (ADR 0025), so large
+  appends and rewrites need scratch disk instead of memory. A commit of several snapshots still
+  holds the keys it changes in memory after sorting them, and one with equality deletes is read
   whole. `verify` reads the rows of each snapshot it recomputes whole.
 - One domain commits about 80 times per second with one writer on the benchmark machine, and about
   25 times per second when 16 writers race on one table (about a third of the same race without
@@ -75,9 +77,7 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   inserting 1 M rows takes 4.6–5.1 s through the Plane against 0.7 s directly, an initial load of
   30 M rows 38 s against 6 s, compacting 33 M rows 59 s against 33 s (`docs/benchmarks.md`). A
   whole nightly ETL job (reads, joins, two MERGEs, an aggregate) took 30–31 s against 22–24 s.
-  Sorting and probing every key, and for a rewrite comparing every row, dominate. A commit's
-  memory also grows with the keys it changes (unlike copy-on-write rewrites and compactions, whose
-  unchanged keys cancel out).
+  Sorting and probing every key, and for a rewrite comparing every row, dominate.
 - Commits to a table with position delete files read every manifest of both snapshots and every
   live position delete file (each once, 16 at a time; ADR 0020), so their cost grows with the
   number of manifests and live delete files. On S3 a merge-on-read delete of one row in a 100-file

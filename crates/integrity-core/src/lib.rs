@@ -14,9 +14,9 @@ pub mod signature;
 pub mod verdict;
 
 pub use certificate::{
-    CERT_VERSION, CertificateInput, Digest, InvalidCertificate, SUMMARY_CERT, SUMMARY_CERT_VERSION,
-    SUMMARY_CONSTRAINT_SET_VERSION, certificate, constraint_set_digest, key_delta_digest,
-    parse_table_uuid,
+    CERT_VERSION, CertificateInput, Digest, InvalidCertificate, KeyDeltaDigest, SUMMARY_CERT,
+    SUMMARY_CERT_VERSION, SUMMARY_CONSTRAINT_SET_VERSION, certificate, constraint_set_digest,
+    key_delta_digest, parse_table_uuid,
 };
 pub use constraint::{
     ColumnRef, Constraint, ConstraintKind, EnforcementMode, ForeignKeySpec, InvalidConstraint,

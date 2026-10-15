@@ -10,6 +10,10 @@
   100 000) and applied by streaming them from the log into one index transaction (RFC 0006, ADR
   0025): logging and applying no longer hold a commit's changes in memory. A log written by 0.0.2
   still recovers; 0.0.2 cannot recover a commit logged in chunks.
+- A commit of one snapshot without equality deletes is decided after the merge in chunks too
+  (ADR 0025): its merged keys, probes, staged writes and key delta digest go through runs that
+  spill to scratch beyond `limits.scan_memory`, so an append's memory no longer grows with the
+  keys it adds. Commits of several snapshots keep the previous path.
 
 ## 0.0.2 — 2026-10-14
 

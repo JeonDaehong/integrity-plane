@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 
 use integrity_core::{
     CertificateInput, Constraint, ConstraintKind, Digest, EncodedKey, EnforcementMode,
-    ForeignKeySpec, KeyDelta, KeyMultiset, KeySchema, KeySpec, KeyValue, MatchMode, NetDelta,
-    NullsMode, ReferentialAction, TypeFamily, UniqueSpec, certificate, constraint_set_digest,
-    key_delta_digest, parse_table_uuid,
+    ForeignKeySpec, KeyDelta, KeyDeltaDigest, KeyMultiset, KeySchema, KeySpec, KeyValue, MatchMode,
+    NetDelta, NullsMode, ReferentialAction, TypeFamily, UniqueSpec, certificate,
+    constraint_set_digest, key_delta_digest, parse_table_uuid,
 };
 use integrity_types::{ConstraintId, ConstraintSetVersion, FieldId, SnapshotId, TableId};
 
@@ -252,4 +252,40 @@ fn hex_and_uuid_parsing() {
     ] {
         assert!(parse_table_uuid(bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn the_streamed_key_delta_digest_takes_only_the_announced_sequence() {
+    let d = deltas();
+    let streamed = |order: &[(ConstraintId, &NetDelta)]| {
+        let mut s = KeyDeltaDigest::new(order.len())?;
+        for (id, delta) in order {
+            s.constraint(*id, delta.len() as u64)?;
+            for (k, c) in delta.iter() {
+                s.change(k.as_bytes(), c)?;
+            }
+        }
+        s.finish()
+    };
+    let in_order: Vec<_> = d.iter().map(|(id, n)| (*id, n)).collect();
+    assert_eq!(streamed(&in_order).unwrap().to_hex(), GOLDEN_KEY_DELTA);
+    let mut reversed = in_order.clone();
+    reversed.reverse();
+    assert!(streamed(&reversed).is_err(), "constraints out of order");
+
+    let (id, delta) = in_order[0];
+    // Fewer or more changes than announced, fewer constraints than announced.
+    let mut s = KeyDeltaDigest::new(1).unwrap();
+    s.constraint(id, delta.len() as u64 + 1).unwrap();
+    for (k, c) in delta.iter() {
+        s.change(k.as_bytes(), c).unwrap();
+    }
+    assert!(s.finish().is_err());
+    let mut s = KeyDeltaDigest::new(1).unwrap();
+    s.constraint(id, 0).unwrap();
+    assert!(s.change(b"k", 1).is_err());
+    assert!(KeyDeltaDigest::new(2).unwrap().finish().is_err());
+    let mut s = KeyDeltaDigest::new(1).unwrap();
+    s.constraint(id, 0).unwrap();
+    assert!(s.constraint(ConstraintId(id.0 + 1), 0).is_err());
 }

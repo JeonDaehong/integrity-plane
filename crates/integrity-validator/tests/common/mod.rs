@@ -16,7 +16,8 @@ use integrity_index::{IndexEpoch, IndexValue, KeyIndex, MemoryIndex, PersistentS
 use integrity_reference::{Commit, Oracle, Row, Verdict};
 use integrity_types::{ConstraintId, ConstraintSetVersion, FieldId, SnapshotId, TableId};
 use integrity_validator::{
-    CommitScan, Decision, ResolvedConstraint, ValidationError, Validator, ViolationDetail,
+    CommitScan, Decision, ResolvedConstraint, StreamOptions, StreamedDecision, ValidationError,
+    Validator, ViolationDetail, counted_value,
 };
 use proptest::prelude::*;
 
@@ -64,6 +65,90 @@ pub fn streamed(
         }
     }
     scan.decide(indexes)
+}
+
+/// `rows` decided by `CommitScan::decide_streamed` (ADR 0025): the merged keys of each constraint
+/// in runs (spilled when `spill`), probed and staged `chunk` keys at a time. Only the keys that
+/// matter go to the runs when `removed_first`, every key otherwise.
+pub fn decided_streamed(
+    validator: &Validator,
+    rows: &CommitRows,
+    indexes: &impl integrity_validator::IndexSet,
+    chunk: usize,
+    removed_first: bool,
+    spill: bool,
+) -> Result<(StreamedDecision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
+    let scratch = std::env::temp_dir().join(format!("oip-decide-streamed-{}", std::process::id()));
+    let budget = if spill { 0 } else { 1 << 20 };
+    let mut scan = validator.commit_scan(&rows.table, rows.snapshot)?;
+    let mut keys: BTreeMap<ConstraintId, BTreeMap<EncodedKey, (u64, u64)>> = BTreeMap::new();
+    for (side, batch) in [(Side::Added, &rows.added), (Side::Removed, &rows.removed)] {
+        scan.feed(side, batch, |id, key| {
+            let e = keys.entry(id).or_default().entry(key).or_default();
+            match side {
+                Side::Added => e.0 += 1,
+                Side::Removed => e.1 += 1,
+            }
+            Ok::<_, ValidationError>(())
+        })?;
+    }
+    let mut runs = BTreeMap::new();
+    for id in scan.keyed() {
+        let mut run = integrity_index::Run::new(&scratch, budget);
+        for (key, (added, removed)) in keys.remove(&id).unwrap_or_default() {
+            if removed_first && !CommitScan::counts_matter(added, removed) {
+                continue;
+            }
+            run.push(key.as_bytes(), &counted_value(added, removed))
+                .unwrap();
+        }
+        runs.insert(id, run.finish().unwrap());
+    }
+    scan.decide_streamed(
+        indexes,
+        &runs,
+        StreamOptions {
+            scratch: &scratch,
+            memory: budget,
+            chunk,
+        },
+    )
+}
+
+/// Asserts that a streamed decision is the decision taken at once, and stages the same writes.
+pub fn assert_same_decision(
+    streamed: Result<(StreamedDecision, BTreeMap<Violation, ViolationDetail>), ValidationError>,
+    at_once: &Result<(Decision, BTreeMap<Violation, ViolationDetail>), ValidationError>,
+    indexes: &impl integrity_validator::IndexSet,
+) {
+    match (streamed, at_once) {
+        (Err(a), Err(b)) => assert_eq!(&a, b, "decide_streamed fails differently"),
+        (Ok((StreamedDecision::Rejected(a), da)), Ok((Decision::Rejected(b), db))) => {
+            assert_eq!(&a, b, "decide_streamed rejects differently");
+            assert_eq!(&da, db, "decide_streamed reports violations differently");
+        }
+        (Ok((StreamedDecision::Accepted(a), _)), Ok((Decision::Accepted(b), _))) => {
+            assert_eq!(
+                a.key_delta_digest(),
+                b.key_delta_digest(),
+                "decide_streamed digests differently"
+            );
+            let staged = b.stage(indexes).unwrap();
+            let ids: Vec<_> = a.staged.iter().map(|r| r.constraint).collect();
+            let expected_ids: Vec<_> = staged.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids, expected_ids, "decide_streamed stages other indexes");
+            for (run, (_, delta)) in a.staged.iter().zip(&staged) {
+                assert_eq!(run.header, delta.header(), "staged header");
+                let writes: Vec<_> = run.writes().unwrap().collect::<Result<_, _>>().unwrap();
+                let expected: Vec<_> = delta
+                    .writes()
+                    .map(|(k, v)| (k.clone(), v.copied()))
+                    .collect();
+                assert_eq!(writes, expected, "staged writes");
+            }
+        }
+        (a, b) => panic!("decide_streamed decided {a:?}, validate {b:?}"),
+    }
 }
 
 /// Which index backend the engine uses.
@@ -193,6 +278,17 @@ impl Engine {
                 self.snapshot % 2 == 0,
             );
             assert_eq!(streamed, at_once, "CommitScan disagrees with validate");
+            // After the merge with bounded memory (ADR 0025): any chunk size, spilled or not.
+            let chunk = 1 + (self.snapshot as usize / 2) % 3;
+            let decided = decided_streamed(
+                &self.validator,
+                &rows,
+                &self.indexes,
+                chunk,
+                self.snapshot % 2 == 1,
+                self.snapshot % 3 == 0,
+            );
+            assert_same_decision(decided, &at_once, &self.indexes);
         }
         let (decision, details) = at_once?;
         match decision {

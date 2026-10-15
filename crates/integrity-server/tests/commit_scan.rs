@@ -2,7 +2,8 @@
 //! Avro files: random copy-on-write deletes, appends, compactions (some changing rows) and
 //! overwrites of a table with a PRIMARY KEY, a UNIQUE key and a NOT NULL column, with files of
 //! several row groups and memory budgets small enough to spill many sorted runs. Both must reach
-//! the same decision with the same details, or fail with the same code.
+//! the same decision with the same details, or fail with the same code. Deciding in chunks (ADR
+//! 0025) must also stage the same writes and digest the same key delta.
 
 #![allow(clippy::unwrap_used)] // test helpers outside #[test] fns
 
@@ -21,7 +22,7 @@ use integrity_server::config::ConstraintConfig;
 use integrity_server::pipeline::Streamed;
 use integrity_server::registry;
 use integrity_types::{ConstraintId, SnapshotId};
-use integrity_validator::{Decision, Validator};
+use integrity_validator::{Decision, IndexSet, StreamedDecision, Validator};
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use support::{Dir, Files, Row, empty_table};
@@ -136,9 +137,53 @@ fn case() -> impl Strategy<Value = (Vec<Vec<Row>>, Step, bool)> {
 
 type Outcome = Result<String, String>;
 
-fn describe(d: integrity_server::pipeline::Decided) -> String {
+fn describe_bounded(d: integrity_server::pipeline::BoundedDecided) -> String {
     match d {
-        (Decision::Accepted(v), _) => format!("accepted {:?}", v.key_deltas()),
+        (StreamedDecision::Accepted(v), _) => {
+            let staged: Writes = v
+                .staged
+                .iter()
+                .map(|r| {
+                    let w = r.writes().unwrap().collect::<Result<_, _>>().unwrap();
+                    (r.constraint, r.header, w)
+                })
+                .collect();
+            format!("accepted {:?} {staged:?}", v.key_delta_digest())
+        }
+        (StreamedDecision::Rejected(v), details) => {
+            let details: Vec<_> = details
+                .iter()
+                .map(|(v, d)| (v, d.count(), d.samples().to_vec()))
+                .collect();
+            format!("rejected {v:?} {details:?}")
+        }
+    }
+}
+
+/// Every staged write of an accepted commit, per index: what the log takes.
+type Writes = Vec<(
+    ConstraintId,
+    integrity_index::StagedHeader,
+    Vec<(
+        integrity_core::EncodedKey,
+        Option<integrity_index::IndexValue>,
+    )>,
+)>;
+
+fn describe(d: integrity_server::pipeline::Decided, indexes: &impl IndexSet) -> String {
+    match d {
+        (Decision::Accepted(v), _) => {
+            let staged: Writes = v
+                .stage(indexes)
+                .unwrap()
+                .into_iter()
+                .map(|(id, d)| {
+                    let w = d.writes().map(|(k, v)| (k.clone(), v.copied())).collect();
+                    (id, d.header(), w)
+                })
+                .collect();
+            format!("accepted {:?} {staged:?}", v.key_delta_digest())
+        }
         (Decision::Rejected(v), details) => {
             let details: Vec<_> = details
                 .iter()
@@ -220,7 +265,7 @@ fn compare(
         check_operation(step.operation, &rows).map_err(|e| format!("{:?}", e.code()))?;
         validator
             .validate_with_details(&rows, &indexes)
-            .map(describe)
+            .map(|d| describe(d, &indexes))
             .map_err(|e| format!("{:?}", e.code()))
     })();
     let scratch = Dir::new();
@@ -233,8 +278,13 @@ fn compare(
         scratch: &scratch.0,
         memory,
     };
+    let bounded: Outcome =
+        match streamed.validate_bounded(&Local, &changes, &indexes, 1 + memory % 3) {
+            Ok((d, _)) => Ok(describe_bounded(d)),
+            Err(e) => Err(format!("{:?}", e.code)),
+        };
     let streamed: Outcome = match streamed.validate(&Local, &changes, &indexes) {
-        Ok((d, _)) => Ok(describe(d)),
+        Ok((d, _)) => Ok(describe(d, &indexes)),
         Err(e) => Err(format!("{:?}", e.code)),
     };
     let leftover = std::fs::read_dir(&scratch.0)
@@ -243,10 +293,12 @@ fn compare(
     if leftover != 0 {
         return Err(format!("{leftover} scratch entries left"));
     }
-    if streamed == whole {
-        Ok(())
-    } else {
+    if streamed != whole {
         Err(format!("streamed {streamed:?}\n   whole {whole:?}"))
+    } else if bounded != whole {
+        Err(format!("bounded {bounded:?}\n   whole {whole:?}"))
+    } else {
+        Ok(())
     }
 }
 

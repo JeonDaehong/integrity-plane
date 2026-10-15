@@ -7,7 +7,9 @@
 //!
 //! Rows are streamed, never held (ADR 0019): the keys of each side are sorted externally within
 //! the scan memory budget and only the net change of each key is probed. Commits with equality
-//! deletes are read whole (`commit_rows`), as before.
+//! deletes are read whole (`commit_rows`), as before. A commit of one step without equality
+//! deletes is also decided, staged and logged in chunks (ADR 0025): its memory does not grow with
+//! the keys it changes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -15,19 +17,22 @@ use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::ScopedJoinHandle;
 
-use integrity_core::{EncodedKey, LogicalType, RowBatch, Side, Violation, encode_row_into};
+use integrity_core::{
+    Digest, EncodedKey, InvalidCertificate, LogicalType, RowBatch, Side, Violation, encode_row_into,
+};
 use integrity_iceberg::{
     Budgeted, CommitDeletes, FileChanges, FileIo, InspectError, MainChange, NewSnapshot, Operation,
     TableMetadata, check_operation, check_sides, commit_rows, diff_snapshots, for_each_side_batch,
 };
 use integrity_index::{
-    IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex, PersistentStore,
-    StagedDelta,
+    FinishedRun, IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex,
+    PersistentStore, Run, StagedDelta,
 };
-use integrity_txn::{FaultPoint, StagedEntry, TxnId, TxnLog, fault};
+use integrity_txn::{FaultPoint, StagedEntry, StagedSource, TxnId, TxnLog, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, SnapshotId, TableId};
 use integrity_validator::{
-    CommitScan, Decision, IndexSet, ValidatedDeltas, ValidationError, Validator, ViolationDetail,
+    CommitScan, Decision, IndexSet, StagedRun, StreamOptions, StreamedDecision, ValidationError,
+    Validator, ViolationDetail, counted_value, decode_counted,
 };
 
 use crate::error::ApiError;
@@ -37,9 +42,40 @@ use crate::error::ApiError;
 pub struct StepPlan {
     /// The snapshot.
     pub step: NewSnapshot,
-    /// Its validated index changes.
-    pub validated: ValidatedDeltas,
+    /// The RFC 0002 key delta digest of its changes.
+    pub key_delta: Result<Digest, InvalidCertificate>,
 }
+
+/// A commit's writes, one staged delta per index that changes.
+#[derive(Debug)]
+pub enum Staged {
+    /// Held in memory (commits of several steps, or with equality deletes).
+    Whole(Vec<(ConstraintId, StagedDelta)>),
+    /// In runs that spill to scratch (ADR 0025).
+    Runs(Vec<StagedRun>),
+}
+
+impl Staged {
+    /// The deltas as the transaction log takes them.
+    pub fn sources(&self) -> Result<Vec<StagedSource<'_>>, ApiError> {
+        match self {
+            Staged::Whole(deltas) => Ok(integrity_txn::log::sources(deltas)),
+            Staged::Runs(runs) => runs
+                .iter()
+                .map(|run| {
+                    Ok(StagedSource {
+                        constraint: run.constraint,
+                        header: run.header,
+                        writes: run.writes().map_err(spill)?,
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Keys per probe and per staged batch of a commit decided in chunks (ADR 0025).
+const DECIDE_CHUNK: usize = 100_000;
 
 /// The decision on a main change.
 #[derive(Debug)]
@@ -48,8 +84,8 @@ pub enum Outcome {
     Accepted {
         /// One plan per step, oldest first.
         plans: Vec<StepPlan>,
-        /// The whole commit's writes, one staged delta per index that changes.
-        staged: Vec<(ConstraintId, StagedDelta)>,
+        /// The whole commit's writes.
+        staged: Staged,
     },
     /// A step violates constraints: what violates each of them.
     Rejected(BTreeMap<Violation, ViolationDetail>),
@@ -188,16 +224,33 @@ fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Ou
         };
         let changes = diff_snapshots(io, parent_list.as_deref(), &step.manifest_list)
             .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
-        let decided = if changes.equality_deletes.is_empty() {
-            let streamed = Streamed {
-                validator: &job.validator,
-                table: &job.table,
-                snapshot: step.snapshot,
-                operation: step.operation,
-                columns: &job.columns,
-                scratch: &job.scratch,
-                memory: job.memory,
+        let streamed = Streamed {
+            validator: &job.validator,
+            table: &job.table,
+            snapshot: step.snapshot,
+            operation: step.operation,
+            columns: &job.columns,
+            scratch: &job.scratch,
+            memory: job.memory,
+        };
+        if job.change.steps.len() == 1 && changes.equality_deletes.is_empty() {
+            // One step: nothing earlier to see, so no overlay; decided and staged in chunks.
+            let (decided, rows) = streamed.validate_bounded(io, &changes, &timed, DECIDE_CHUNK)?;
+            job.stats
+                .rows
+                .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+            return match decided {
+                (StreamedDecision::Rejected(_), details) => Ok(Outcome::Rejected(details)),
+                (StreamedDecision::Accepted(deltas), _) => Ok(Outcome::Accepted {
+                    plans: vec![StepPlan {
+                        step: step.clone(),
+                        key_delta: deltas.key_delta_digest(),
+                    }],
+                    staged: Staged::Runs(deltas.staged),
+                }),
             };
+        }
+        let decided = if changes.equality_deletes.is_empty() {
             let (decided, rows) = streamed.validate(io, &changes, &overlays)?;
             job.stats
                 .rows
@@ -232,7 +285,7 @@ fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Ou
                 }
                 plans.push(StepPlan {
                     step: step.clone(),
-                    validated,
+                    key_delta: validated.key_delta_digest(),
                 });
             }
         }
@@ -249,7 +302,10 @@ fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Ou
             ));
         }
     }
-    Ok(Outcome::Accepted { plans, staged })
+    Ok(Outcome::Accepted {
+        plans,
+        staged: Staged::Whole(staged),
+    })
 }
 
 /// A decision and what violates each violated constraint.
@@ -497,7 +553,7 @@ fn close_all<'s, T: Send + 's>(
 /// `replace`), the merged keys of each constraint, and the number of rows added and removed.
 type Scanned = (Option<Result<bool, ApiError>>, Vec<Merged>, (u64, u64));
 
-impl Streamed<'_> {
+impl<'a> Streamed<'a> {
     /// Validates the step: what `check_operation` and `validate_with_details` decide for the
     /// rows `commit_rows` reads, without holding them. Also returns the number of rows read.
     pub fn validate(
@@ -506,6 +562,49 @@ impl Streamed<'_> {
         changes: &FileChanges,
         indexes: &impl IndexSet,
     ) -> Result<(Decided, u64), ApiError> {
+        let (mut scan, runs, rows) = self.merged(io, changes)?;
+        for (id, run) in &runs {
+            for record in run.records().map_err(spill)? {
+                let (key, value) = record.map_err(spill)?;
+                let key = EncodedKey::from_vec(key).map_err(|_| spill(IndexError::Corrupt))?;
+                let (a, r) = decode_counted(&value).ok_or_else(|| spill(IndexError::Corrupt))?;
+                scan.counts(*id, key, a, r).map_err(invalid)?;
+            }
+        }
+        Ok((scan.decide(indexes).map_err(invalid)?, rows))
+    }
+
+    /// [`Streamed::validate`], then decided, staged and digested `chunk` keys at a time
+    /// (ADR 0025): for a commit of one step, whose memory must not grow with its keys.
+    pub fn validate_bounded(
+        &self,
+        io: &impl FileIo,
+        changes: &FileChanges,
+        indexes: &impl IndexSet,
+        chunk: usize,
+    ) -> Result<(BoundedDecided, u64), ApiError> {
+        let (scan, runs, rows) = self.merged(io, changes)?;
+        let runs: BTreeMap<ConstraintId, FinishedRun> = runs.into_iter().collect();
+        let options = StreamOptions {
+            scratch: self.scratch,
+            memory: self.memory,
+            chunk,
+        };
+        let decided = scan
+            .decide_streamed(indexes, &runs, options)
+            .map_err(invalid)?;
+        Ok((decided, rows))
+    }
+
+    /// Reads, checks and sorts both sides of the step, and merges each keyed constraint's sides
+    /// into a run of the keys that matter ([`counted_value`] records), in [`CommitScan::keyed`]
+    /// order. Also returns the number of rows read.
+    #[allow(clippy::type_complexity)]
+    fn merged(
+        &self,
+        io: &impl FileIo,
+        changes: &FileChanges,
+    ) -> Result<(CommitScan<'a>, Vec<(ConstraintId, FinishedRun)>, u64), ApiError> {
         let mut scan = self
             .validator
             .commit_scan(self.table, self.snapshot)
@@ -515,6 +614,9 @@ impl Streamed<'_> {
         let replace = self.operation == Operation::Replace;
         let sorters_needed = 2 * keyed.len() + if replace { 2 } else { 0 };
         let budget = self.memory / sorters_needed.max(1);
+        let run_budget = self.memory / keyed.len().max(1);
+        let scratch = self.scratch;
+        let new_run = move || Run::new(scratch, run_budget);
         let mut removed_scan = scan.removed();
         // A side without data files to read, and no kept files, has no rows.
         let has = |side| {
@@ -683,7 +785,7 @@ impl Streamed<'_> {
                 });
                 let merged = sorted
                     .into_iter()
-                    .map(|(a, r)| merge_sides(a?, r?))
+                    .map(|(a, r)| merge_sides(a?, r?, new_run()))
                     .collect();
                 return Ok((same_rows, merged, (added_count, removed_count)));
             }
@@ -700,7 +802,8 @@ impl Streamed<'_> {
                 .into_iter()
                 .map(|(a, r)| -> Result<_, ApiError> {
                     let (a, r) = (ahead(s, a?), ahead(s, r?));
-                    Ok(s.spawn(move || merge_sides(a, r)))
+                    let run = new_run();
+                    Ok(s.spawn(move || merge_sides(a, r, run)))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let same_rows = comparing.map(joined);
@@ -714,15 +817,17 @@ impl Streamed<'_> {
         check_sides(self.operation, added_count > 0, removed_count > 0, || {
             same_rows.unwrap_or(Ok(true)).map_err(Failed::Api)
         })?;
-        for (id, counted) in keyed.iter().zip(merged) {
-            for (key, a, r) in counted? {
-                scan.counts(*id, key, a, r).map_err(invalid)?;
-            }
-        }
-        let decided = scan.decide(indexes).map_err(invalid)?;
-        Ok((decided, added_count + removed_count))
+        let runs = keyed
+            .iter()
+            .zip(merged)
+            .map(|(id, run)| Ok((*id, run?)))
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok((scan, runs, added_count + removed_count))
     }
 }
+
+/// A decision taken in chunks and what violates each violated constraint.
+pub type BoundedDecided = (StreamedDecision, BTreeMap<Violation, ViolationDetail>);
 
 /// Hands `key` of constraint `id` to its sorter.
 fn feed<'s, T: Send + 's>(
@@ -799,7 +904,7 @@ fn joined<T>(h: ScopedJoinHandle<'_, T>) -> T {
 type Counted = (EncodedKey, u64, u64);
 
 /// The keys of one constraint that matter, merged from both sides.
-type Merged = Result<Vec<Counted>, ApiError>;
+type Merged = Result<FinishedRun, ApiError>;
 
 /// Sorted distinct keys with their counts.
 trait Keys: Iterator<Item = Result<(EncodedKey, u64), IndexError>> {}
@@ -808,10 +913,9 @@ impl<I: Iterator<Item = Result<(EncodedKey, u64), IndexError>>> Keys for I {}
 
 /// Merges the two sorted sides of one constraint: each distinct key once, with its count on each
 /// side, keeping only the keys that matter to the validator ([`CommitScan::counts_matter`]).
-fn merge_sides(added: impl Keys, removed: impl Keys) -> Merged {
+fn merge_sides(added: impl Keys, removed: impl Keys, mut out: Run) -> Merged {
     let mut added = added.peekable();
     let mut removed = removed.peekable();
-    let mut out = Vec::new();
     loop {
         let next = match (added.peek(), removed.peek()) {
             (None, None) => break,
@@ -842,10 +946,11 @@ fn merge_sides(added: impl Keys, removed: impl Keys) -> Merged {
             }
         };
         if CommitScan::counts_matter(a, r) {
-            out.push((key, a, r));
+            out.push(key.as_bytes(), &counted_value(a, r))
+                .map_err(spill)?;
         }
     }
-    Ok(out)
+    out.finish().map_err(spill)
 }
 
 fn take(it: &mut impl Keys) -> Result<(EncodedKey, u64), ApiError> {

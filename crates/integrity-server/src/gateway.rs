@@ -1323,7 +1323,7 @@ impl Gateway {
 
         let mut certificates = Vec::new();
         for plan in &plans {
-            let key_delta = plan.validated.key_delta_digest().map_err(|e| {
+            let key_delta = plan.key_delta.map_err(|e| {
                 abort(
                     ApiError::new(ErrorCode::IndexDegraded, e.to_string()),
                     TxnState::Aborted,
@@ -1376,9 +1376,10 @@ impl Gateway {
 
         // VALIDATED (with the staged deltas) and COMMITTING in one durable write (RFC 0004
         // records, staged deltas in chunks: RFC 0006).
+        let sources = staged.sources().map_err(|e| abort(e, TxnState::Aborted))?;
         let staged = self
             .log
-            .validated_and_committing(
+            .validated_and_committing_streamed(
                 txn,
                 Validated {
                     base_snapshot,
@@ -1388,7 +1389,7 @@ impl Gateway {
                     epoch,
                     certificates: certificates.clone(),
                 },
-                &staged,
+                sources,
             )
             .map_err(log_error)?;
         fault::hit(FaultPoint::AfterValidatedLog);

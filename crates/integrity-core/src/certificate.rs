@@ -205,19 +205,79 @@ pub fn constraint_set_digest(
 pub fn key_delta_digest(
     deltas: &BTreeMap<ConstraintId, NetDelta>,
 ) -> Result<Digest, InvalidCertificate> {
-    let mut w = Writer::new("oip-key-delta-v1");
-    w.len(deltas.len())?;
+    let mut d = KeyDeltaDigest::new(deltas.len())?;
     for (id, delta) in deltas {
-        w.u64(id.0);
-        let changes: Vec<_> = delta.iter().collect();
-        w.len(changes.len())?;
-        for (key, change) in changes {
-            w.len(key.as_bytes().len())?;
-            w.bytes(key.as_bytes());
-            w.i64(i64::try_from(change).map_err(|_| InvalidCertificate)?);
+        d.constraint(*id, delta.len() as u64)?;
+        for (key, change) in delta.iter() {
+            d.change(key.as_bytes(), change)?;
         }
     }
-    Ok(w.finish())
+    d.finish()
+}
+
+/// [`key_delta_digest`] computed one change at a time, for deltas too large to hold (ADR 0025):
+/// each constraint, in increasing id order, is announced with its number of changes, then its
+/// changes follow in key order. Any other sequence is [`InvalidCertificate`].
+pub struct KeyDeltaDigest {
+    w: Writer,
+    constraints_left: usize,
+    changes_left: u64,
+    last: Option<ConstraintId>,
+}
+
+impl fmt::Debug for KeyDeltaDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyDeltaDigest")
+            .field("constraints_left", &self.constraints_left)
+            .field("changes_left", &self.changes_left)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KeyDeltaDigest {
+    /// Starts the digest of a commit's deltas over `constraints` constraints.
+    pub fn new(constraints: usize) -> Result<Self, InvalidCertificate> {
+        let mut w = Writer::new("oip-key-delta-v1");
+        w.len(constraints)?;
+        Ok(Self {
+            w,
+            constraints_left: constraints,
+            changes_left: 0,
+            last: None,
+        })
+    }
+
+    /// Starts the next constraint, which has `changes` changes.
+    pub fn constraint(&mut self, id: ConstraintId, changes: u64) -> Result<(), InvalidCertificate> {
+        if self.changes_left != 0 || self.constraints_left == 0 || self.last >= Some(id) {
+            return Err(InvalidCertificate);
+        }
+        self.constraints_left -= 1;
+        self.last = Some(id);
+        self.w.u64(id.0);
+        self.w
+            .len(usize::try_from(changes).map_err(|_| InvalidCertificate)?)?;
+        self.changes_left = changes;
+        Ok(())
+    }
+
+    /// Adds the next change of the current constraint: the key's bytes and its signed change.
+    pub fn change(&mut self, key: &[u8], change: i128) -> Result<(), InvalidCertificate> {
+        self.changes_left = self.changes_left.checked_sub(1).ok_or(InvalidCertificate)?;
+        self.w.len(key.len())?;
+        self.w.bytes(key);
+        self.w
+            .i64(i64::try_from(change).map_err(|_| InvalidCertificate)?);
+        Ok(())
+    }
+
+    /// The digest, once every announced constraint and change was added.
+    pub fn finish(self) -> Result<Digest, InvalidCertificate> {
+        if self.constraints_left != 0 || self.changes_left != 0 {
+            return Err(InvalidCertificate);
+        }
+        Ok(self.w.finish())
+    }
 }
 
 /// Everything a certificate commits to.

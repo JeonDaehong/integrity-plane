@@ -15,6 +15,7 @@
 //! cannot prove, is an error rather than a verdict, so callers fail closed.
 
 mod plan;
+mod streamed;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,6 +31,9 @@ use integrity_index::{
 use integrity_types::{ConstraintId, ErrorCode, FieldId, SnapshotId, TableId};
 
 use plan::Plan;
+pub use streamed::{
+    StagedRun, StreamOptions, StreamedDecision, StreamedDeltas, counted_value, decode_counted,
+};
 
 /// A registered constraint with its resolved key schema.
 #[derive(Debug, Clone, PartialEq, Eq)]

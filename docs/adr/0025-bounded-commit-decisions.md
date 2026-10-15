@@ -1,6 +1,6 @@
 # 0025. Bounded memory after the merge: deciding, staging, logging and applying a commit in chunks
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-14
 - Implements: RFC 0006 (chunked staged deltas)
 - Amends: ADR 0019 (what happens after the merge), ADR 0003 (apply from a stream)
@@ -26,20 +26,26 @@ and applied as streams of chunks; nothing holds more than one chunk of keys per 
 beyond the sorters' budget (`limits.scan_memory`). These are the appends, initial loads, deletes,
 rewrites and compactions engines write.
 
-1. **Merged keys** are not collected: each constraint's merge yields `(key, added, removed)` to the
-   decision as it goes.
-2. **Duplicates and net changes** (spec §8) are counted as today. Net changes go to a **run**: a
-   sequence of `(key, value)` records in key order, held in memory up to its share of the budget and
-   appended to a file in the index store's scratch directory beyond it (`integrity_index::Run`).
-3. **Probes** read each constraint's net changes back in batches of at most `CHUNK` (100 000) keys,
-   in key order, against the indexes directly (no overlay: a one-step commit has nothing earlier to
-   see). The order of the checks, and so which violations are recorded and which inconsistency is
-   reported first, is that of `Validator::decide`: every own constraint in id order, then the
-   referencing constraints. Each batch's current values resolve the batch's staged writes
-   (`resolve`, unchanged) into a staged run per index.
-4. **Violation details** keep their samples and a count; keys reported by the streamed decision are
-   distinct per constraint and counted, not kept (`add_distinct_key`).
-5. **Key delta digest** (RFC 0002) is computed from the net-change runs once their counts are known.
+1. **Merged keys** go to a **run** per constraint instead of a list: `(key, added ‖ removed)`
+   records of the keys that matter (`CommitScan::counts_matter`), in key order, held in memory up to
+   the constraint's share of `limits.scan_memory` and appended to one file in the index store's
+   scratch directory beyond it (`integrity_index::Run`). Each merge writes its own run on its own
+   thread, as it did its list.
+2. **`CommitScan::decide_streamed`** reads each run back as often as it needs, at most `chunk`
+   (100 000) keys at a time. First, as `counts` did for every key: duplicates among the added rows
+   (spec §8, before any probe), and per constraint the number of changed keys and whether a
+   PK/UNIQUE key falls by more than one.
+3. **Probes** then follow `Validator::decide` exactly, so the same violations are recorded and the
+   same inconsistency is reported first: every own constraint in order, then the referencing
+   constraints, against the indexes directly (no overlay: a one-step commit has nothing earlier to
+   see).
+4. **Violation details** keep their samples and a count; the merged keys are distinct, so each is
+   counted once (`add_distinct_key`), and a key already recorded as an intra-commit duplicate is not
+   recorded again when the index also has it, as the set of keys did before.
+5. **Staging**, if accepted: after the same epoch check as `ValidatedDeltas::stage`, each batch of
+   changed keys is staged by the index itself (`KeyIndex::stage`, unchanged) into a staged run with
+   its `StagedHeader`. **The key delta digest** (RFC 0002) is computed from the runs once each
+   constraint's count of changes is known (`KeyDeltaDigest`).
 6. **The log** (RFC 0006) gets each staged run in chunks: every chunk but the last of each index in
    a durable write of its own before `VALIDATED`, the last ones with `VALIDATED` and `COMMITTING`.
 7. **Apply** reads the logged chunks back and writes them into one index transaction
@@ -51,15 +57,16 @@ still grows with the keys they change. Engines write them for multi-snapshot RES
 for equality-delete upserts (refused together with removed data files, ADR 0009), not for bulk
 loads; `docs/limitations.md` says so.
 
-The streamed decision is tested against `Validator::decide` on every commit of the validator's
-differential suite and of `commit_scan.rs`, at chunk sizes 1, 2, 3 and 100 000 and budgets that
-force every run to spill: same decision, same violations (count and samples), same key delta
-digest, same staged writes, same index contents after apply.
+The streamed decision is tested against deciding at once on every commit of the validator's
+differential suite (in-memory and persistent indexes) and of `commit_scan.rs` (real Parquet files),
+at chunk sizes 1 to 3 and budgets that spill every run or none: same decision, same violations
+(count and samples) or error, same key delta digest, same staged headers and writes. The gateway
+tests and the crash suite run it at the default chunk size.
 
 ## Consequences
 
-- An append's memory no longer grows with its keys; scratch disk grows with them instead (net
-  changes and staged writes: about the key bytes twice, plus 17 bytes per key), and the log holds
+- An append's memory no longer grows with its keys; scratch disk grows with them instead (merged
+  keys and staged writes: about the key bytes twice, plus about 35 bytes per key), and the log holds
   the staged writes until the commit is resolved (RFC 0006).
 - Small commits keep one chunk per index: no file is written below the budget, and the log still
   takes one durable write.
