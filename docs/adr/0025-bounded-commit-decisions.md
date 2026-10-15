@@ -31,26 +31,30 @@ rewrites and compactions engines write.
    the constraint's share of `limits.scan_memory` and appended to one file in the index store's
    scratch directory beyond it (`integrity_index::Run`). Each merge writes its own run on its own
    thread, as it did its list.
-2. **`CommitScan::decide_streamed`** reads each run back as often as it needs, at most `chunk`
-   (100 000) keys at a time. First, as `counts` did for every key: duplicates among the added rows
-   (spec §8, before any probe), and per constraint the number of changed keys and whether a
-   PK/UNIQUE key falls by more than one.
-3. **Probes** then follow `Validator::decide` exactly, so the same violations are recorded and the
-   same inconsistency is reported first: every own constraint in order, then the referencing
-   constraints, against the indexes directly (no overlay: a one-step commit has nothing earlier to
-   see).
+2. **The merge counts** on the way what the decision needs before reading the run: each
+   constraint's number of changed keys, whether any key repeats among the added rows and whether
+   a PK/UNIQUE key falls by more than one (`MergedKeysWriter`).
+3. **`CommitScan::decide_streamed`** records the duplicates among the added rows first (spec §8,
+   before any probe), in a pass of its own over the constraints whose merge saw any. Then one pass
+   per constraint, in `Validator::decide`'s order, reads the run at most `chunk` (100 000) keys at a
+   time: it probes the batch against the indexes directly (no overlay: a one-step commit has nothing
+   earlier to see), records violations, and feeds the key delta digest (RFC 0002,
+   `KeyDeltaDigest`; the validator keeps constraints in id order, as the digest takes them). The
+   referencing constraints follow, so the same violations are recorded and the same inconsistency
+   is reported first as deciding at once.
 4. **Violation details** keep their samples and a count; the merged keys are distinct, so each is
    counted once (`add_distinct_key`), and a key already recorded as an intra-commit duplicate is not
    recorded again when the index also has it, as the set of keys did before.
-5. **Staging**, if accepted: after the same epoch check as `ValidatedDeltas::stage`, each batch of
-   changed keys is staged by the index itself (`KeyIndex::stage`, unchanged) into a staged run with
-   its `StagedHeader`. **The key delta digest** (RFC 0002) is computed from the runs once each
-   constraint's count of changes is known (`KeyDeltaDigest`).
+5. **Staging** happens in the same pass while nothing is violated: each batch is resolved against
+   its current values (the probe's for a unique index, the foreign key's own index otherwise) by the
+   resolution every backend uses (`integrity_index::stage_from`), into a staged run with its
+   `StagedHeader`. Once anything is violated, staging stops; the epoch check of
+   `ValidatedDeltas::stage` runs before an acceptance is returned.
 6. **The log** (RFC 0006) gets each staged run in chunks: every chunk but the last of each index in
    a durable write of its own before `VALIDATED`, the last ones with `VALIDATED` and `COMMITTING`.
-7. **Apply** reads the logged chunks back and writes them into one index transaction
-   (`PersistentStore::apply_streamed`), checking the digest before committing; recovery does the
-   same. The ADR 0003 idempotence check compares the logged digest.
+7. **Apply** writes the staged runs into one index transaction (`PersistentStore::apply_streamed`),
+   checking the digest before committing; recovery reads the logged chunks back and does the same.
+   The ADR 0003 idempotence check compares the logged digest.
 
 Commits with several steps, and commits with equality deletes, keep the current path: their memory
 still grows with the keys they change. Engines write them for multi-snapshot REST transactions and
