@@ -1,12 +1,11 @@
 //! Deciding a commit with bounded memory after the merge (ADR 0025).
 //!
 //! [`CommitScan::decide`] collects every changed key. [`CommitScan::decide_streamed`] takes the
-//! merged keys of each keyed constraint as a [`FinishedRun`] of `(key, added ‖ removed)` records
-//! and reads it back as often as needed, a batch of at most [`StreamOptions::chunk`] keys at a
-//! time: it records duplicates, probes the indexes, stages the accepted changes into runs and
-//! computes the key delta digest, deciding exactly what [`CommitScan::decide`] decides for the same
-//! counts, and staging exactly what [`ValidatedDeltas::stage`](crate::ValidatedDeltas::stage)
-//! stages.
+//! merged keys of each keyed constraint as [`MergedKeys`]: a [`FinishedRun`] of
+//! `(key, added ‖ removed)` records and what the merge counted. It reads the runs back a batch of
+//! at most [`StreamOptions::chunk`] keys at a time, deciding exactly what [`CommitScan::decide`]
+//! decides for the same counts, and staging exactly what
+//! [`ValidatedDeltas::stage`](crate::ValidatedDeltas::stage) stages.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -15,10 +14,10 @@ use integrity_core::{
     ConstraintKind, Digest, EncodedKey, InvalidCertificate, KeyDeltaDigest, NetDelta, Violation,
 };
 use integrity_index::{
-    FinishedRun, IndexDelta, IndexEpoch, IndexError, IndexValue, Run, StagedDigest, StagedHeader,
-    Writes, decode_staged_value, encode_value,
+    FinishedRun, IndexDelta, IndexEpoch, IndexError, IndexKind, IndexValue, Run, StagedDigest,
+    StagedHeader, Writes, decode_staged_value, encode_value, stage_from,
 };
-use integrity_types::{ConstraintId, ErrorCode};
+use integrity_types::{ConstraintId, ErrorCode, SnapshotId};
 
 use crate::{CommitScan, Inconsistency, IndexSet, ValidationError, ViolationDetail, index, probe};
 
@@ -44,10 +43,75 @@ fn corrupt() -> ValidationError {
     ValidationError::Index(IndexError::Corrupt)
 }
 
+/// One constraint's merged keys, in key order, and what the merge counted on the way.
+#[derive(Debug)]
+pub struct MergedKeys {
+    run: FinishedRun,
+    changes: u64,
+    repeated: bool,
+    falls_twice: bool,
+}
+
+/// A merged key with how often the added and the removed rows have it.
+pub type KeyCounts = (EncodedKey, u64, u64);
+
+impl MergedKeys {
+    /// Each key with its counts, in key order.
+    pub fn counts(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<KeyCounts, ValidationError>> + '_, ValidationError>
+    {
+        Ok(counted_records(Some(&self.run))?.map(|c| c.map(|c| (c.key, c.added, c.removed))))
+    }
+}
+
+/// Writes [`MergedKeys`]: each key once, in strictly increasing key order.
+#[derive(Debug)]
+pub struct MergedKeysWriter {
+    run: Run,
+    changes: u64,
+    repeated: bool,
+    falls_twice: bool,
+}
+
+impl MergedKeysWriter {
+    /// Writes into `run`.
+    pub fn new(run: Run) -> Self {
+        Self {
+            run,
+            changes: 0,
+            repeated: false,
+            falls_twice: false,
+        }
+    }
+
+    /// Adds a key that the added rows have `added` times and the removed ones `removed` times.
+    pub fn push(&mut self, key: &[u8], added: u64, removed: u64) -> Result<(), IndexError> {
+        self.run.push(key, &counted_value(added, removed))?;
+        if added != removed {
+            self.changes += 1;
+        }
+        self.repeated |= added > 1;
+        self.falls_twice |= removed > added.saturating_add(1);
+        Ok(())
+    }
+
+    /// Ends writing.
+    pub fn finish(self) -> Result<MergedKeys, IndexError> {
+        Ok(MergedKeys {
+            run: self.run.finish()?,
+            changes: self.changes,
+            repeated: self.repeated,
+            falls_twice: self.falls_twice,
+        })
+    }
+}
+
 /// One merged key: the key, its counts on each side, and its net change.
 struct Counted {
     key: EncodedKey,
     added: u64,
+    removed: u64,
     change: i128,
 }
 
@@ -66,6 +130,7 @@ fn counted_records(
         Ok(Counted {
             key,
             added,
+            removed,
             change: i128::from(added) - i128::from(removed),
         })
     }))
@@ -75,14 +140,13 @@ fn counted_records(
 fn for_each_batch(
     run: Option<&FinishedRun>,
     size: usize,
-    mut keep: impl FnMut(&Counted) -> bool,
     mut f: impl FnMut(&[Counted]) -> Result<(), ValidationError>,
 ) -> Result<(), ValidationError> {
     let size = size.max(1);
     let mut batch = Vec::with_capacity(size.min(4096));
     for c in counted_records(run)? {
         let c = c?;
-        if c.change != 0 && keep(&c) {
+        if c.change != 0 {
             batch.push(c);
             if batch.len() == size {
                 f(&batch)?;
@@ -154,56 +218,124 @@ pub enum StreamedDecision {
     Rejected(BTreeSet<Violation>),
 }
 
-/// What [`CommitScan::decide_streamed`] learns while counting a constraint's keys.
-#[derive(Debug, Default, Clone, Copy)]
-struct Tally {
-    changes: u64,
-    /// A PK/UNIQUE key whose count falls by more than one (never indexed that often).
-    falls_twice: bool,
+/// The staged writes of one index being written.
+struct Stager {
+    kind: IndexKind,
+    base_epoch: IndexEpoch,
+    writes: u64,
+    digest: StagedDigest,
+    run: Run,
+}
+
+impl Stager {
+    /// Stages `batch` against the current values of its keys.
+    fn stage(
+        &mut self,
+        snapshot: SnapshotId,
+        batch: &[Counted],
+        current: &[Option<IndexValue>],
+    ) -> Result<(), ValidationError> {
+        let changes = batch.iter().map(|c| (c.key.clone(), c.change)).collect();
+        let delta = IndexDelta {
+            snapshot,
+            changes: NetDelta::from_sorted(changes).map_err(ValidationError::Delta)?,
+        };
+        let part = stage_from(self.kind, &delta, self.base_epoch, current)
+            .map_err(ValidationError::Index)?;
+        for (key, value) in part.writes() {
+            self.digest
+                .update(key, value)
+                .map_err(ValidationError::Index)?;
+            self.run
+                .push(key.as_bytes(), encode_value(value).as_slice())
+                .map_err(ValidationError::Index)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self, constraint: ConstraintId) -> Result<StagedRun, ValidationError> {
+        Ok(StagedRun {
+            constraint,
+            header: StagedHeader {
+                base_epoch: self.base_epoch,
+                writes: self.writes,
+                digest: self.digest.finish().map_err(ValidationError::Index)?,
+            },
+            run: self.run.finish().map_err(ValidationError::Index)?,
+        })
+    }
+}
+
+/// The key delta digest (RFC 0002), computed in the pass: the validator keeps its constraints in
+/// id order, as the digest takes them (a different order fails the digest, and so the commit).
+enum Digesting {
+    Here(Box<KeyDeltaDigest>),
+    Failed(InvalidCertificate),
+}
+
+impl Digesting {
+    fn constraint(&mut self, id: ConstraintId, changes: u64) {
+        if let Digesting::Here(d) = self
+            && let Err(e) = d.constraint(id, changes)
+        {
+            *self = Digesting::Failed(e);
+        }
+    }
+
+    fn changes(&mut self, batch: &[Counted]) {
+        if let Digesting::Here(d) = self
+            && let Some(e) = batch
+                .iter()
+                .find_map(|c| d.change(c.key.as_bytes(), c.change).err())
+        {
+            *self = Digesting::Failed(e);
+        }
+    }
 }
 
 impl CommitScan<'_> {
-    /// [`CommitScan::counts`] for every key of `counted`, then [`CommitScan::decide`], then
-    /// staging, with bounded memory (ADR 0025). `counted` holds, per keyed constraint, its merged
-    /// keys in key order with [`counted_value`]s (at least the keys
-    /// [`CommitScan::counts_matter`]; a constraint without a run has no such key).
+    /// [`CommitScan::counts`] for every key of `merged`, then [`CommitScan::decide`], then
+    /// staging, with bounded memory (ADR 0025). `merged` holds, per keyed constraint, its merged
+    /// keys (at least those [`CommitScan::counts_matter`]; a constraint without an entry has none).
+    ///
+    /// One pass over each constraint's changed keys probes them, records violations, stages them
+    /// while nothing is violated (a unique index's current values are the probe's) and digests
+    /// them. Duplicates among the added rows are recorded in a pass of their own before (spec §8),
+    /// only where the merge saw any.
     pub fn decide_streamed(
         mut self,
         indexes: &impl IndexSet,
-        counted: &BTreeMap<ConstraintId, FinishedRun>,
+        merged: &BTreeMap<ConstraintId, MergedKeys>,
         options: StreamOptions<'_>,
     ) -> Result<(StreamedDecision, BTreeMap<Violation, ViolationDetail>), ValidationError> {
         let keyed = self.keyed();
-        let duplicate_code = |id: ConstraintId| {
-            self.ctx
-                .own
-                .iter()
-                .find(|rc| rc.constraint.id == id)
-                .map(|rc| match rc.constraint.kind {
-                    ConstraintKind::PrimaryKey(_) => Some(ErrorCode::DuplicatePrimaryKey),
-                    ConstraintKind::Unique(_) => Some(ErrorCode::DuplicateUniqueKey),
-                    _ => None,
-                })
-                .ok_or(ValidationError::MissingIndex(id))
+        let run = |id: &ConstraintId| merged.get(id).map(|m| &m.run);
+        let changes = |id: &ConstraintId| merged.get(id).map_or(0, |m| m.changes);
+        let duplicate_code = |kind: &ConstraintKind| match kind {
+            ConstraintKind::PrimaryKey(_) => Some(ErrorCode::DuplicatePrimaryKey),
+            ConstraintKind::Unique(_) => Some(ErrorCode::DuplicateUniqueKey),
+            _ => None,
         };
 
         // What `counts` does for each key: duplicates among the added rows (spec §8, before any
-        // probe).
-        let mut tallies: BTreeMap<ConstraintId, Tally> = BTreeMap::new();
-        for &id in &keyed {
-            let duplicate = duplicate_code(id)?;
-            let tally = tallies.entry(id).or_default();
-            for c in counted_records(counted.get(&id))? {
+        // probe). Merged keys are distinct: each is reported once.
+        for id in &keyed {
+            let rc = self
+                .ctx
+                .own
+                .iter()
+                .find(|rc| rc.constraint.id == *id)
+                .ok_or(ValidationError::MissingIndex(*id))?;
+            let Some(code) = duplicate_code(&rc.constraint.kind) else {
+                continue;
+            };
+            if !merged.get(id).is_some_and(|m| m.repeated) {
+                continue;
+            }
+            for c in counted_records(run(id))? {
                 let c = c?;
-                if let Some(code) = duplicate
-                    && c.added > 1
-                {
-                    // Merged keys are distinct: each is reported once.
-                    self.plan.record_distinct_key(id, code, &c.key);
-                }
-                if c.change != 0 {
-                    tally.changes += 1;
-                    tally.falls_twice |= duplicate.is_some() && c.change < -1;
+                if c.added > 1 {
+                    self.plan.record_distinct_key(*id, code, &c.key);
                 }
             }
         }
@@ -213,113 +345,134 @@ impl CommitScan<'_> {
         if let Some((_, e)) = std::mem::take(&mut self.errors).into_iter().next() {
             return Err(e);
         }
+        let mut digest = match KeyDeltaDigest::new(keyed.len()) {
+            Ok(d) => Digesting::Here(Box::new(d)),
+            Err(e) => Digesting::Failed(e),
+        };
+        let mut stagers: BTreeMap<ConstraintId, Stager> = BTreeMap::new();
+        let staging = keyed.iter().filter(|id| changes(id) > 0).count();
+        let budget = options.memory / staging.max(1);
+        let snapshot = self.snapshot;
         let chunk = options.chunk;
         for rc in &self.ctx.own {
             let id = rc.constraint.id;
-            let Some(tally) = tallies.get(&id).copied() else {
+            if !keyed.contains(&id) {
                 continue;
+            }
+            digest.constraint(id, changes(&id));
+            let duplicate = duplicate_code(&rc.constraint.kind);
+            if duplicate.is_some() && merged.get(&id).is_some_and(|m| m.falls_twice) {
+                return Err(ValidationError::Inconsistent(
+                    Inconsistency::RemovedKeyNotIndexed(id),
+                ));
+            }
+            let mut stager = if changes(&id) > 0 {
+                let base_epoch = *observed.get(&id).ok_or(ValidationError::MissingIndex(id))?;
+                Some(Stager {
+                    kind: if duplicate.is_some() {
+                        IndexKind::Unique
+                    } else {
+                        IndexKind::Reference
+                    },
+                    base_epoch,
+                    writes: changes(&id),
+                    digest: StagedDigest::new(base_epoch, changes(&id)),
+                    run: Run::new(options.scratch, budget),
+                })
+            } else {
+                None
             };
-            let run = counted.get(&id);
-            match &rc.constraint.kind {
-                ConstraintKind::PrimaryKey(_) | ConstraintKind::Unique(_) => {
-                    let duplicate = match rc.constraint.kind {
-                        ConstraintKind::PrimaryKey(_) => ErrorCode::DuplicatePrimaryKey,
-                        _ => ErrorCode::DuplicateUniqueKey,
-                    };
-                    if tally.falls_twice {
-                        return Err(ValidationError::Inconsistent(
-                            Inconsistency::RemovedKeyNotIndexed(id),
-                        ));
+            let plan = &mut self.plan;
+            for_each_batch(run(&id), chunk, |batch| {
+                let keys: Vec<EncodedKey> = batch.iter().map(|c| c.key.clone()).collect();
+                let current = match (&rc.constraint.kind, duplicate) {
+                    (_, Some(code)) => {
+                        let found = probe(indexes, id, &keys)?;
+                        for (c, value) in batch.iter().zip(&found) {
+                            match (c.change > 0, value) {
+                                // Count rises and the key is already present: duplicate (already
+                                // recorded if the added rows repeat it).
+                                (true, Some(_)) => {
+                                    if c.added <= 1 {
+                                        plan.record_distinct_key(id, code, &c.key);
+                                    }
+                                }
+                                // Count falls but the key was never indexed.
+                                (false, None) => {
+                                    return Err(ValidationError::Inconsistent(
+                                        Inconsistency::RemovedKeyNotIndexed(id),
+                                    ));
+                                }
+                                (true, None) | (false, Some(_)) => {}
+                            }
+                        }
+                        Some(found)
                     }
-                    let plan = &mut self.plan;
-                    for_each_batch(
-                        run,
-                        chunk,
-                        |_| true,
-                        |batch| {
-                            let keys: Vec<EncodedKey> =
-                                batch.iter().map(|c| c.key.clone()).collect();
-                            for (c, value) in batch.iter().zip(probe(indexes, id, &keys)?) {
-                                match (c.change > 0, value) {
-                                    // Count rises and the key is already present: duplicate (already
-                                    // recorded if the added rows repeat it).
-                                    (true, Some(_)) => {
-                                        if c.added <= 1 {
-                                            plan.record_distinct_key(id, duplicate, &c.key);
-                                        }
-                                    }
-                                    // Count falls but the key was never indexed.
-                                    (false, None) => {
-                                        return Err(ValidationError::Inconsistent(
-                                            Inconsistency::RemovedKeyNotIndexed(id),
-                                        ));
-                                    }
-                                    (true, None) | (false, Some(_)) => {}
-                                }
+                    (ConstraintKind::ForeignKey(fk), None) => {
+                        // Only keys whose count rises need a parent: a key that was already
+                        // referenced had a parent before, and the parent table is not written.
+                        let rising: Vec<EncodedKey> = batch
+                            .iter()
+                            .filter(|c| c.change > 0)
+                            .map(|c| c.key.clone())
+                            .collect();
+                        let found = probe(indexes, fk.parent_constraint, &rising)?;
+                        for (key, value) in rising.iter().zip(found) {
+                            if value.is_none() {
+                                plan.record_distinct_key(id, ErrorCode::ForeignKeyViolation, key);
                             }
-                            Ok(())
-                        },
-                    )?;
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+                digest.changes(batch);
+                // Staging is useless once anything is violated (and could not resolve a
+                // duplicate): stop.
+                if !plan.violations.is_empty() {
+                    stager = None;
                 }
-                ConstraintKind::ForeignKey(fk) => {
-                    let plan = &mut self.plan;
-                    for_each_batch(
-                        run,
-                        chunk,
-                        |c| c.change > 0,
-                        |batch| {
-                            let keys: Vec<EncodedKey> =
-                                batch.iter().map(|c| c.key.clone()).collect();
-                            let found = probe(indexes, fk.parent_constraint, &keys)?;
-                            for (key, value) in keys.iter().zip(found) {
-                                if value.is_none() {
-                                    plan.record_distinct_key(
-                                        id,
-                                        ErrorCode::ForeignKeyViolation,
-                                        key,
-                                    );
-                                }
-                            }
-                            Ok(())
-                        },
-                    )?;
+                if let Some(s) = &mut stager {
+                    let current = match current {
+                        Some(found) => found,
+                        None => probe(indexes, id, &keys)?,
+                    };
+                    s.stage(snapshot, batch, &current)?;
                 }
-                ConstraintKind::NotNull(_) => {}
+                Ok(())
+            })?;
+            if let Some(s) = stager {
+                stagers.insert(id, s);
             }
         }
         for (rc, parent) in &self.ctx.referencing {
-            if !tallies.contains_key(parent) {
+            if !keyed.contains(parent) {
                 return Err(ValidationError::Unprovable(rc.constraint.id));
             }
             let child = rc.constraint.id;
             let plan = &mut self.plan;
             // Parent keys that disappear (removed and not re-added).
-            for_each_batch(
-                counted.get(parent),
-                chunk,
-                |c| c.change < 0,
-                |batch| {
-                    let keys: Vec<EncodedKey> = batch.iter().map(|c| c.key.clone()).collect();
-                    for (key, value) in keys.iter().zip(probe(indexes, child, &keys)?) {
-                        match value {
-                            None => {}
-                            Some(IndexValue::Reference { .. }) => {
-                                plan.record_distinct_key(
-                                    child,
-                                    ErrorCode::ReferencedRowDelete,
-                                    key,
-                                );
-                            }
-                            Some(IndexValue::Unique { .. }) => {
-                                return Err(ValidationError::Inconsistent(
-                                    Inconsistency::WrongIndexKind(child),
-                                ));
-                            }
+            for_each_batch(run(parent), chunk, |batch| {
+                let gone: Vec<EncodedKey> = batch
+                    .iter()
+                    .filter(|c| c.change < 0)
+                    .map(|c| c.key.clone())
+                    .collect();
+                for (key, value) in gone.iter().zip(probe(indexes, child, &gone)?) {
+                    match value {
+                        None => {}
+                        Some(IndexValue::Reference { .. }) => {
+                            plan.record_distinct_key(child, ErrorCode::ReferencedRowDelete, key);
+                        }
+                        Some(IndexValue::Unique { .. }) => {
+                            return Err(ValidationError::Inconsistent(
+                                Inconsistency::WrongIndexKind(child),
+                            ));
                         }
                     }
-                    Ok(())
-                },
-            )?;
+                }
+                Ok(())
+            })?;
         }
         if !self.plan.violations.is_empty() {
             return Ok((
@@ -328,8 +481,8 @@ impl CommitScan<'_> {
             ));
         }
 
-        // What `ValidatedDeltas::stage` does: every index the decision read or writes is still
-        // where it was; each changed index stages its changes.
+        // What `ValidatedDeltas::stage` checks first: every index the decision read or writes is
+        // still where it was (the staged writes were resolved at those epochs).
         for (&id, &epoch) in &observed {
             if index(indexes, id)?
                 .epoch()
@@ -339,54 +492,14 @@ impl CommitScan<'_> {
                 return Err(ValidationError::StaleValidation);
             }
         }
-        let changed: Vec<(ConstraintId, Tally)> = tallies
-            .iter()
-            .filter(|(_, t)| t.changes > 0)
-            .map(|(id, t)| (*id, *t))
-            .collect();
-        let budget = options.memory / changed.len().max(1);
-        let mut staged = Vec::new();
-        for (id, tally) in changed {
-            let target = index(indexes, id)?;
-            let base_epoch: IndexEpoch = target.epoch().map_err(ValidationError::Index)?;
-            let mut digest = StagedDigest::new(base_epoch, tally.changes);
-            let mut out = Run::new(options.scratch, budget);
-            let snapshot = self.snapshot;
-            for_each_batch(
-                counted.get(&id),
-                chunk,
-                |_| true,
-                |batch| {
-                    let changes = batch.iter().map(|c| (c.key.clone(), c.change)).collect();
-                    let delta = IndexDelta {
-                        snapshot,
-                        changes: NetDelta::from_sorted(changes).map_err(ValidationError::Delta)?,
-                    };
-                    let part = target.stage(&delta).map_err(ValidationError::Index)?;
-                    if part.base_epoch() != base_epoch {
-                        return Err(ValidationError::StaleValidation);
-                    }
-                    for (key, value) in part.writes() {
-                        digest.update(key, value).map_err(ValidationError::Index)?;
-                        out.push(key.as_bytes(), encode_value(value).as_slice())
-                            .map_err(ValidationError::Index)?;
-                    }
-                    Ok(())
-                },
-            )?;
-            let header = StagedHeader {
-                base_epoch,
-                writes: tally.changes,
-                digest: digest.finish().map_err(ValidationError::Index)?,
-            };
-            staged.push(StagedRun {
-                constraint: id,
-                header,
-                run: out.finish().map_err(ValidationError::Index)?,
-            });
-        }
-
-        let key_delta_digest = key_delta_digest(&tallies, counted)?;
+        let staged = stagers
+            .into_iter()
+            .map(|(id, s)| s.finish(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let key_delta_digest = match digest {
+            Digesting::Here(d) => d.finish(),
+            Digesting::Failed(e) => Err(e),
+        };
         Ok((
             StreamedDecision::Accepted(StreamedDeltas {
                 key_delta_digest,
@@ -395,30 +508,4 @@ impl CommitScan<'_> {
             BTreeMap::new(),
         ))
     }
-}
-
-/// The key delta digest (RFC 0002), every keyed constraint in id order. Reading the runs can
-/// fail; a delta the digest cannot represent is returned as such, as `key_delta_digest` does.
-fn key_delta_digest(
-    tallies: &BTreeMap<ConstraintId, Tally>,
-    counted: &BTreeMap<ConstraintId, FinishedRun>,
-) -> Result<Result<Digest, InvalidCertificate>, ValidationError> {
-    let mut d = match KeyDeltaDigest::new(tallies.len()) {
-        Ok(d) => d,
-        Err(e) => return Ok(Err(e)),
-    };
-    for (&id, tally) in tallies {
-        if let Err(e) = d.constraint(id, tally.changes) {
-            return Ok(Err(e));
-        }
-        for c in counted_records(counted.get(&id))? {
-            let c = c?;
-            if c.change != 0
-                && let Err(e) = d.change(c.key.as_bytes(), c.change)
-            {
-                return Ok(Err(e));
-            }
-        }
-    }
-    Ok(d.finish())
 }

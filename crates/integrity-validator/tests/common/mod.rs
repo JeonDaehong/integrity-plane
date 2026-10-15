@@ -16,8 +16,8 @@ use integrity_index::{IndexEpoch, IndexValue, KeyIndex, MemoryIndex, PersistentS
 use integrity_reference::{Commit, Oracle, Row, Verdict};
 use integrity_types::{ConstraintId, ConstraintSetVersion, FieldId, SnapshotId, TableId};
 use integrity_validator::{
-    CommitScan, Decision, ResolvedConstraint, StreamOptions, StreamedDecision, ValidationError,
-    Validator, ViolationDetail, counted_value,
+    CommitScan, Decision, MergedKeysWriter, ResolvedConstraint, StreamOptions, StreamedDecision,
+    ValidationError, Validator, ViolationDetail,
 };
 use proptest::prelude::*;
 
@@ -94,13 +94,12 @@ pub fn decided_streamed(
     }
     let mut runs = BTreeMap::new();
     for id in scan.keyed() {
-        let mut run = integrity_index::Run::new(&scratch, budget);
+        let mut run = MergedKeysWriter::new(integrity_index::Run::new(&scratch, budget));
         for (key, (added, removed)) in keys.remove(&id).unwrap_or_default() {
             if removed_first && !CommitScan::counts_matter(added, removed) {
                 continue;
             }
-            run.push(key.as_bytes(), &counted_value(added, removed))
-                .unwrap();
+            run.push(key.as_bytes(), added, removed).unwrap();
         }
         runs.insert(id, run.finish().unwrap());
     }

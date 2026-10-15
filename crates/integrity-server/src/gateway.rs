@@ -1377,8 +1377,7 @@ impl Gateway {
         // VALIDATED (with the staged deltas) and COMMITTING in one durable write (RFC 0004
         // records, staged deltas in chunks: RFC 0006).
         let sources = staged.sources().map_err(|e| abort(e, TxnState::Aborted))?;
-        let staged = self
-            .log
+        self.log
             .validated_and_committing_streamed(
                 txn,
                 Validated {
@@ -1466,7 +1465,7 @@ impl Gateway {
 struct Accepted {
     txn: TxnId,
     epoch: u64,
-    staged: Vec<StagedEntry>,
+    staged: pipeline::Staged,
     indexes: BTreeMap<ConstraintId, PersistentIndex>,
     decision: TxnDecision,
     identifier: String,
@@ -1494,7 +1493,7 @@ impl Gateway {
         } = accepted;
         let gateway = Arc::clone(&self);
         let applied = tokio::task::spawn_blocking(move || {
-            pipeline::apply(&gateway.store, &gateway.log, txn, &staged, &indexes, epoch)
+            pipeline::apply_staged(&gateway.store, &staged, &indexes, epoch)
         })
         .await;
         match applied {

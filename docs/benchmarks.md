@@ -258,6 +258,24 @@ on threads of their own (ranges of two to four runs each; this machine's timings
 | Single-row FK append, time in `validate` (p50 of 100) | 1.5–1.6 ms | 1.2–1.3 ms |
 | Merge-on-read delete of 1 % of all rows, spread over every file | 0.32–0.50 s | 0.32–0.48 s |
 
+### Bounded memory after the merge (ADR 0025, local)
+
+`integrity-bench --parent-rows 1000000 --appends 1 --append-rows 5000000` on the local Windows
+machine, before (commit 751ed59) and after deciding, staging, logging and applying a one-step commit
+in chunks; two runs each, alternating. Peak memory is the whole benchmark process (gateway, fake
+catalog and the generation of its 5 M-row files), sampled every 0.1 s.
+
+| | Before | After |
+|---|---|---|
+| Peak memory of the run | 1 482 MB | 821–822 MB |
+| Child append of 5 M rows (PK + FK into 1 M parent keys), validation | 7.1–8.8 s | 8.4–8.6 s |
+| Index write of that append, after the answer (ADR 0022) | 5.2 s | 5.7 s |
+
+What remains in memory grows with neither the keys nor the rows: the sorters' and runs' share of
+`limits.scan_memory` (512 MiB by default), one batch of 100 000 keys per constraint being probed,
+and one chunk per index being logged. The extra half second of the index write reads the staged
+writes back from their run instead of from memory.
+
 ### Large tables and appends, version C (local NVMe)
 
 Same instance, commit fe42956, files on the instance's disk as in the sections above

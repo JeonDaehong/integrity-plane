@@ -25,14 +25,14 @@ use integrity_iceberg::{
     TableMetadata, check_operation, check_sides, commit_rows, diff_snapshots, for_each_side_batch,
 };
 use integrity_index::{
-    FinishedRun, IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex,
-    PersistentStore, Run, StagedDelta,
+    IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex, PersistentStore, Run,
+    StagedDelta,
 };
 use integrity_txn::{FaultPoint, StagedEntry, StagedSource, TxnId, TxnLog, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, SnapshotId, TableId};
 use integrity_validator::{
-    CommitScan, Decision, IndexSet, StagedRun, StreamOptions, StreamedDecision, ValidationError,
-    Validator, ViolationDetail, counted_value, decode_counted,
+    CommitScan, Decision, IndexSet, MergedKeys, MergedKeysWriter, StagedRun, StreamOptions,
+    StreamedDecision, ValidationError, Validator, ViolationDetail,
 };
 
 use crate::error::ApiError;
@@ -563,11 +563,9 @@ impl<'a> Streamed<'a> {
         indexes: &impl IndexSet,
     ) -> Result<(Decided, u64), ApiError> {
         let (mut scan, runs, rows) = self.merged(io, changes)?;
-        for (id, run) in &runs {
-            for record in run.records().map_err(spill)? {
-                let (key, value) = record.map_err(spill)?;
-                let key = EncodedKey::from_vec(key).map_err(|_| spill(IndexError::Corrupt))?;
-                let (a, r) = decode_counted(&value).ok_or_else(|| spill(IndexError::Corrupt))?;
+        for (id, merged) in &runs {
+            for counted in merged.counts().map_err(invalid)? {
+                let (key, a, r) = counted.map_err(invalid)?;
                 scan.counts(*id, key, a, r).map_err(invalid)?;
             }
         }
@@ -584,7 +582,7 @@ impl<'a> Streamed<'a> {
         chunk: usize,
     ) -> Result<(BoundedDecided, u64), ApiError> {
         let (scan, runs, rows) = self.merged(io, changes)?;
-        let runs: BTreeMap<ConstraintId, FinishedRun> = runs.into_iter().collect();
+        let runs: BTreeMap<ConstraintId, MergedKeys> = runs.into_iter().collect();
         let options = StreamOptions {
             scratch: self.scratch,
             memory: self.memory,
@@ -604,7 +602,7 @@ impl<'a> Streamed<'a> {
         &self,
         io: &impl FileIo,
         changes: &FileChanges,
-    ) -> Result<(CommitScan<'a>, Vec<(ConstraintId, FinishedRun)>, u64), ApiError> {
+    ) -> Result<(CommitScan<'a>, Vec<(ConstraintId, MergedKeys)>, u64), ApiError> {
         let mut scan = self
             .validator
             .commit_scan(self.table, self.snapshot)
@@ -616,7 +614,7 @@ impl<'a> Streamed<'a> {
         let budget = self.memory / sorters_needed.max(1);
         let run_budget = self.memory / keyed.len().max(1);
         let scratch = self.scratch;
-        let new_run = move || Run::new(scratch, run_budget);
+        let new_run = move || MergedKeysWriter::new(Run::new(scratch, run_budget));
         let mut removed_scan = scan.removed();
         // A side without data files to read, and no kept files, has no rows.
         let has = |side| {
@@ -904,7 +902,7 @@ fn joined<T>(h: ScopedJoinHandle<'_, T>) -> T {
 type Counted = (EncodedKey, u64, u64);
 
 /// The keys of one constraint that matter, merged from both sides.
-type Merged = Result<FinishedRun, ApiError>;
+type Merged = Result<MergedKeys, ApiError>;
 
 /// Sorted distinct keys with their counts.
 trait Keys: Iterator<Item = Result<(EncodedKey, u64), IndexError>> {}
@@ -913,7 +911,7 @@ impl<I: Iterator<Item = Result<(EncodedKey, u64), IndexError>>> Keys for I {}
 
 /// Merges the two sorted sides of one constraint: each distinct key once, with its count on each
 /// side, keeping only the keys that matter to the validator ([`CommitScan::counts_matter`]).
-fn merge_sides(added: impl Keys, removed: impl Keys, mut out: Run) -> Merged {
+fn merge_sides(added: impl Keys, removed: impl Keys, mut out: MergedKeysWriter) -> Merged {
     let mut added = added.peekable();
     let mut removed = removed.peekable();
     loop {
@@ -946,8 +944,7 @@ fn merge_sides(added: impl Keys, removed: impl Keys, mut out: Run) -> Merged {
             }
         };
         if CommitScan::counts_matter(a, r) {
-            out.push(key.as_bytes(), &counted_value(a, r))
-                .map_err(spill)?;
+            out.push(key.as_bytes(), a, r).map_err(spill)?;
         }
     }
     out.finish().map_err(spill)
@@ -975,9 +972,35 @@ fn same(
     }
 }
 
+/// Applies a commit's staged deltas as validation left them, at `epoch`, atomically across its
+/// indexes: what the transaction log holds, without reading it back. Idempotent (ADR 0003).
+pub fn apply_staged(
+    store: &PersistentStore,
+    staged: &Staged,
+    indexes: &BTreeMap<ConstraintId, PersistentIndex>,
+    epoch: u64,
+) -> Result<(), ApiError> {
+    let batch = staged
+        .sources()?
+        .into_iter()
+        .map(|source| {
+            let id = source.constraint;
+            let index = indexes.get(&id).ok_or_else(|| {
+                ApiError::new(ErrorCode::IndexDegraded, format!("no index for {id}"))
+            })?;
+            Ok((index, source.header, source.writes))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    fault::hit(FaultPoint::DuringIndexApply);
+    // One atomic transaction for every index of the commit.
+    store
+        .apply_streamed(batch, IndexEpoch(epoch))
+        .map_err(|e| api(e, ErrorCode::IndexDegraded))
+}
+
 /// Applies a commit's staged deltas, read from the transaction log one chunk at a time (RFC
-/// 0006), at `epoch`, atomically across its indexes. Idempotent: re-applying after a crash is a
-/// no-op (ADR 0003).
+/// 0006), at `epoch`, atomically across its indexes: how recovery finishes a commit. Idempotent:
+/// re-applying after a crash is a no-op (ADR 0003).
 pub fn apply(
     store: &PersistentStore,
     log: &TxnLog,

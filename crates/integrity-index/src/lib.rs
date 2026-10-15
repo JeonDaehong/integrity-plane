@@ -321,6 +321,24 @@ pub trait KeyIndex: Send + Sync {
     fn entries(&self) -> Result<Vec<(EncodedKey, IndexValue)>>;
 }
 
+/// [`KeyIndex::stage`] of an index of `kind` at `base_epoch` whose current values of the delta's
+/// keys were already read: `current` holds them in the delta's key order (ADR 0025). The same
+/// resolution every backend uses.
+pub fn stage_from(
+    kind: IndexKind,
+    delta: &IndexDelta,
+    base_epoch: IndexEpoch,
+    current: &[Option<IndexValue>],
+) -> Result<StagedDelta> {
+    if current.len() != delta.changes.len() {
+        return Err(IndexError::Corrupt);
+    }
+    let mut values = current.iter();
+    resolve(kind, delta, base_epoch, |_| {
+        values.next().copied().ok_or(IndexError::Corrupt)
+    })
+}
+
 /// Resolves `delta` against the current values returned by `current` (spec §13.2 `stage`).
 /// Shared by every backend so that all of them stage identically.
 pub(crate) fn resolve(
