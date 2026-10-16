@@ -69,6 +69,78 @@ pub struct ServerConfig {
     /// `Authorization: Bearer <admin_token>`.
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Named integrity API tokens (ADR 0026): a request authenticated with one is attributed to
+    /// its name. `admin_token` is the token named `admin`.
+    #[serde(default)]
+    pub api_tokens: Vec<ApiTokenConfig>,
+}
+
+/// `[[server.api_tokens]]` (ADR 0026): `token` or its hex SHA-256 `token_sha256`, not both.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiTokenConfig {
+    /// Who holds the token, as audit events name them.
+    pub name: String,
+    /// The token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Hex SHA-256 of the token, so the file need not hold it.
+    #[serde(default)]
+    pub token_sha256: Option<String>,
+}
+
+/// SHA-256 of an integrity API token.
+pub fn token_digest(token: &str) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(token.as_bytes()).into()
+}
+
+fn parse_sha256_hex(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+impl ServerConfig {
+    /// Every integrity API token as `(name, SHA-256)`: `admin_token` as `admin`, then
+    /// `api_tokens`. Names are unique, 1–64 characters of `[A-Za-z0-9._@-]`, never `plane`.
+    pub fn tokens(&self) -> Result<Vec<(String, [u8; 32])>, ConfigError> {
+        let mut out = Vec::new();
+        if let Some(t) = &self.admin_token {
+            out.push(("admin".to_owned(), token_digest(t)));
+        }
+        for t in &self.api_tokens {
+            let err = |why: &str| ConfigError(format!("server.api_tokens {:?}: {why}", t.name));
+            let valid_name = (1..=64).contains(&t.name.len())
+                && t.name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._@-".contains(c));
+            if !valid_name {
+                return Err(err("name must be 1-64 characters of A-Z a-z 0-9 . _ @ -"));
+            }
+            if t.name == "plane" {
+                return Err(err("\"plane\" names the Plane's own actions"));
+            }
+            if out.iter().any(|(n, _)| *n == t.name) {
+                return Err(err("name used twice (admin_token is \"admin\")"));
+            }
+            let digest = match (&t.token, &t.token_sha256) {
+                (Some(token), None) if !token.is_empty() => token_digest(token),
+                (None, Some(hex)) => {
+                    parse_sha256_hex(hex).ok_or_else(|| err("token_sha256 is not 64 hex digits"))?
+                }
+                _ => return Err(err("needs exactly one of token, token_sha256")),
+            };
+            out.push((t.name.clone(), digest));
+        }
+        Ok(out)
+    }
 }
 
 /// `[upstream]`.
@@ -423,6 +495,61 @@ path = "/tmp/x"
 [limits]
 max_inline_validation_bytes = "2GiB"
 "#;
+
+    /// `BASE` with an `admin_token` and `[[server.api_tokens]]` entries.
+    fn with_tokens(entries: &str) -> Result<Vec<(String, [u8; 32])>, String> {
+        let text = BASE.replace(
+            "bind = \"127.0.0.1:8181\"",
+            "bind = \"127.0.0.1:8181\"\nadmin_token = \"shared\"",
+        ) + entries;
+        Config::from_toml(&text)
+            .map_err(|e| e.to_string())?
+            .server
+            .tokens()
+            .map_err(|e| e.0)
+    }
+
+    #[test]
+    fn api_tokens_have_names_and_one_secret_each() {
+        // Any 64 hex digits (the digest of whatever bob holds).
+        let bob = "4fd0c7d2b3d9ff06a8fa3e7a3ba7ff5b0a2b8c3c5f4e1d2b1d6a0e7f9c8b7a6d";
+        let tokens = with_tokens(&format!(
+            "[[server.api_tokens]]\nname = \"alice\"\ntoken = \"alice-token\"\n\
+             [[server.api_tokens]]\nname = \"bob\"\ntoken_sha256 = \"{bob}\"\n"
+        ))
+        .unwrap();
+        let names: Vec<&str> = tokens.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["admin", "alice", "bob"]);
+        assert_eq!(tokens[0].1, token_digest("shared"));
+        assert_eq!(tokens[1].1, token_digest("alice-token"));
+        assert_eq!(tokens[2].1, parse_sha256_hex(bob).unwrap());
+        // The digest operators compute with `sha256sum`.
+        assert_eq!(
+            token_digest("abc"),
+            parse_sha256_hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+                .unwrap()
+        );
+
+        for (entry, why) in [
+            ("name = \"admin\"\ntoken = \"x\"", "name used twice"),
+            ("name = \"plane\"\ntoken = \"x\"", "Plane's own"),
+            ("name = \"a b\"\ntoken = \"x\"", "name must be"),
+            ("name = \"\"\ntoken = \"x\"", "name must be"),
+            ("name = \"c\"", "exactly one"),
+            ("name = \"c\"\ntoken = \"\"", "exactly one"),
+            (
+                "name = \"c\"\ntoken = \"x\"\ntoken_sha256 = \"00\"",
+                "exactly one",
+            ),
+            ("name = \"c\"\ntoken_sha256 = \"zz\"", "64 hex"),
+        ] {
+            let e = with_tokens(&format!("[[server.api_tokens]]\n{entry}\n")).unwrap_err();
+            assert!(e.contains(why), "{entry}: {e}");
+        }
+        let twice = "[[server.api_tokens]]\nname = \"c\"\ntoken = \"x\"\n";
+        let e = with_tokens(&format!("{twice}{twice}")).unwrap_err();
+        assert!(e.contains("name used twice"), "{e}");
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

@@ -35,6 +35,9 @@ apache-avro = { version = "0.22", default-features = false, features = ["snappy"
 roaring = "0.11.5"
 # Certificate signatures (RFC 0005). BSD-3-Clause, pure Rust.
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+# Integrity API token digests (ADR 0026). MIT OR Apache-2.0, pure Rust; already used by
+# ed25519-dalek.
+sha2 = "0.11"
 # OS randomness for generating signing keys.
 getrandom = "0.3.4"
 

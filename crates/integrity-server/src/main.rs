@@ -68,7 +68,7 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         registry,
     )?
     .with_prefix(config.upstream.prefix.as_deref())
-    .with_admin_token(config.server.admin_token.clone())
+    .with_api_tokens(config.server.tokens()?)
     .with_redact_keys(config.errors.redact_keys)
     .with_scan_memory(config.limits.scan_memory)
     .with_request_limits(

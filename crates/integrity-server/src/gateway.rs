@@ -321,8 +321,8 @@ pub struct Gateway {
     pub(crate) registry: Registry,
     /// `/v1` or `/v1/{prefix}`: where the integrity API finds tables upstream.
     pub(crate) base: String,
-    /// Bearer token required by the integrity API, if any.
-    pub(crate) admin_token: Option<String>,
+    /// Integrity API tokens as `(name, SHA-256)` (ADR 0026); none: the API is open.
+    pub(crate) tokens: Vec<(String, [u8; 32])>,
     /// Credentials for the Plane's own upstream requests.
     upstream_auth: Option<crate::config::UpstreamAuth>,
     /// Cached OAuth2 access token and when to refresh it.
@@ -380,7 +380,7 @@ impl Gateway {
             budget,
             registry,
             base: "/v1".to_owned(),
-            admin_token: None,
+            tokens: Vec::new(),
             upstream_auth: None,
             upstream_token: Mutex::new(None),
             redact_keys: false,
@@ -455,10 +455,44 @@ impl Gateway {
         self
     }
 
-    /// Requires `Authorization: Bearer <token>` on the integrity API.
+    /// Requires `Authorization: Bearer <token>` on the integrity API (except `status`); the token
+    /// is named `admin` in audit events (ADR 0026). Replaces any token named `admin`.
     pub fn with_admin_token(mut self, token: Option<String>) -> Self {
-        self.admin_token = token;
+        self.tokens.retain(|(name, _)| name != "admin");
+        if let Some(t) = token {
+            self.tokens
+                .insert(0, ("admin".to_owned(), crate::config::token_digest(&t)));
+        }
         self
+    }
+
+    /// Integrity API tokens as `(name, SHA-256)` (`ServerConfig::tokens`, ADR 0026); replaces
+    /// every token set before.
+    pub fn with_api_tokens(mut self, tokens: Vec<(String, [u8; 32])>) -> Self {
+        self.tokens = tokens;
+        self
+    }
+
+    /// The name of the token `headers` authenticate with, if any. Every entry is compared, so the
+    /// time taken does not say which one matched.
+    pub(crate) fn token_name(&self, headers: &HeaderMap) -> Option<String> {
+        let given = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))?;
+        let digest = crate::config::token_digest(given);
+        let mut found = None;
+        for (name, expected) in &self.tokens {
+            let same = expected
+                .iter()
+                .zip(&digest)
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+            if same && found.is_none() {
+                found = Some(name.clone());
+            }
+        }
+        found
     }
 
     /// Credentials for the Plane's own upstream requests (`[upstream.auth]`).
@@ -669,6 +703,7 @@ impl Gateway {
     pub(crate) fn audit(&self, mut event: AuditEvent) {
         if event.actor.is_none() {
             event.actor = Some("plane".to_owned());
+            event.authenticated = true;
         }
         if let Err(e) = self.registry.audit(event) {
             tracing::warn!("audit write failed: {e}");
@@ -738,7 +773,7 @@ impl Gateway {
                 } else if let Some(reason) = disabled_reason(&doc, &identifier) {
                     // An operator disabled the domain (spec §19): forwarded unchecked.
                     let mut event = AuditEvent::new("COMMIT_UNCHECKED", Some(&identifier));
-                    event.actor = Some(actor_of(&headers));
+                    Actor::declared(&headers).stamp(&mut event);
                     event.detail = Some(format!("domain disabled: {reason}"));
                     self.audit(event);
                     self.proxy(method, path_and_query, &headers, body).await
@@ -1276,7 +1311,7 @@ impl Gateway {
             .map_err(log_error)?;
         fault::hit(FaultPoint::AfterPreparedLog);
         let base_snapshot = change.parent.map(|s| s.0);
-        let actor = actor_of(&headers);
+        let actor = Actor::declared(&headers);
         let abort = |mut e: ApiError, state: TxnState| -> ApiError {
             // The structured report goes to the audit log (`/v1/integrity/transactions/{id}`), not
             // into the Iceberg error body (RFC 0003).
@@ -1290,7 +1325,7 @@ impl Gateway {
                 "COMMIT_ABORTED"
             };
             let mut event = AuditEvent::new(kind, Some(&identifier));
-            event.actor = Some(actor.clone());
+            actor.stamp(&mut event);
             event.txn = Some(txn.0);
             event.base_snapshot = base_snapshot;
             event.verdict = Some(e.code.code().to_owned());
@@ -1518,7 +1553,7 @@ impl Gateway {
                 // The commit happened: answer now and write the indexes after, still holding the
                 // domain queue and the shared constraint lock (ADR 0022).
                 let mut event = AuditEvent::new("COMMIT_ACCEPTED", Some(&identifier));
-                event.actor = Some(actor.clone());
+                actor.stamp(&mut event);
                 event.txn = Some(txn.0);
                 event.base_snapshot = base_snapshot;
                 event.result_snapshot = Some(final_snapshot);
@@ -1547,7 +1582,7 @@ impl Gateway {
                     .finish(txn, TxnState::Aborted, c.decision())
                     .map_err(log_error)?;
                 let mut event = AuditEvent::new("COMMIT_ABORTED", Some(&identifier));
-                event.actor = Some(actor.clone());
+                actor.stamp(&mut event);
                 event.txn = Some(txn.0);
                 event.base_snapshot = base_snapshot;
                 event.verdict = Some(format!("upstream {}", c.status));
@@ -1656,8 +1691,47 @@ impl Drop for Finished<'_> {
     }
 }
 
-/// Who a request says it comes from: `X-Integrity-Actor`, else `User-Agent`. Not authenticated.
-pub(crate) fn actor_of(headers: &HeaderMap) -> String {
+/// Who caused an audited request (ADR 0026).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor {
+    /// The token's name, or the declared name.
+    pub name: String,
+    /// `name` is a token's.
+    pub authenticated: bool,
+    /// The declared name, when it is not `name`.
+    pub declared: Option<String>,
+}
+
+impl Actor {
+    /// What the request declares, unverified (commits, and an integrity API without tokens).
+    pub fn declared(headers: &HeaderMap) -> Self {
+        Self {
+            name: actor_of(headers),
+            authenticated: false,
+            declared: None,
+        }
+    }
+
+    /// The holder of the token named `name`; the request's declared name is kept beside it.
+    pub fn token(name: String, headers: &HeaderMap) -> Self {
+        let declared = declared_of(headers).filter(|d| *d != name);
+        Self {
+            name,
+            authenticated: true,
+            declared,
+        }
+    }
+
+    /// Records this actor in `event`.
+    pub(crate) fn stamp(&self, event: &mut AuditEvent) {
+        event.actor = Some(self.name.clone());
+        event.authenticated = self.authenticated;
+        event.declared_actor = self.declared.clone();
+    }
+}
+
+/// What a request declares about who sent it: `X-Integrity-Actor`, else `User-Agent`.
+fn declared_of(headers: &HeaderMap) -> Option<String> {
     let header = |name: &str| {
         headers
             .get(name)
@@ -1666,9 +1740,12 @@ pub(crate) fn actor_of(headers: &HeaderMap) -> String {
             .filter(|v| !v.is_empty())
             .map(|v| v.chars().take(200).collect::<String>())
     };
-    header("x-integrity-actor")
-        .or_else(|| header("user-agent"))
-        .unwrap_or_else(|| "unknown".to_owned())
+    header("x-integrity-actor").or_else(|| header("user-agent"))
+}
+
+/// Who a request says it comes from: `X-Integrity-Actor`, else `User-Agent`. Not authenticated.
+fn actor_of(headers: &HeaderMap) -> String {
+    declared_of(headers).unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// The reason the domain of `identifier` is disabled, if it is.

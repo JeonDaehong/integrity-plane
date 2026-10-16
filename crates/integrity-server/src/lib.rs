@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -72,13 +72,15 @@ fn peer_of(request: &Request) -> Option<IpAddr> {
         .map(|c| c.0.ip())
 }
 
-/// Lets an integrity API request through if it carries the token, unless its client failed to
-/// authenticate too often lately (RFC 0007).
-async fn admit(State(g): State<Arc<Gateway>>, request: Request, next: Next) -> Response {
-    if g.admin_token.is_some() {
+/// Lets an integrity API request through if it carries a token, unless its client failed to
+/// authenticate too often lately (RFC 0007), and tells the handler who sent it (ADR 0026).
+async fn admit(State(g): State<Arc<Gateway>>, mut request: Request, next: Next) -> Response {
+    let actor = if g.tokens.is_empty() {
+        gateway::Actor::declared(request.headers())
+    } else {
         let client = g.client(request.headers(), peer_of(&request));
         let now = Instant::now();
-        let refused = {
+        let admitted = {
             let mut failures = match g.limits.auth_failures.lock() {
                 Ok(f) => f,
                 Err(p) => p.into_inner(),
@@ -87,36 +89,24 @@ async fn admit(State(g): State<Arc<Gateway>>, request: Request, next: Next) -> R
                 g.metrics
                     .limited_auth
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Some(
+                Err(
                     error::ApiError::rate_limited("too many failed authentications", seconds)
                         .into_response(),
                 )
-            } else if authorized(&g, request.headers()) {
-                None
+            } else if let Some(name) = g.token_name(request.headers()) {
+                Ok(name)
             } else {
                 failures.failed(&client, now);
-                Some(unauthorized())
+                Err(unauthorized())
             }
         };
-        if let Some(response) = refused {
-            return response;
+        match admitted {
+            Ok(name) => gateway::Actor::token(name, request.headers()),
+            Err(response) => return response,
         }
-    }
-    next.run(request).await
-}
-
-/// Checks the bearer token, comparing digests so the comparison time does not depend on where
-/// the token differs.
-fn authorized(g: &Gateway, headers: &HeaderMap) -> bool {
-    let Some(token) = &g.admin_token else {
-        return true;
     };
-    let given = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    blake3::hash(given.as_bytes()) == blake3::hash(token.as_bytes())
+    request.extensions_mut().insert(actor);
+    next.run(request).await
 }
 
 fn unauthorized() -> Response {
@@ -134,7 +124,11 @@ async fn status(State(g): State<Arc<Gateway>>) -> Response {
     axum::Json(g.status().await).into_response()
 }
 
-async fn register(State(g): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn register(
+    State(g): State<Arc<Gateway>>,
+    Extension(actor): Extension<gateway::Actor>,
+    body: Bytes,
+) -> Response {
     let req: admin::RegisterRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -145,7 +139,7 @@ async fn register(State(g): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes
             .into_response();
         }
     };
-    reply(g.register(req, &headers).await)
+    reply(g.register(req, &actor).await)
 }
 
 async fn list_constraints(
@@ -157,18 +151,18 @@ async fn list_constraints(
 
 async fn drop_constraint(
     State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
+    Extension(actor): Extension<gateway::Actor>,
     Path(id): Path<u64>,
 ) -> Response {
-    reply(g.drop_constraint(id, &headers).await)
+    reply(g.drop_constraint(id, &actor).await)
 }
 
 async fn rebuild(
     State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
+    Extension(actor): Extension<gateway::Actor>,
     Path(id): Path<u64>,
 ) -> Response {
-    reply(g.rebuild(id, &headers).await)
+    reply(g.rebuild(id, &actor).await)
 }
 
 async fn audit(
@@ -224,7 +218,7 @@ async fn domain(State(g): State<Arc<Gateway>>, Path(table): Path<String>) -> Res
 
 async fn disable(
     State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
+    Extension(actor): Extension<gateway::Actor>,
     Path(table): Path<String>,
     body: Bytes,
 ) -> Response {
@@ -232,7 +226,7 @@ async fn disable(
         .ok()
         .and_then(|v| v["reason"].as_str().map(str::to_owned))
         .unwrap_or_default();
-    reply(g.disable(&table, &reason, &headers).await)
+    reply(g.disable(&table, &reason, &actor).await)
 }
 
 async fn keys(State(g): State<Arc<Gateway>>) -> Response {

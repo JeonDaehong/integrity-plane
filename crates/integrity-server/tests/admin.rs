@@ -31,6 +31,8 @@ struct Env {
     _shared: Shared,
     up: SocketAddr,
     token: Option<String>,
+    /// Named integrity API tokens `(name, token)` (ADR 0026).
+    named: Vec<(String, String)>,
     redact: bool,
     seed: Option<[u8; 32]>,
     running: Option<Running>,
@@ -42,10 +44,12 @@ struct Running {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[allow(clippy::too_many_arguments)] // test helper
 async fn start_gateway(
     files: &Files,
     up: SocketAddr,
     token: Option<&str>,
+    named: &[(String, String)],
     redact: bool,
     seed: Option<[u8; 32]>,
     index_file: &str,
@@ -81,6 +85,12 @@ async fn start_gateway(
         registry,
     )
     .unwrap()
+    .with_api_tokens(
+        named
+            .iter()
+            .map(|(n, t)| (n.clone(), integrity_server::config::token_digest(t)))
+            .collect(),
+    )
     .with_admin_token(token.map(str::to_owned))
     .with_redact_keys(redact)
     .with_signer(
@@ -118,6 +128,19 @@ async fn env_with(token: Option<&str>, redact: bool) -> Env {
 }
 
 async fn env_full(token: Option<&str>, redact: bool, seed: Option<[u8; 32]>) -> Env {
+    env_named(token, &[], redact, seed).await
+}
+
+async fn env_named(
+    token: Option<&str>,
+    named: &[(&str, &str)],
+    redact: bool,
+    seed: Option<[u8; 32]>,
+) -> Env {
+    let named: Vec<(String, String)> = named
+        .iter()
+        .map(|(n, t)| ((*n).to_owned(), (*t).to_owned()))
+        .collect();
     let files = Arc::new(Files {
         dir: Dir::new(),
         next: AtomicI64::new(1),
@@ -140,8 +163,17 @@ async fn env_full(token: Option<&str>, redact: bool, seed: Option<[u8; 32]>) -> 
             .with_state(Arc::clone(&shared)),
     )
     .await;
-    let (gateway, running) =
-        start_gateway(&files, up, token, redact, seed, "indexes.redb", "txn.redb").await;
+    let (gateway, running) = start_gateway(
+        &files,
+        up,
+        token,
+        &named,
+        redact,
+        seed,
+        "indexes.redb",
+        "txn.redb",
+    )
+    .await;
     Env {
         http: reqwest::Client::new(),
         gateway,
@@ -150,6 +182,7 @@ async fn env_full(token: Option<&str>, redact: bool, seed: Option<[u8; 32]>) -> 
         _shared: shared,
         up,
         token: token.map(str::to_owned),
+        named,
         redact,
         seed,
         running: Some(running),
@@ -168,6 +201,7 @@ impl Env {
             &self.files,
             self.up,
             self.token.as_deref(),
+            &self.named,
             self.redact,
             self.seed,
             index_file,
@@ -1028,6 +1062,83 @@ async fn a_disabled_domain_forwards_unchecked_until_rebuilt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn named_tokens_authenticate_their_holders() {
+    let e = env_named(
+        Some("shared"),
+        &[("alice", "alice-token"), ("bob", "bob-token")],
+        false,
+        None,
+    )
+    .await;
+    let post = |token: &str, declared: Option<&str>, name: &str| {
+        let mut req = e
+            .http
+            .post(format!("{}/v1/integrity/constraints", e.gateway))
+            .bearer_auth(token)
+            .json(
+                &json!({"table": "db.customer", "name": name, "type": "UNIQUE", "columns": ["id"]}),
+            );
+        if let Some(d) = declared {
+            req = req.header("x-integrity-actor", d);
+        }
+        req.send()
+    };
+    // Alice says she is Mallory: the token decides, the claim is kept beside it.
+    assert_eq!(
+        post("alice-token", Some("mallory"), "u1")
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        post("bob-token", Some("bob"), "u2").await.unwrap().status(),
+        200
+    );
+    assert_eq!(
+        post("shared", Some("carol"), "u3").await.unwrap().status(),
+        200
+    );
+    assert_eq!(
+        post("nobody", Some("alice"), "u4").await.unwrap().status(),
+        401
+    );
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+
+    let audit: Value = e
+        .http
+        .get(format!("{}/v1/integrity/audit", e.gateway))
+        .bearer_auth("bob-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let events = audit["events"].as_array().unwrap();
+    let registered: Vec<(&Value, &Value, &Value)> = events
+        .iter()
+        .filter(|ev| ev["kind"] == "CONSTRAINT_REGISTERED")
+        .map(|ev| (&ev["actor"], &ev["authenticated"], &ev["declared_actor"]))
+        .collect();
+    assert_eq!(
+        registered,
+        [
+            (&json!("alice"), &json!(true), &json!("mallory")),
+            (&json!("bob"), &json!(true), &Value::Null),
+            (&json!("admin"), &json!(true), &json!("carol")),
+        ],
+        "{audit}"
+    );
+    // Writers are not authenticated by the Plane.
+    let commit = events
+        .iter()
+        .find(|ev| ev["kind"] == "COMMIT_ACCEPTED")
+        .unwrap();
+    assert_eq!(commit["authenticated"], false, "{commit}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn audit_events_name_their_actor() {
     let e = env(None).await;
     let r = e
@@ -1051,6 +1162,14 @@ async fn audit_events_name_their_actor() {
             .clone()
     };
     assert_eq!(actor("CONSTRAINT_REGISTERED"), "alice");
+    // No token configured: declared, not authenticated (ADR 0026).
+    let registered = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ev| ev["kind"] == "CONSTRAINT_REGISTERED")
+        .unwrap();
+    assert_eq!(registered["authenticated"], false);
     // Without the header, the client's User-Agent (reqwest sends none by default: "unknown").
     assert!(actor("COMMIT_ACCEPTED").is_string());
 }

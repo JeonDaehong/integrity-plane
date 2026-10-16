@@ -80,14 +80,21 @@ the API token stays inside the Plane.
 ### The integrity API
 
 Registering, dropping and rebuilding constraints change what is enforced; `verify` and `rebuild`
-are expensive. Set `[server] admin_token` so `/v1/integrity/*` (except `status`) requires
-`Authorization: Bearer <token>`, and keep the API off untrusted networks either way. Without a
-token the API is open to anyone who can reach the gateway. The token is compared by digest; ten failed
-attempts within a minute lock the client out until that minute ends (RFC 0007), so guessing is
-slow from one address. One `verify` runs at a time. Audit events name an actor, but it is whatever the request declares
-(`X-Integrity-Actor` or `User-Agent`): useful for attribution among cooperating operators, not
-evidence. Disabling a domain (spec §19) switches enforcement off for it until a rebuild; it is a
-privileged, audited action and must be restricted like the rest of the API.
+are expensive. Give each operator a token of their own (`[[server.api_tokens]]`, ADR 0026;
+`[server] admin_token` is one named `admin`) so `/v1/integrity/*` (except `status`, `keys` and
+`/metrics`) requires `Authorization: Bearer <token>`, and keep the API off untrusted networks
+either way. Without a token the API is open to anyone who can reach the gateway. Tokens are
+compared by digest and may be configured as their SHA-256 only; ten failed attempts within a
+minute lock the client out until that minute ends (RFC 0007), so guessing is slow from one
+address. One `verify` runs at a time.
+
+Audit events of the integrity API name the token's holder (`actor`, `authenticated: true`); what
+the request declared (`X-Integrity-Actor` or `User-Agent`) is kept as `declared_actor` when it
+differs. Anyone holding a token acts as its holder: revoke by removing the entry and restarting.
+Commit events name only what the writer declared (`authenticated: false`): writers authenticate to
+the catalog, not to the Plane, so the catalog's log is the evidence of who wrote. Disabling a domain
+(spec §19) switches enforcement off for it until a rebuild; it is a privileged, audited action and
+must be restricted like the rest of the API.
 
 ### Control-store damage or loss
 

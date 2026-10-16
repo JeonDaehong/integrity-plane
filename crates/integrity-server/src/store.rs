@@ -175,10 +175,18 @@ pub struct AuditEvent {
     pub at_ms: u64,
     /// `CONSTRAINT_REGISTERED`, `COMMIT_ACCEPTED`, …
     pub kind: String,
-    /// Who caused the event, as the request stated it (`X-Integrity-Actor`, else the client's
-    /// `User-Agent`); `plane` for the Plane's own actions. Not authenticated.
+    /// Who caused the event (ADR 0026): the name of the integrity API token the request
+    /// authenticated with, `plane` for the Plane's own actions, else what the request stated
+    /// (`X-Integrity-Actor`, else the client's `User-Agent`).
     #[serde(default)]
     pub actor: Option<String>,
+    /// Whether `actor` was established by the Plane (a token's name, or `plane`) rather than
+    /// declared by the request. False for events written before ADR 0026.
+    #[serde(default)]
+    pub authenticated: bool,
+    /// What the request declared, when that is not `actor`: unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_actor: Option<String>,
     /// Table identifier.
     pub table: Option<String>,
     /// Transaction id.
@@ -209,6 +217,8 @@ impl AuditEvent {
             at_ms: 0,
             kind: kind.to_owned(),
             actor: None,
+            authenticated: false,
+            declared_actor: None,
             table: table.map(str::to_owned),
             txn: None,
             constraints: Vec::new(),

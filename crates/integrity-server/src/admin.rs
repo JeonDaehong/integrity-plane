@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::config::{ConstraintConfig, ReferenceConfig};
 use crate::error::ApiError;
-use crate::gateway::{Gateway, Loaded, TablePath, actor_of};
+use crate::gateway::{Actor, Gateway, Loaded, TablePath};
 use crate::onboard::{self, Member, ScanOutcome};
 use crate::registry;
 use crate::store::{Anchor, AuditEvent, StoreError};
@@ -180,11 +180,7 @@ impl Gateway {
     }
 
     /// Registers a constraint, onboarding its domain (spec §20).
-    pub async fn register(
-        &self,
-        req: RegisterRequest,
-        headers: &HeaderMap,
-    ) -> Result<Value, ApiError> {
+    pub async fn register(&self, req: RegisterRequest, actor: &Actor) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
         self.recover(&HeaderMap::new(), None).await?;
         let doc = self.registry.snapshot();
@@ -299,7 +295,7 @@ impl Gateway {
             Ok(s) => s,
             Err(report) => {
                 let mut event = AuditEvent::new("CONSTRAINT_REJECTED", Some(&config.table));
-                event.actor = Some(actor_of(headers));
+                actor.stamp(&mut event);
                 event.constraints = vec![config.id];
                 event.verdict = Some(ErrorCode::OnboardingViolations.code().to_owned());
                 event.detail = Some(report.to_string());
@@ -340,7 +336,7 @@ impl Gateway {
         self.clear_transient(&members);
         self.reset_domains();
         let mut event = AuditEvent::new("CONSTRAINT_REGISTERED", Some(&config.table));
-        event.actor = Some(actor_of(headers));
+        actor.stamp(&mut event);
         event.constraints = vec![config.id];
         event.detail = Some(format!("onboarded {}", join(&members)));
         self.audit(event);
@@ -348,7 +344,7 @@ impl Gateway {
     }
 
     /// Drops a constraint. A PK/UNIQUE that a foreign key references cannot be dropped first.
-    pub async fn drop_constraint(&self, id: u64, headers: &HeaderMap) -> Result<Value, ApiError> {
+    pub async fn drop_constraint(&self, id: u64, actor: &Actor) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
         self.recover(&HeaderMap::new(), None).await?;
         let doc = self.registry.snapshot();
@@ -384,7 +380,7 @@ impl Gateway {
         })?;
         self.reset_domains();
         let mut event = AuditEvent::new("CONSTRAINT_DROPPED", Some(&config.table));
-        event.actor = Some(actor_of(headers));
+        actor.stamp(&mut event);
         event.constraints = vec![id];
         self.audit(event);
         Ok(json!(config))
@@ -392,7 +388,7 @@ impl Gateway {
 
     /// Rebuilds the indexes of the domain of constraint `id` from the data and re-anchors its
     /// tables (spec §19). On violations the domain stays (or becomes) degraded.
-    pub async fn rebuild(&self, id: u64, headers: &HeaderMap) -> Result<Value, ApiError> {
+    pub async fn rebuild(&self, id: u64, actor: &Actor) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
         self.recover(&HeaderMap::new(), None).await?;
         let doc = self.registry.snapshot();
@@ -412,7 +408,7 @@ impl Gateway {
                     Ok::<_, ApiError>(())
                 })?;
                 let mut event = AuditEvent::new("DOMAIN_DEGRADED", Some(&config.table));
-                event.actor = Some(actor_of(headers));
+                actor.stamp(&mut event);
                 event.verdict = Some(ErrorCode::OnboardingViolations.code().to_owned());
                 event.detail = Some(report.to_string());
                 self.audit(event);
@@ -450,7 +446,7 @@ impl Gateway {
             })
             .collect();
         let mut event = AuditEvent::new("INDEX_REBUILT", Some(&config.table));
-        event.actor = Some(actor_of(headers));
+        actor.stamp(&mut event);
         event.constraints = scanned.constraints.clone();
         event.detail = Some(Value::Array(relinks.clone()).to_string());
         self.audit(event);
@@ -464,7 +460,7 @@ impl Gateway {
         &self,
         table: &str,
         reason: &str,
-        headers: &HeaderMap,
+        actor: &Actor,
     ) -> Result<Value, ApiError> {
         let _exclusive = self.admin.write().await;
         let doc = self.registry.snapshot();
@@ -486,7 +482,7 @@ impl Gateway {
         })?;
         self.reset_domains();
         let mut event = AuditEvent::new("DOMAIN_DISABLED", Some(table));
-        event.actor = Some(actor_of(headers));
+        actor.stamp(&mut event);
         event.detail = Some(format!("{reason} (tables: {})", join(&members)));
         self.audit(event);
         Ok(json!({ "domain": members, "state": "Disabled", "reason": reason }))

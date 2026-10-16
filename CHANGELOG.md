@@ -14,6 +14,11 @@
   (ADR 0025): its merged keys, probes, staged writes and key delta digest go through runs that
   spill to scratch beyond `limits.scan_memory`, so an append's memory no longer grows with the
   keys it adds. Commits of several snapshots keep the previous path.
+- Named integrity API tokens (ADR 0026): `[[server.api_tokens]]` entries with a `name` and a
+  `token` or its `token_sha256`; `admin_token` is the token named `admin`. Audit events of the API
+  name the token's holder as `actor` with `authenticated: true`, and keep a differing
+  `X-Integrity-Actor`/`User-Agent` as `declared_actor`. Commit events stay declared
+  (`authenticated: false`).
 - Request limits (RFC 0007, new code INT-017 `RATE_LIMITED`, HTTP 429 with `Retry-After`):
   at most `[limits] max_queued_commits` (default 32) commits wait for one domain; an optional
   `commits_per_client` rate per client (peer address, or `client_header` behind a proxy); ten
