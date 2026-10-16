@@ -49,7 +49,8 @@ real files with tiny memory budgets (`integrity-server/tests/commit_scan.rs`).
   budget.
 - Intra-commit duplicate keys are still kept in memory for the violation report (one entry per
   duplicate key, as before).
-- `verify` still recomputes certificates with `net_key_deltas` over rows read whole.
+- `verify` still recomputed certificates with `net_key_deltas` over rows read whole; since
+  2026-10-16 it streams and merges them like a commit's (`Streamed::key_delta_digest`).
 
 ## Alternatives considered
 

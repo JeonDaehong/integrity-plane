@@ -294,6 +294,41 @@ impl Digesting {
 }
 
 impl CommitScan<'_> {
+    /// The key delta digest of the merged keys alone, without deciding anything: what
+    /// [`Validator::net_key_deltas`](crate::Validator::net_key_deltas) digests for the same rows,
+    /// read back one key at a time. `verify` recomputes certificates with it. Fails like
+    /// [`CommitScan::decide`] on the errors the rows had.
+    pub fn key_delta_digest(
+        self,
+        merged: &BTreeMap<ConstraintId, MergedKeys>,
+    ) -> Result<Result<Digest, InvalidCertificate>, ValidationError> {
+        if let Some((_, e)) = self.errors.into_iter().next() {
+            return Err(e);
+        }
+        let keyed = self
+            .ctx
+            .own
+            .iter()
+            .filter(|rc| rc.constraint.kind.key().is_some());
+        let mut digest = match KeyDeltaDigest::new(keyed.clone().count()) {
+            Ok(d) => Digesting::Here(Box::new(d)),
+            Err(e) => Digesting::Failed(e),
+        };
+        for rc in keyed {
+            let id = rc.constraint.id;
+            let m = merged.get(&id);
+            digest.constraint(id, m.map_or(0, |m| m.changes));
+            for_each_batch(m.map(|m| &m.run), 4096, |batch| {
+                digest.changes(batch);
+                Ok(())
+            })?;
+        }
+        Ok(match digest {
+            Digesting::Here(d) => d.finish(),
+            Digesting::Failed(e) => Err(e),
+        })
+    }
+
     /// [`CommitScan::counts`] for every key of `merged`, then [`CommitScan::decide`], then
     /// staging, with bounded memory (ADR 0025). `merged` holds, per keyed constraint, its merged
     /// keys (at least those [`CommitScan::counts_matter`]; a constraint without an entry has none).

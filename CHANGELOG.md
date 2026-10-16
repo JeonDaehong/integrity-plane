@@ -14,6 +14,9 @@
   (ADR 0025): its merged keys, probes, staged writes and key delta digest go through runs that
   spill to scratch beyond `limits.scan_memory`, so an append's memory no longer grows with the
   keys it adds. Commits of several snapshots keep the previous path.
+- `verify` streams each snapshot's rows and sorts their keys within `limits.scan_memory`, spilling
+  to scratch, instead of reading them whole: verifying a table no longer needs memory for the rows
+  of its largest snapshot.
 
 ## 0.0.2 — 2026-10-14
 

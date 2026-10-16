@@ -594,6 +594,20 @@ impl<'a> Streamed<'a> {
         Ok((decided, rows))
     }
 
+    /// The RFC 0002 key delta digest of the step's rows, read and merged like
+    /// [`Streamed::validate_bounded`] reads them, without probing anything: what `verify`
+    /// recomputes. Unlike validating, it does not check the rows against the declared operation
+    /// (pass [`Operation::Overwrite`]: a certificate covers the rows, whatever the summary says).
+    pub fn key_delta_digest(
+        &self,
+        io: &impl FileIo,
+        changes: &FileChanges,
+    ) -> Result<Result<Digest, InvalidCertificate>, ApiError> {
+        let (scan, runs, _) = self.merged(io, changes)?;
+        let runs: BTreeMap<ConstraintId, MergedKeys> = runs.into_iter().collect();
+        scan.key_delta_digest(&runs).map_err(invalid)
+    }
+
     /// Reads, checks and sorts both sides of the step, and merges each keyed constraint's sides
     /// into a run of the keys that matter ([`counted_value`] records), in [`CommitScan::keyed`]
     /// order. Also returns the number of rows read.

@@ -3,21 +3,25 @@
 //! Walks `main` back from its head to where the chain starts (an anchor without a certificate, or
 //! the first snapshot) and recomputes every certificate from the data files: the constraint set of
 //! the version the snapshot names, the key delta of its file changes, and its parent's certificate.
-//! Nothing is taken from the Plane's indexes or transaction log.
+//! Nothing is taken from the Plane's indexes or transaction log. Rows are streamed and their keys
+//! sorted within [`Input::memory`], spilling to [`Input::scratch`] (as commit validation does,
+//! ADR 0019 and 0025), so a snapshot's size does not bound what can be verified.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use integrity_core::{
     CertificateInput, Digest, SUMMARY_CONSTRAINT_SET_VERSION, certificate, constraint_set_digest,
-    key_delta_digest, parse_table_uuid,
+    parse_table_uuid,
 };
 use integrity_iceberg::snapshot_certificate;
-use integrity_iceberg::{Budgeted, FileIo, TableMetadata, commit_rows, diff_snapshots};
+use integrity_iceberg::{Budgeted, FileIo, Operation, TableMetadata, diff_snapshots};
 use integrity_types::{ConstraintSetVersion, SnapshotId};
 use integrity_validator::Validator;
 use serde::Serialize;
 
 use crate::config::ConstraintConfig;
+use crate::pipeline::Streamed;
 use crate::registry;
 
 /// The verdict on one snapshot.
@@ -105,6 +109,10 @@ pub struct Input {
     pub trusted_keys: Vec<[u8; 32]>,
     /// Unsigned snapshots and unknown keys break the chain.
     pub require_signatures: bool,
+    /// Directory for sorted runs that outgrow `memory`.
+    pub scratch: PathBuf,
+    /// Bytes of keys kept in memory per snapshot before spilling (`limits.scan_memory`).
+    pub memory: usize,
 }
 
 fn signature_status(input: &Input, snapshot: SnapshotId, cert: &Digest) -> SignatureStatus {
@@ -305,19 +313,22 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                 .ok_or("snapshot without manifest list")?;
             let changes =
                 diff_snapshots(&io, parent_list.as_deref(), list).map_err(|e| e.to_string())?;
-            let rows = commit_rows(
-                &io,
-                version.table.clone(),
-                SnapshotId(id),
-                &changes,
-                &version.columns,
-            )
-            .map_err(|e| e.to_string())?;
-            let deltas = version
-                .validator
-                .net_key_deltas(&rows)
+            if !changes.equality_deletes.is_empty() {
+                return Err("key deltas of equality deletes depend on index state".into());
+            }
+            let streamed = Streamed {
+                validator: &version.validator,
+                table: &version.table,
+                snapshot: SnapshotId(id),
+                operation: Operation::Overwrite,
+                columns: &version.columns,
+                scratch: &input.scratch,
+                memory: input.memory,
+            };
+            let key_delta = streamed
+                .key_delta_digest(&io, &changes)
+                .map_err(|e| e.message)?
                 .map_err(|e| e.to_string())?;
-            let key_delta = key_delta_digest(&deltas).map_err(|e| e.to_string())?;
             let uuid = uuid.map_err(|e| e.to_string())?;
             Ok(certificate(&CertificateInput {
                 table_uuid: uuid,

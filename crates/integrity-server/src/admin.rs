@@ -575,6 +575,8 @@ impl Gateway {
             anchors,
             trusted_keys,
             require_signatures: require_signatures || self.require_signatures,
+            scratch: self.store.scratch_dir().to_path_buf(),
+            memory: self.scan_memory,
         };
         let io = Arc::clone(&self.io);
         let report = tokio::task::spawn_blocking(move || verify::verify(io.as_ref(), &input))

@@ -26,7 +26,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   commit of one snapshot is then decided, staged, logged and applied in chunks (ADR 0025), so large
   appends and rewrites need scratch disk instead of memory. A commit of several snapshots still
   holds the keys it changes in memory after sorting them, and one with equality deletes is read
-  whole. `verify` reads the rows of each snapshot it recomputes whole.
+  whole. `verify` streams each snapshot's rows the same way (one snapshot at a time, each within
+  `limits.scan_memory`, beside any commits validating at the same time).
 - One domain commits about 80 times per second with one writer on the benchmark machine, and about
   25 times per second when 16 writers race on one table (about a third of the same race without
   the Plane; `benchmarks.md`).

@@ -3,7 +3,8 @@
 //! overwrites of a table with a PRIMARY KEY, a UNIQUE key and a NOT NULL column, with files of
 //! several row groups and memory budgets small enough to spill many sorted runs. Both must reach
 //! the same decision with the same details, or fail with the same code. Deciding in chunks (ADR
-//! 0025) must also stage the same writes and digest the same key delta.
+//! 0025) must also stage the same writes and digest the same key delta, and the digest `verify` streams for any snapshot
+//! (accepted or not) must equal the one of `net_key_deltas` over the rows read whole.
 
 #![allow(clippy::unwrap_used)] // test helpers outside #[test] fns
 
@@ -268,7 +269,34 @@ fn compare(
             .map(|d| describe(d, &indexes))
             .map_err(|e| format!("{:?}", e.code()))
     })();
+    // What `verify` recomputes: the digest alone, whatever the decision and the operation.
+    let whole_digest: Result<String, String> = commit_rows(
+        &Local,
+        table.clone(),
+        SnapshotId(new_id),
+        &changes,
+        &columns,
+    )
+    .map_err(|e| format!("{:?}", e.code()))
+    .and_then(|rows| {
+        validator
+            .net_key_deltas(&rows)
+            .map_err(|e| format!("{:?}", e.code()))
+    })
+    .map(|deltas| format!("{:?}", integrity_core::key_delta_digest(&deltas)));
     let scratch = Dir::new();
+    let streamed_digest: Result<String, String> = Streamed {
+        validator: &validator,
+        table: &table,
+        snapshot: SnapshotId(new_id),
+        operation: Operation::Overwrite,
+        columns: &columns,
+        scratch: &scratch.0,
+        memory,
+    }
+    .key_delta_digest(&Local, &changes)
+    .map(|d| format!("{d:?}"))
+    .map_err(|e| format!("{:?}", e.code));
     let streamed = Streamed {
         validator: &validator,
         table: &table,
@@ -297,6 +325,10 @@ fn compare(
         Err(format!("streamed {streamed:?}\n   whole {whole:?}"))
     } else if bounded != whole {
         Err(format!("bounded {bounded:?}\n   whole {whole:?}"))
+    } else if streamed_digest != whole_digest {
+        Err(format!(
+            "streamed digest {streamed_digest:?}\n   whole digest {whole_digest:?}"
+        ))
     } else {
         Ok(())
     }

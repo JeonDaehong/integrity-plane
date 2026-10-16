@@ -130,8 +130,11 @@ operations take a lock that every commit holds shared, so they never interleave 
 `GET /v1/integrity/verify?table=` walks `main` back from its head to the chain start (an uncertified
 current or retired anchor, or the first snapshot) and recomputes every certificate from the data:
 the constraint set of the version named in the snapshot summary (from the registry's version
-history), the key delta of the snapshot's file changes (`Validator::net_key_deltas`, checked against
-validation in the differential tests), and the parent's certificate. Each snapshot is `OK`,
+history), the key delta of the snapshot's file changes, and the parent's certificate. The key delta
+is read like commit validation reads it: rows streamed, keys sorted within `limits.scan_memory`
+and spilled to scratch beyond it, merged and digested one key at a time
+(`CommitScan::key_delta_digest`, checked against `Validator::net_key_deltas` over the rows read
+whole in the differential tests). Each snapshot is `OK`,
 `ANCHOR`, `MISSING` (written without the Plane), `MISMATCH` (forged or tampered), `MALFORMED` or
 `UNVERIFIABLE` (equality deletes; expired history). A broken chain degrades the domain like a
 bypass detected at commit time.
