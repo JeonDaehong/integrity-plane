@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod fileio;
 pub mod gateway;
+pub mod limits;
 pub mod metrics;
 pub mod onboard;
 pub mod pipeline;
@@ -19,21 +20,26 @@ pub mod store;
 pub mod verify;
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 
 pub use gateway::Gateway;
 
-/// The HTTP router: the integrity API plus the catalog API (everything else).
+/// The HTTP router: the integrity API plus the catalog API (everything else). Serve it with
+/// `into_make_service_with_connect_info::<SocketAddr>()` so request limits know each client's
+/// address (RFC 0007).
 pub fn router(gateway: Arc<Gateway>) -> Router {
-    Router::new()
-        .route("/v1/integrity/status", get(status))
+    // Behind the bearer token, if one is set.
+    let api = Router::new()
         .route(
             "/v1/integrity/constraints",
             post(register).get(list_constraints),
@@ -45,10 +51,58 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/v1/integrity/transactions/{id}", get(transaction))
         .route("/v1/integrity/domains/{table}", get(domain))
         .route("/v1/integrity/domains/{table}/disable", post(disable))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            admit,
+        ));
+    Router::new()
+        .route("/v1/integrity/status", get(status))
         .route("/metrics", get(metrics))
         .route("/v1/integrity/keys", get(keys))
+        .merge(api)
         .fallback(catalog)
         .with_state(gateway)
+}
+
+/// The connection's peer address, when the router is served with connect info.
+fn peer_of(request: &Request) -> Option<IpAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+}
+
+/// Lets an integrity API request through if it carries the token, unless its client failed to
+/// authenticate too often lately (RFC 0007).
+async fn admit(State(g): State<Arc<Gateway>>, request: Request, next: Next) -> Response {
+    if g.admin_token.is_some() {
+        let client = g.client(request.headers(), peer_of(&request));
+        let now = Instant::now();
+        let refused = {
+            let mut failures = match g.limits.auth_failures.lock() {
+                Ok(f) => f,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(seconds) = failures.locked(&client, now) {
+                g.metrics
+                    .limited_auth
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(
+                    error::ApiError::rate_limited("too many failed authentications", seconds)
+                        .into_response(),
+                )
+            } else if authorized(&g, request.headers()) {
+                None
+            } else {
+                failures.failed(&client, now);
+                Some(unauthorized())
+            }
+        };
+        if let Some(response) = refused {
+            return response;
+        }
+    }
+    next.run(request).await
 }
 
 /// Checks the bearer token, comparing digests so the comparison time does not depend on where
@@ -81,9 +135,6 @@ async fn status(State(g): State<Arc<Gateway>>) -> Response {
 }
 
 async fn register(State(g): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     let req: admin::RegisterRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -99,12 +150,8 @@ async fn register(State(g): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes
 
 async fn list_constraints(
     State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     axum::Json(g.constraints(q.get("table").map(String::as_str))).into_response()
 }
 
@@ -113,9 +160,6 @@ async fn drop_constraint(
     headers: HeaderMap,
     Path(id): Path<u64>,
 ) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     reply(g.drop_constraint(id, &headers).await)
 }
 
@@ -124,20 +168,13 @@ async fn rebuild(
     headers: HeaderMap,
     Path(id): Path<u64>,
 ) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     reply(g.rebuild(id, &headers).await)
 }
 
 async fn audit(
     State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     let since = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
     // Commits already answered are in the log once finished (ADR 0022).
     g.settled().await;
@@ -146,12 +183,8 @@ async fn audit(
 
 async fn verify(
     State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     let Some(table) = q.get("table") else {
         return (
             StatusCode::BAD_REQUEST,
@@ -176,14 +209,7 @@ fn not_found(what: &str) -> Response {
         .into_response()
 }
 
-async fn transaction(
-    State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
-    Path(id): Path<u64>,
-) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
+async fn transaction(State(g): State<Arc<Gateway>>, Path(id): Path<u64>) -> Response {
     g.settled().await;
     g.transaction(id).map_or_else(
         || not_found("transaction"),
@@ -191,14 +217,7 @@ async fn transaction(
     )
 }
 
-async fn domain(
-    State(g): State<Arc<Gateway>>,
-    headers: HeaderMap,
-    Path(table): Path<String>,
-) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
+async fn domain(State(g): State<Arc<Gateway>>, Path(table): Path<String>) -> Response {
     g.domain_state(&table)
         .map_or_else(|| not_found("domain"), |v| axum::Json(v).into_response())
 }
@@ -209,9 +228,6 @@ async fn disable(
     Path(table): Path<String>,
     body: Bytes,
 ) -> Response {
-    if !authorized(&g, &headers) {
-        return unauthorized();
-    }
     let reason = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v["reason"].as_str().map(str::to_owned))
@@ -235,6 +251,7 @@ async fn metrics(State(g): State<Arc<Gateway>>) -> Response {
 }
 
 async fn catalog(State(g): State<Arc<Gateway>>, request: Request) -> Response {
+    let peer = peer_of(&request);
     let (parts, body) = request.into_parts();
     let path_and_query = parts
         .uri
@@ -245,5 +262,6 @@ async fn catalog(State(g): State<Arc<Gateway>>, request: Request) -> Response {
         Ok(b) => b,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
-    g.handle(parts.method, &path_and_query, headers, body).await
+    g.handle(parts.method, &path_and_query, headers, body, peer)
+        .await
 }

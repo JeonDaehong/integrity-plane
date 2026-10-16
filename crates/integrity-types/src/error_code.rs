@@ -38,11 +38,13 @@ pub enum ErrorCode {
     BypassDetected,
     /// `INT-016`: a manifest or data file of the commit could not be read (RFC 0003).
     StorageReadFailed,
+    /// `INT-017`: a request limit was reached; nothing was forwarded (RFC 0007).
+    RateLimited,
 }
 
 impl ErrorCode {
     /// Every code, in numeric order.
-    pub const ALL: [ErrorCode; 16] = [
+    pub const ALL: [ErrorCode; 17] = [
         ErrorCode::InvalidConstraint,
         ErrorCode::ConstraintNotFound,
         ErrorCode::DuplicatePrimaryKey,
@@ -59,6 +61,7 @@ impl ErrorCode {
         ErrorCode::ValidationBudgetExceeded,
         ErrorCode::BypassDetected,
         ErrorCode::StorageReadFailed,
+        ErrorCode::RateLimited,
     ];
 
     /// The numeric part of the code, e.g. `5` for `INT-005`.
@@ -80,6 +83,7 @@ impl ErrorCode {
             ErrorCode::ValidationBudgetExceeded => 14,
             ErrorCode::BypassDetected => 15,
             ErrorCode::StorageReadFailed => 16,
+            ErrorCode::RateLimited => 17,
         }
     }
 
@@ -102,6 +106,7 @@ impl ErrorCode {
             ErrorCode::ValidationBudgetExceeded => "INT-014",
             ErrorCode::BypassDetected => "INT-015",
             ErrorCode::StorageReadFailed => "INT-016",
+            ErrorCode::RateLimited => "INT-017",
         }
     }
 
@@ -124,6 +129,7 @@ impl ErrorCode {
             ErrorCode::ValidationBudgetExceeded => "VALIDATION_BUDGET_EXCEEDED",
             ErrorCode::BypassDetected => "BYPASS_DETECTED",
             ErrorCode::StorageReadFailed => "STORAGE_READ_FAILED",
+            ErrorCode::RateLimited => "RATE_LIMITED",
         }
     }
 
@@ -167,9 +173,9 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The spec §24 table (plus INT-016 from RFC 0003), verbatim. Changing an existing row means
+    /// The spec §24 table (plus INT-016 from RFC 0003 and INT-017 from RFC 0007), verbatim. Changing an existing row means
     /// breaking a public contract; new codes are appended.
-    const SPEC_TABLE: [(&str, &str); 16] = [
+    const SPEC_TABLE: [(&str, &str); 17] = [
         ("INT-001", "INVALID_CONSTRAINT"),
         ("INT-002", "CONSTRAINT_NOT_FOUND"),
         ("INT-003", "DUPLICATE_PRIMARY_KEY"),
@@ -186,6 +192,7 @@ mod tests {
         ("INT-014", "VALIDATION_BUDGET_EXCEEDED"),
         ("INT-015", "BYPASS_DETECTED"),
         ("INT-016", "STORAGE_READ_FAILED"),
+        ("INT-017", "RATE_LIMITED"),
     ];
 
     #[test]
@@ -211,7 +218,7 @@ mod tests {
             assert_eq!(ErrorCode::from_code(c.code()), Ok(c));
             assert_eq!(ErrorCode::from_name(c.name()), Ok(c));
         }
-        assert_eq!(ErrorCode::from_code("INT-017"), Err(UnknownErrorCode));
+        assert_eq!(ErrorCode::from_code("INT-018"), Err(UnknownErrorCode));
         assert_eq!(ErrorCode::from_code("int-001"), Err(UnknownErrorCode));
         assert_eq!(ErrorCode::from_name("FOREIGN_KEY"), Err(UnknownErrorCode));
     }

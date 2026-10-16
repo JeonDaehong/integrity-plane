@@ -119,6 +119,40 @@ impl Client {
     }
 }
 
+impl Client {
+    /// One append of `rows` on the table's current head, without retrying: its status and
+    /// `Retry-After`.
+    async fn append_once(&self, table: &str, rows: &[Row]) -> (u16, Option<String>) {
+        let head = self.head(table).await;
+        let mut manifests = head
+            .map(|h| self.files.manifests_of.lock().unwrap()[&h].clone())
+            .unwrap_or_default();
+        manifests.push(self.files.manifest(rows));
+        let (id, list) = self.files.list(&manifests);
+        let body = json!({
+            "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": head}],
+            "updates": [
+                {"action": "add-snapshot", "snapshot": {"snapshot-id": id, "parent-snapshot-id": head,
+                    "sequence-number": id, "timestamp-ms": id, "manifest-list": list,
+                    "summary": {"operation": "append"}}},
+                {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": id, "type": "branch"}
+            ]
+        });
+        let r = self
+            .http
+            .post(format!("{}/v1/namespaces/db/tables/{table}", self.gateway))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let retry = r
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_owned());
+        (r.status().as_u16(), retry)
+    }
+}
+
 fn manifests_with(files: &Files, current: &[String], pred: impl Fn(&Row) -> bool) -> Vec<String> {
     let rows = files.rows_of.lock().unwrap();
     current
@@ -162,6 +196,16 @@ struct Env {
 }
 
 async fn env(tables: &[(&str, &str)], constraints: Vec<ConstraintConfig>) -> Env {
+    env_limited(tables, constraints, 32, None).await
+}
+
+/// [`env`] with request limits (RFC 0007).
+async fn env_limited(
+    tables: &[(&str, &str)],
+    constraints: Vec<ConstraintConfig>,
+    max_queued_commits: usize,
+    commits_per_client: Option<u32>,
+) -> Env {
     let files = Arc::new(Files {
         dir: Dir::new(),
         next: AtomicI64::new(1),
@@ -198,9 +242,14 @@ async fn env(tables: &[(&str, &str)], constraints: Vec<ConstraintConfig>) -> Env
             1 << 30,
             Registry::open(control.join("registry.redb"), &constraints).unwrap(),
         )
-        .unwrap(),
+        .unwrap()
+        .with_request_limits(max_queued_commits, commits_per_client, None),
     );
-    let gw = serve(router(Arc::clone(&gateway))).await;
+    // Served as the server binary serves it: with peer addresses.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = listener.local_addr().unwrap();
+    let app = router(Arc::clone(&gateway)).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Env {
         upstream: shared,
         client: Client {
@@ -547,4 +596,77 @@ async fn domains_commit_in_parallel_and_each_domain_is_serial() {
         Some("/v1/namespaces/db/tables/b"),
         "b committed first: {history:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_domain_queue_refuses_commits_before_forwarding_them() {
+    let env = env_limited(
+        &[("a", "00000000-0000-4000-8000-00000000000a")],
+        vec![constraint(1, "db.a", "primary_key", vec![1], None)],
+        1,
+        None,
+    )
+    .await;
+    let client = Arc::new(env.client);
+    let gate = Arc::new(Semaphore::new(0));
+    env.upstream
+        .lock()
+        .unwrap()
+        .gates
+        .insert("/v1/namespaces/db/tables/a".into(), Arc::clone(&gate));
+
+    // The first commit holds the queue (held upstream), the second waits for it.
+    let c = Arc::clone(&client);
+    let holding = tokio::spawn(async move { c.append_once("a", &[(1, None)]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let c = Arc::clone(&client);
+    let waiting = tokio::spawn(async move { c.append_once("a", &[(2, None)]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A third finds one waiting already: refused at once.
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.append_once("a", &[(3, None)]),
+    )
+    .await
+    .expect("a refused commit waited for the queue");
+    assert_eq!(refused, (429, Some("1".to_owned())));
+
+    gate.add_permits(100);
+    assert_eq!(holding.await.unwrap().0, 200);
+    // Built on the same (empty) base, so stale once the first committed.
+    assert_eq!(waiting.await.unwrap().0, 409);
+    // Only the first reached upstream; the refused one was never forwarded.
+    assert_eq!(env.upstream.lock().unwrap().history.len(), 1);
+    // The queue counts no one left behind.
+    assert_eq!(client.append_once("a", &[(4, None)]).await.0, 200);
+    let metrics = env.gateway.metrics_text();
+    assert!(
+        metrics.contains("integrity_rate_limited_total{reason=\"queue\"} 1\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_client_commits_at_its_rate() {
+    let env = env_limited(
+        &[
+            ("a", "00000000-0000-4000-8000-00000000000a"),
+            ("free", "00000000-0000-4000-8000-0000000000ff"),
+        ],
+        vec![constraint(1, "db.a", "primary_key", vec![1], None)],
+        32,
+        Some(1),
+    )
+    .await;
+    let client = &env.client;
+    assert_eq!(client.append_once("a", &[(1, None)]).await, (200, None));
+    assert_eq!(
+        client.append_once("a", &[(2, None)]).await,
+        (429, Some("1".to_owned()))
+    );
+    // Tables without constraints are forwarded unchanged and not counted.
+    assert_eq!(client.append_once("free", &[(1, None)]).await.0, 200);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(client.append_once("a", &[(2, None)]).await, (200, None));
+    assert_eq!(env.upstream.lock().unwrap().history.len(), 3);
 }

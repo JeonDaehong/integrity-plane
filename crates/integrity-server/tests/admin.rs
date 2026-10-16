@@ -552,6 +552,85 @@ async fn the_api_requires_the_admin_token_when_configured() {
     assert_eq!(r.status(), 200);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_authentications_lock_the_client_out() {
+    let e = env(Some("s3cret")).await;
+    for _ in 0..10 {
+        assert_eq!(e.api("GET", "constraints", None).await.0, 401);
+    }
+    // Locked out (RFC 0007), even with the right token, for the rest of the minute.
+    let r = e
+        .http
+        .get(format!("{}/v1/integrity/constraints", e.gateway))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    let wait: u64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(code(&body), "INT-017");
+    assert_eq!(body["error"]["type"], "RateLimitedException");
+    let (status, _) = e.api("GET", "status", None).await;
+    assert_eq!(status, 200, "status is never limited");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_verify_runs_at_a_time() {
+    let e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    // The first verify waits for upstream to serve the table.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    e._shared.lock().unwrap().read_gates.insert(
+        "/v1/namespaces/db/tables/customer".into(),
+        Arc::clone(&gate),
+    );
+    let first = {
+        let (http, url) = (
+            e.http.clone(),
+            format!("{}/v1/integrity/verify?table=db.customer", e.gateway),
+        );
+        tokio::spawn(async move { http.get(url).send().await.unwrap().status().as_u16() })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = e
+        .http
+        .get(format!(
+            "{}/v1/integrity/verify?table=db.customer",
+            e.gateway
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.headers()["retry-after"], "5");
+    gate.add_permits(100);
+    assert_eq!(first.await.unwrap(), 200);
+    // Released: the next one runs.
+    let (status, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(report["ok"], true, "{report}");
+    let metrics = e
+        .http
+        .get(format!("{}/metrics", e.gateway))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("integrity_rate_limited_total{reason=\"verify\"} 1\n"),
+        "{metrics}"
+    );
+}
+
 fn head_of(meta: &Value) -> i64 {
     meta["metadata"]["refs"]["main"]["snapshot-id"]
         .as_i64()

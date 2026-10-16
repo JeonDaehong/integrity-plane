@@ -1,4 +1,4 @@
-//! Integrity outcomes as HTTP responses (RFC 0003).
+//! Integrity outcomes as HTTP responses (RFC 0003, RFC 0007).
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -15,6 +15,8 @@ pub struct ApiError {
     pub message: String,
     /// Structured detail returned by the integrity API (violation reports).
     pub report: Option<serde_json::Value>,
+    /// Seconds for the `Retry-After` header of a refused request (RFC 0007).
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -30,7 +32,15 @@ impl ApiError {
             code,
             message,
             report: None,
+            retry_after: None,
         }
+    }
+
+    /// INT-017: a request limit was reached; retry after `seconds` (at least 1, RFC 0007).
+    pub fn rate_limited(message: impl Into<String>, seconds: u64) -> Self {
+        let mut e = Self::new(ErrorCode::RateLimited, message);
+        e.retry_after = Some(seconds.max(1));
+        e
     }
 
     /// Attaches a structured report.
@@ -47,6 +57,7 @@ impl ApiError {
             | ErrorCode::StorageReadFailed => StatusCode::CONFLICT,
             ErrorCode::IndexDegraded | ErrorCode::BypassDetected => StatusCode::LOCKED,
             ErrorCode::ConstraintNotFound => StatusCode::NOT_FOUND,
+            ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -57,6 +68,7 @@ impl ApiError {
             StatusCode::CONFLICT => "CommitFailedException",
             StatusCode::LOCKED => "IntegrityUnavailableException",
             StatusCode::NOT_FOUND => "NotFoundException",
+            StatusCode::TOO_MANY_REQUESTS => "RateLimitedException",
             _ => "IntegrityViolationException",
         }
     }
@@ -76,7 +88,13 @@ impl IntoResponse for ApiError {
         if let Some(report) = self.report {
             body["integrity"] = report;
         }
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, seconds.into());
+        }
+        response
     }
 }
 
@@ -111,6 +129,7 @@ mod tests {
         for code in [ErrorCode::IndexDegraded, ErrorCode::BypassDetected] {
             assert_eq!(s(code), 423, "{code}");
         }
+        assert_eq!(s(ErrorCode::RateLimited), 429);
         // No integrity code ever maps to a 5xx.
         for code in ErrorCode::ALL {
             assert!(s(code) < 500, "{code}");
@@ -126,6 +145,23 @@ mod tests {
         assert_eq!(e.message, "requirement failed");
         let other = ApiError::new(ErrorCode::IndexDegraded, "INT-009 elsewhere");
         assert_eq!(other.message, "INT-009 elsewhere");
+    }
+
+    #[test]
+    fn rate_limited_says_when_to_retry() {
+        let r = ApiError::rate_limited("domain queue full", 0).into_response();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r.headers()[axum::http::header::RETRY_AFTER], "1");
+        assert_eq!(
+            ApiError::rate_limited("", 3).error_type(),
+            "RateLimitedException"
+        );
+        let other = ApiError::new(ErrorCode::StaleBaseSnapshot, "").into_response();
+        assert!(
+            !other
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER)
+        );
     }
 
     #[test]

@@ -141,6 +141,25 @@ pub struct LimitsConfig {
     /// control store directory.
     #[serde(default = "default_scan_memory", deserialize_with = "byte_size")]
     pub scan_memory: u64,
+    /// Commits that may wait for one domain's queue at once; more are refused with 429 (RFC
+    /// 0007). `0`: no bound.
+    #[serde(default = "default_max_queued_commits")]
+    pub max_queued_commits: usize,
+    /// Commits to constrained tables each client may send per second (bursts of as many); off
+    /// when absent (RFC 0007).
+    #[serde(default)]
+    pub commits_per_client: Option<u32>,
+    /// Header naming the client (first comma-separated value) instead of the peer address, e.g.
+    /// `X-Forwarded-For`; only behind a proxy that sets it.
+    #[serde(default)]
+    pub client_header: Option<String>,
+}
+
+/// Default `limits.max_queued_commits`.
+pub const DEFAULT_MAX_QUEUED_COMMITS: usize = 32;
+
+fn default_max_queued_commits() -> usize {
+    DEFAULT_MAX_QUEUED_COMMITS
 }
 
 fn default_budget() -> u64 {
@@ -159,6 +178,9 @@ impl Default for LimitsConfig {
         Self {
             max_inline_validation_bytes: default_budget(),
             scan_memory: default_scan_memory(),
+            max_queued_commits: default_max_queued_commits(),
+            commits_per_client: None,
+            client_header: None,
         }
     }
 }

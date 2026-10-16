@@ -30,6 +30,8 @@ pub struct Upstream {
     pub history: Vec<(String, i64)>,
     /// Tables whose commits wait for a permit.
     pub gates: HashMap<String, Arc<Semaphore>>,
+    /// Tables whose reads wait for a permit.
+    pub read_gates: HashMap<String, Arc<Semaphore>>,
 }
 
 pub type Shared = Arc<Mutex<Upstream>>;
@@ -42,6 +44,12 @@ pub async fn upstream(State(s): State<Shared>, req: Request) -> Response {
         .unwrap();
     if path == "/v1/config" {
         return axum::Json(json!({"defaults": {}, "overrides": {}})).into_response();
+    }
+    if method == "GET" {
+        let gate = s.lock().unwrap().read_gates.get(&path).cloned();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
     }
     if method == "POST" {
         let gate = s.lock().unwrap().gates.get(&path).cloned();

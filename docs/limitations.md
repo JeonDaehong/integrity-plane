@@ -66,7 +66,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - The persistent index takes about 100 bytes per key.
 - Losing `registry.redb` cannot be detected from the other files; constraints from the
   configuration file are re-imported and tables with data must be onboarded again.
-- The integrity API has one optional shared bearer token and no rate limiting; audit actors are
+- The integrity API has one optional shared bearer token; ten failed authentications in a minute
+  lock a client out for the rest of that minute (RFC 0007). Audit actors are
   self-declared (`X-Integrity-Actor` or `User-Agent`), not authenticated.
 - A disabled domain (spec §19) accepts anything, uncertified, until it is rebuilt.
 - Verified clients: Spark 3.5 with Iceberg 1.10, PyIceberg 0.12, iceberg-rust 0.10, against the

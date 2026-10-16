@@ -6,8 +6,9 @@
 //! other request is forwarded to the upstream catalog unchanged.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -252,7 +253,62 @@ fn log_error(e: integrity_txn::TxnError) -> ApiError {
 
 /// One integrity domain's commit queue (spec §11). Holding its lock is holding the queue:
 /// validation, publication and index application of one commit at a time.
-type Queue = Arc<Mutex<()>>;
+#[derive(Debug, Default)]
+struct DomainQueue {
+    lock: Arc<Mutex<()>>,
+    /// Commits waiting for the lock (RFC 0007 bounds them).
+    waiting: AtomicUsize,
+}
+
+type Queue = Arc<DomainQueue>;
+
+/// A commit counted among a queue's waiting commits until dropped.
+struct Waiting<'q>(&'q AtomicUsize);
+
+impl<'q> Waiting<'q> {
+    /// Counts one more waiting commit, unless `max` (non-zero) already wait.
+    fn enter(waiting: &'q AtomicUsize, max: usize) -> Option<Self> {
+        let before = waiting.fetch_add(1, Ordering::AcqRel);
+        if max != 0 && before >= max {
+            waiting.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(waiting))
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Request limits (RFC 0007).
+#[derive(Debug)]
+pub(crate) struct Limits {
+    /// Commits that may wait for one domain's queue; `0`: no bound.
+    max_queued_commits: usize,
+    /// Commit rate per client, if limited.
+    commit_rate: Option<std::sync::Mutex<crate::limits::TokenBuckets>>,
+    /// Header naming the client instead of the peer address.
+    client_header: Option<HeaderName>,
+    /// Failed integrity API authentications per client.
+    pub(crate) auth_failures: std::sync::Mutex<crate::limits::AuthFailures>,
+    /// Held by the one `verify` that may run.
+    pub(crate) verifying: tokio::sync::Semaphore,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_queued_commits: crate::config::DEFAULT_MAX_QUEUED_COMMITS,
+            commit_rate: None,
+            client_header: None,
+            auth_failures: std::sync::Mutex::default(),
+            verifying: tokio::sync::Semaphore::new(1),
+        }
+    }
+}
 
 /// The gateway.
 pub struct Gateway {
@@ -295,6 +351,8 @@ pub struct Gateway {
     commit_requests: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Prometheus metrics.
     pub(crate) metrics: Metrics,
+    /// Request limits (RFC 0007).
+    pub(crate) limits: Limits,
 }
 
 pub(crate) enum Loaded {
@@ -335,6 +393,7 @@ impl Gateway {
             finishing: std::sync::Mutex::new(BTreeSet::new()),
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
             metrics: Metrics::default(),
+            limits: Limits::default(),
         };
         gateway.check_control_store();
         Ok(gateway)
@@ -564,6 +623,42 @@ impl Gateway {
         self
     }
 
+    /// Request limits (RFC 0007): commits that may wait for one domain (`0`: no bound), commits
+    /// per client per second, and the header naming clients instead of the peer address.
+    pub fn with_request_limits(
+        mut self,
+        max_queued_commits: usize,
+        commits_per_client: Option<u32>,
+        client_header: Option<HeaderName>,
+    ) -> Self {
+        self.limits.max_queued_commits = max_queued_commits;
+        self.limits.commit_rate = commits_per_client
+            .filter(|n| *n > 0)
+            .map(|n| std::sync::Mutex::new(crate::limits::TokenBuckets::new(n)));
+        self.limits.client_header = client_header;
+        self
+    }
+
+    /// Who sent a request (RFC 0007).
+    pub(crate) fn client(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> String {
+        crate::limits::client_key(headers, peer, self.limits.client_header.as_ref())
+    }
+
+    /// Takes a commit token of `client`, or refuses the commit (RFC 0007).
+    fn take_commit_token(&self, client: &str) -> Result<(), ApiError> {
+        let Some(rate) = &self.limits.commit_rate else {
+            return Ok(());
+        };
+        let taken = match rate.lock() {
+            Ok(mut b) => b.take(client, Instant::now()),
+            Err(p) => p.into_inner().take(client, Instant::now()),
+        };
+        taken.map_err(|seconds| {
+            self.metrics.limited_client.fetch_add(1, Ordering::Relaxed);
+            ApiError::rate_limited("commit rate of this client exceeded", seconds)
+        })
+    }
+
     /// Leaves sample key values out of violation reports (`errors.redact_keys`).
     pub fn with_redact_keys(mut self, redact: bool) -> Self {
         self.redact_keys = redact;
@@ -616,6 +711,7 @@ impl Gateway {
         path_and_query: &str,
         headers: HeaderMap,
         body: Bytes,
+        peer: Option<IpAddr>,
     ) -> Response {
         let path = path_and_query.split('?').next().unwrap_or("");
         let route = route(&method, path);
@@ -646,6 +742,8 @@ impl Gateway {
                     event.detail = Some(format!("domain disabled: {reason}"));
                     self.audit(event);
                     self.proxy(method, path_and_query, &headers, body).await
+                } else if let Err(e) = self.take_commit_token(&self.client(&headers, peer)) {
+                    e.into_response()
                 } else {
                     self.commit(&table, path_and_query, headers, body, shared)
                         .await
@@ -1078,7 +1176,21 @@ impl Gateway {
         }
 
         let waiting = Instant::now();
-        let held = queue.lock_owned().await;
+        let held = match Arc::clone(&queue.lock).try_lock_owned() {
+            Ok(held) => held,
+            Err(_) => {
+                // Bounded (RFC 0007): refused before waiting, nothing forwarded.
+                let Some(_counted) = Waiting::enter(&queue.waiting, self.limits.max_queued_commits)
+                else {
+                    self.metrics.limited_queue.fetch_add(1, Ordering::Relaxed);
+                    return Err(ApiError::rate_limited(
+                        "too many commits are waiting for this integrity domain",
+                        1,
+                    ));
+                };
+                Arc::clone(&queue.lock).lock_owned().await
+            }
+        };
         self.metrics.queue_wait.observe(waiting.elapsed());
         self.recover(&headers, Some(&members)).await?;
         if let Some(r) = request_id.as_deref()

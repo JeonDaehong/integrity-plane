@@ -13,3 +13,4 @@ File name: `NNNN-short-title.md`. Use [`template.md`](template.md).
 | [0004](0004-transaction-log-v1.md) | Transaction log format v1 | Accepted |
 | [0005](0005-signed-certificates.md) | Signed integrity certificates | Implemented |
 | [0006](0006-chunked-deltas-and-log-retention.md) | Chunked staged deltas and txn log retention | Accepted |
+| [0007](0007-request-limits.md) | Request limits (adds INT-017) | Accepted |

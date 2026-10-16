@@ -56,7 +56,7 @@ classification.
 Verified against files written by pyarrow 25, PyIceberg 0.12 and arrow-rs 60. Java (parquet-mr)
 writers are verified in Phase 7.
 
-## HTTP status mapping (spec §22, RFC 0003)
+## HTTP status mapping (spec §22, RFC 0003, RFC 0007)
 
 | Situation | Codes | HTTP | Java (Spark) | PyIceberg | iceberg-rust |
 |---|---|---|---|---|---|
@@ -64,6 +64,7 @@ writers are verified in Phase 7.
 | Stale base | INT-009 | 409 | `CommitFailedException`, bounded retry | `CommitFailedException` | retried |
 | Transient Plane state | INT-011, INT-016 | 409 | as above | as above | as above |
 | Operator action needed | INT-010, INT-015 | 423 | `RESTException`, fails fast | `RESTError` | error |
+| Request limit reached | INT-017 | 429 + `Retry-After` | retried with backoff, then `RESTException` | `RESTError` | not verified |
 | Upstream response after forwarding | — | unchanged | — | — | — |
 
 The message of a rejected commit reads `INT-005 FOREIGN_KEY_VIOLATION: commit rejected: INT-005 on

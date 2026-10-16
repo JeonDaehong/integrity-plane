@@ -60,7 +60,12 @@ policies are the preventive control.
 - Inline validation reads at most `limits.max_inline_validation_bytes` per commit
   (`VALIDATION_BUDGET_EXCEEDED`, 400); request bodies are limited to 64 MiB.
 - Each integrity domain commits serially (ADR 0015): a writer that floods one domain slows that
-  domain, not others. There is no rate limiting per client.
+  domain, not others. At most `limits.max_queued_commits` (default 32) commits wait for one
+  domain; more are refused with 429 before they are read (RFC 0007). `limits.commits_per_client`
+  optionally limits each client's commit rate; a client is its peer address, or the
+  `limits.client_header` value behind a proxy that sets it. Clients that spread over many
+  addresses are not bound by it; the queue bound still is. Connection-level floods are for a
+  reverse proxy.
 - Onboarding and rebuild scans are unbounded and pause all commits while they run; they require the
   integrity API, which must be restricted to operators.
 
@@ -77,8 +82,9 @@ the API token stays inside the Plane.
 Registering, dropping and rebuilding constraints change what is enforced; `verify` and `rebuild`
 are expensive. Set `[server] admin_token` so `/v1/integrity/*` (except `status`) requires
 `Authorization: Bearer <token>`, and keep the API off untrusted networks either way. Without a
-token the API is open to anyone who can reach the gateway. The token is compared by digest; it is
-not rate-limited. Audit events name an actor, but it is whatever the request declares
+token the API is open to anyone who can reach the gateway. The token is compared by digest; ten failed
+attempts within a minute lock the client out until that minute ends (RFC 0007), so guessing is
+slow from one address. One `verify` runs at a time. Audit events name an actor, but it is whatever the request declares
 (`X-Integrity-Actor` or `User-Agent`): useful for attribution among cooperating operators, not
 evidence. Disabling a domain (spec §19) switches enforcement off for it until a rebuild; it is a
 privileged, audited action and must be restricted like the rest of the API.

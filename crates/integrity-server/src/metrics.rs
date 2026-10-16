@@ -61,6 +61,14 @@ pub struct Metrics {
     pub recovered_aborted: AtomicU64,
     /// Commits refused because a domain member's head was not certified.
     pub bypass_detected: AtomicU64,
+    /// Commits refused because their domain's queue was full (RFC 0007).
+    pub limited_queue: AtomicU64,
+    /// Commits refused because their client exceeded its rate (RFC 0007).
+    pub limited_client: AtomicU64,
+    /// Integrity API requests refused after failed authentications (RFC 0007).
+    pub limited_auth: AtomicU64,
+    /// `verify` requests refused while another ran (RFC 0007).
+    pub limited_verify: AtomicU64,
 }
 
 fn counter(out: &mut String, name: &str, help: &str, values: &[(&str, u64)]) {
@@ -152,6 +160,17 @@ impl Metrics {
             "Commits refused because a table's main was not committed through the Plane.",
             &[("", get(&self.bypass_detected))],
         );
+        counter(
+            &mut out,
+            "integrity_rate_limited_total",
+            "Requests refused with 429 before anything was forwarded, by limit (RFC 0007).",
+            &[
+                ("{reason=\"queue\"}", get(&self.limited_queue)),
+                ("{reason=\"client\"}", get(&self.limited_client)),
+                ("{reason=\"auth\"}", get(&self.limited_auth)),
+                ("{reason=\"verify\"}", get(&self.limited_verify)),
+            ],
+        );
         let _ = writeln!(
             out,
             "# HELP integrity_domain_state Constrained tables by the state of their domain."
@@ -200,6 +219,7 @@ mod tests {
         assert!(text.contains("integrity_validation_seconds_bucket{le=\"+Inf\"} 3\n"));
         assert!(text.contains("integrity_bypass_detected_total 0\n"));
         assert!(text.contains("integrity_domain_state{state=\"degraded\"} 1\n"));
+        assert!(text.contains("integrity_rate_limited_total{reason=\"queue\"} 0\n"));
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let (name, value) = line.rsplit_once(' ').unwrap();
             assert!(value.parse::<f64>().is_ok(), "{line}");

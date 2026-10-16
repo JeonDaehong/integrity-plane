@@ -51,6 +51,13 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         config.storage.clone(),
         tokio::runtime::Handle::current(),
     ));
+    let client_header = config
+        .limits
+        .client_header
+        .as_deref()
+        .map(axum::http::HeaderName::try_from)
+        .transpose()
+        .map_err(|e| format!("limits.client_header: {e}"))?;
     let gateway = Gateway::new(
         &config.upstream.catalog_uri,
         Duration::from_secs(config.upstream.timeout_secs),
@@ -64,6 +71,11 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     .with_admin_token(config.server.admin_token.clone())
     .with_redact_keys(config.errors.redact_keys)
     .with_scan_memory(config.limits.scan_memory)
+    .with_request_limits(
+        config.limits.max_queued_commits,
+        config.limits.commits_per_client,
+        client_header,
+    )
     .with_upstream_auth(config.upstream.auth.clone());
     let gateway = match &config.signing {
         Some(s) => gateway.with_signer(
@@ -77,6 +89,10 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     let listener = tokio::net::TcpListener::bind(&config.server.bind).await?;
     tracing::info!("listening on {}", config.server.bind);
-    axum::serve(listener, router(Arc::new(gateway))).await?;
+    axum::serve(
+        listener,
+        router(Arc::new(gateway)).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

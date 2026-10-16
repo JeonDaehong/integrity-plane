@@ -520,6 +520,13 @@ impl Gateway {
         trusted_keys: Option<&str>,
         require_signatures: bool,
     ) -> Result<Value, ApiError> {
+        // One at a time (RFC 0007): each reads every snapshot of a table.
+        let Ok(_verifying) = self.limits.verifying.try_acquire() else {
+            self.metrics
+                .limited_verify
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(ApiError::rate_limited("another verify is running", 5));
+        };
         let _shared = self.admin.read().await;
         let doc = self.registry.snapshot();
         let history = doc.history.get(table).cloned().unwrap_or_default();

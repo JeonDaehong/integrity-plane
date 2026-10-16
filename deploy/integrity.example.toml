@@ -32,6 +32,12 @@ max_inline_validation_bytes = "2GiB"
 # Keys kept in memory per onboarding table or per commit validation; the rest spills to the control
 # store.
 scan_memory = "512MiB"
+# Commits that may wait for one integrity domain at once; more get 429 + Retry-After (RFC 0007).
+max_queued_commits = 32
+# Commits to constrained tables per client per second (bursts of as many). Off by default.
+# commits_per_client = 20
+# Name clients by this header instead of the peer address; only behind a proxy that sets it.
+# client_header = "X-Forwarded-For"
 
 [txn_log]
 # Finished transactions (and their idempotency keys) are kept this long, then deleted (RFC 0006).
