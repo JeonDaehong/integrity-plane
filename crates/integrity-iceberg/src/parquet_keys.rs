@@ -321,10 +321,11 @@ impl Footer {
             tail = read(tail_start..len)?;
         }
         let meta_start = (tail.len() as u64 - 8 - metadata_len) as usize;
-        let decoded = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(
-            &tail[meta_start..tail.len() - 8],
-        )
-        .map_err(parquet_err)?;
+        let footer_bytes = &tail[meta_start..tail.len() - 8];
+        // Declared lengths are checked before the decoder allocates them.
+        crate::parquet_pages::check_footer(footer_bytes).map_err(parquet_err)?;
+        let decoded = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(footer_bytes)
+            .map_err(parquet_err)?;
         let metadata = ArrowReaderMetadata::try_new(Arc::new(decoded), ArrowReaderOptions::new())
             .map_err(parquet_err)?;
 
@@ -381,6 +382,26 @@ impl Footer {
                     .map_err(ExtractError::Read)?;
                 sparse.ranges.push((start, bytes));
             }
+            // Declared page sizes are checked before the decoder allocates them.
+            let chunk = sparse
+                .find(start, end)
+                .ok_or_else(|| parquet_err("column chunk not read"))?;
+            let column = group.column(i).column_descr();
+            let width = match column.physical_type() {
+                parquet::basic::Type::BOOLEAN => crate::parquet_pages::Width::Bit,
+                parquet::basic::Type::INT32 | parquet::basic::Type::FLOAT => {
+                    crate::parquet_pages::Width::Fixed(4)
+                }
+                parquet::basic::Type::INT64 | parquet::basic::Type::DOUBLE => {
+                    crate::parquet_pages::Width::Fixed(8)
+                }
+                parquet::basic::Type::INT96 => crate::parquet_pages::Width::Fixed(12),
+                parquet::basic::Type::FIXED_LEN_BYTE_ARRAY => {
+                    crate::parquet_pages::Width::Fixed(i64::from(column.type_length()))
+                }
+                parquet::basic::Type::BYTE_ARRAY => crate::parquet_pages::Width::Variable,
+            };
+            crate::parquet_pages::check_chunk(&chunk, width).map_err(parquet_err)?;
         }
         let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(sparse, self.metadata.clone())

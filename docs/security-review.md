@@ -38,6 +38,7 @@ The Plane has had **no external security review**. This page records the interna
 | Terminal records | zstd frames bounded to 256 MiB when read back | OK (RFC 0010) |
 | Storage engine panics | Caught; the index store is then treated as corrupt (fail closed) | OK (ADR 0005) |
 | Parsers | Fuzzed in CI (`fuzz.yml`): commit requests, manifests, Parquet keys | Partial: no Puffin fuzz target |
+| Hostile Parquet sizes | The Parquet decoder allocates declared sizes (dictionary value counts, schema child counts): two fuzzed files allocated 5 and 6 GiB and aborted the process | **Fixed:** footer and page headers checked first (`parquet_pages.rs`); 10 min of fuzzing after the fix found nothing |
 | Audit actors of commits | Self-declared (`X-Integrity-Actor`, `User-Agent`) | Documented (ADR 0026) |
 
 ## For an external reviewer: where to look first

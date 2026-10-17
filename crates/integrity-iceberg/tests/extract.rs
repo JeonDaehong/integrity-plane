@@ -546,3 +546,57 @@ fn selected_rows_match_the_whole_file_at_their_positions() {
     .unwrap();
     assert_eq!((rows, seen), (n as u64, 1));
 }
+
+/// Found by `fuzz/parquet_keys`: a dictionary page declaring ~670 M values in a few bytes made the
+/// decoder allocate 5 GiB. Page headers are checked first; the file is refused, nothing allocated.
+#[test]
+fn a_dictionary_larger_than_its_page_is_refused_before_decoding() {
+    let data = Bytes::from(
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fuzz/parquet_dictionary_oom.parquet"
+        ))
+        .unwrap(),
+    );
+    let columns = [
+        f(1, LogicalType::Long),
+        f(2, LogicalType::Long),
+        f(3, LogicalType::String),
+        f(
+            4,
+            LogicalType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
+        ),
+    ];
+    let err = extract_rows(data, &columns).unwrap_err();
+    assert_eq!(
+        err.code(),
+        integrity_types::ErrorCode::UnsupportedCommitOperation
+    );
+    assert!(err.to_string().contains("dictionary declares"), "{err}");
+}
+
+/// Found by `fuzz/parquet_keys`: a schema element declaring ~800 M children made the footer
+/// decoder allocate 6 GiB. The footer is checked first; the file is refused.
+#[test]
+fn a_footer_declaring_impossible_children_is_refused_before_decoding() {
+    let data = Bytes::from(
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fuzz/parquet_schema_children_oom.parquet"
+        ))
+        .unwrap(),
+    );
+    let err = extract_rows(data, &[f(1, LogicalType::Long)]).unwrap_err();
+    assert_eq!(
+        err.code(),
+        integrity_types::ErrorCode::UnsupportedCommitOperation
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("children") || message.contains("Parquet metadata"),
+        "{message}"
+    );
+}

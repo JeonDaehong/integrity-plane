@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Hostile Parquet files can no longer abort the Plane by declaring huge sizes: the footer and every
+  page header of a column chunk are checked before the decoder allocates what they declare
+  (collections longer than their bytes, a schema element with more children than the schema, pages
+  over 256 MiB or past their chunk, dictionaries with more values than their bytes hold). Two such
+  files found by fuzzing made the Parquet decoder allocate 5 and 6 GiB; they are now refused as
+  `UNSUPPORTED_COMMIT_OPERATION`.
+
 - The Plane reads only a table's own files (RFC 0013): every manifest list, manifest, data and
   delete file of a commit must lie under the table's `location` or `write.*.path` properties, or
   `[storage] allowed_locations`; otherwise the commit is refused (INT-012) before anything is

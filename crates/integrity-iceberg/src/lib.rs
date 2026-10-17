@@ -17,6 +17,7 @@ pub mod io;
 pub mod manifest;
 pub mod metadata;
 mod parquet_keys;
+pub mod parquet_pages;
 pub mod request;
 
 pub use certify::{inject_certificate, inject_signature, snapshot_certificate, snapshot_signature};
