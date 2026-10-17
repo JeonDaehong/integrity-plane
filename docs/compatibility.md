@@ -25,7 +25,7 @@
 | Commits to refs other than `main` | Pass-through, uncertified | Phase 6 |
 | Moving `main` to an existing snapshot | Rejected | Phase 6 |
 | Multi-table commit endpoint (from clients) | Rejected | Phase 7 (gateway) |
-| Multi-table commits to the upstream catalog (`[ha] fence`, RFC 0012) | Used | `compat/multitable_probe.py`: REST fixture 1.10.1, Polaris 1.7.0, Lakekeeper 0.13.6, Nessie 0.108.8; CI runs every client with the fence |
+| Multi-table commits to the upstream catalog (`[ha] fence`, RFC 0012) | Used | see "Catalogs for several Planes" below |
 | Unknown update action or requirement type | Rejected, naming it | Phase 6 |
 | Non-Parquet data files | Rejected | Phase 6 |
 
@@ -105,3 +105,31 @@ fails with the integrity code in its message, and every snapshot on `main` carri
 Upstream: Iceberg REST fixture 1.10.1 with a filesystem warehouse. The CI job `compose-s3` also runs
 the Appendix A demo against `deploy/docker-compose.yml`, where the catalog, the Plane and the
 clients use S3 (SeaweedFS's S3 gateway; MinIO no longer publishes container images).
+
+## File locations (RFC 0013)
+
+Every file a commit names (manifest list, manifests, data, delete and deletion-vector files) must
+lie under the table's `location`, a `write.data.path`, `write.metadata.path`,
+`write.object-storage.path` or `write.folder-storage.path` property, or a
+`[storage] allowed_locations` entry; otherwise the commit is refused with INT-012 (400) and nothing
+is read. `s3a://` counts as `s3://`; `file:///p`, `file:/p` and `/p` are the same; paths with `.`
+or `..` segments are refused.
+
+## Catalogs for several Planes (RFC 0012)
+
+Several Planes in front of the same tables (`[ha] fence = "multi-table"`) need an upstream catalog
+that applies multi-table commits atomically **under concurrency** (a requirement on a table without
+updates is checked when the transaction commits, not before) and serves each table's snapshot
+history (catching up, RFC 0011). `compat/multitable_probe.py` checks the first, sequentially and
+with 30 rounds of two concurrent transactions that assert each other's table; `compat/soak.py`
+runs Planes with chaos against a catalog for an hour. Results of 2026-10-17:
+
+| Catalog | Sequential | Concurrent transactions | Table history | Several Planes |
+|---|---|---|---|---|
+| Lakekeeper 0.13.6 | ✅ | ✅ never both committed | ✅ | **supported** (soak: `compat/soak_lakekeeper.sh`) |
+| Nessie 0.108.8 | ✅ | ✅ | ❌ current snapshot only | no: a Plane cannot catch up |
+| Apache Polaris 1.7.0 | ✅ | ❌ both committed in 29 of 30 rounds | ✅ | no |
+| Iceberg REST fixture 1.10.1 | ✅ | ❌ both committed in 30 of 30 rounds; acknowledged changes lost | ✅ | no |
+
+With the other catalogs, run one Plane per domain (the default `fence = "none"`). The Plane
+answers 409 when a catalog acknowledges a transaction whose snapshot is not on `main`.

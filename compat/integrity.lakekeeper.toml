@@ -4,6 +4,8 @@
 
 [server]
 bind = "127.0.0.1:8181"
+# No API token: local test setup only (ADR 0027).
+open_api = true
 
 [upstream]
 catalog_uri = "http://127.0.0.1:8185/catalog"

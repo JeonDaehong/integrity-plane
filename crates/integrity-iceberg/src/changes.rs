@@ -44,6 +44,7 @@ impl InspectError {
                 ErrorCode::ValidationBudgetExceeded
             }
             InspectError::Read(ReadError::Io(_)) => ErrorCode::StorageReadFailed,
+            InspectError::Read(ReadError::OutsideTable(_)) => ErrorCode::UnsupportedCommitOperation,
             InspectError::Manifest(_) | InspectError::Extract(_) | InspectError::Unsupported(_) => {
                 ErrorCode::UnsupportedCommitOperation
             }

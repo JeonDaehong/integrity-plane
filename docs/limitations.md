@@ -18,6 +18,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   non-Parquet data files and key columns nested in structs.
 - On tables with position deletes, each commit reads all manifests of both snapshots and every live
   position delete file.
+- Files outside a table's location and `write.*.path` properties (imported with `add_files`,
+  migrated) are not read unless listed in `[storage] allowed_locations` (RFC 0013): such commits
+  are refused with `UNSUPPORTED_COMMIT_OPERATION`.
 - Commits to branches other than `main` pass through uncertified.
 - Validation reads the footer and the key column chunks of every data file a commit adds or
   removes (ranged reads), so its cost follows the key columns, not the file size; manifests are
@@ -65,8 +68,11 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 ## Operations
 
 - Each Plane is one process with its own control store (local files). For availability, run
-  several behind a load balancer with `[ha] fence = "multi-table"` (RFC 0012); the upstream catalog
-  must support multi-table commits (verified: the REST fixture, Polaris, Lakekeeper, Nessie).
+  several behind a load balancer with `[ha] fence = "multi-table"` (RFC 0012). The upstream catalog
+  must apply multi-table commits atomically, including under concurrency, and serve the table
+  history: of the catalogs tested only **Lakekeeper** does (`compatibility.md`). Polaris 1.7 and the
+  REST fixture let concurrent transactions skip each other's assertions; Nessie serves only the
+  current snapshot, so a Plane cannot catch up.
   Without the fence, run one Plane per domain: while it is down, writers cannot commit to enforced
   tables (fail closed). A restored control store, or another Plane, catches up from the table
   history (RFC 0011); FK-linked tables that both moved need fenced commits or a rebuild

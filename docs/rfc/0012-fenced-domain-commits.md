@@ -27,10 +27,13 @@ validation and the commit, and a single-table commit only asserts its own table.
 that is unsound: a child insert validated against a parent key and a parent delete validated
 against no child reference can both commit.
 
-The Iceberg REST catalogs the Plane supports apply a multi-table commit atomically and check
-requirements on tables that have no updates (`compat/multitable_probe.py`, 2026-10-17: Iceberg
-REST fixture 1.10.1, Polaris 1.7.0, Lakekeeper 0.13.6, Nessie 0.108.8). Asserting the whole domain
-makes the catalog itself the arbiter of the order of a domain's commits.
+An Iceberg REST catalog that applies a multi-table commit atomically, checking requirements on
+tables without updates when the transaction commits, makes itself the arbiter of the order of a
+domain's commits. Not every catalog does (`compatibility.md`, "Catalogs for several Planes",
+measured 2026-10-17): Lakekeeper 0.13.6 does and serves the table history; Nessie 0.108.8 commits
+atomically but serves only the current snapshot; Polaris 1.7.0 and the REST fixture 1.10.1 check
+those requirements before committing, so concurrent transactions skip each other's assertions (and
+the fixture can acknowledge a change it then loses). The fence is only sound with the first kind.
 
 ## Specification
 
@@ -45,8 +48,9 @@ certification:
     a client requirement on `main` of `T`, which the Plane has already checked);
   - every other table `U` of `D`: no updates, requirements `assert-table-uuid` and
     `assert-ref-snapshot-id` for `main` equal to `U`'s head the validation used.
-- On success (any 2xx) the Plane loads `T` and answers the client `200` with that
-  `LoadTableResult`. The metadata may already include later commits; it always includes this one.
+- On success (any 2xx) the Plane loads `T`; if the commit's final snapshot is not `main` or an
+  ancestor of it, the catalog lost the change and the Plane answers 409 (nothing is applied).
+  Otherwise it answers the client `200` with that `LoadTableResult`. The metadata may already include later commits; it always includes this one.
   Recovery (RFC 0004) is unchanged: a `COMMITTING` transaction is decided by whether its final
   snapshot is in `T`.
 - A 409 (a requirement failed) is passed to the client as before; engines refresh and retry, and

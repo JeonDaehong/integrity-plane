@@ -102,7 +102,8 @@ async fn upstream(State(s): State<Shared>, req: Request) -> Response {
 
 fn empty_table() -> Value {
     json!({
-        "format-version": 2, "table-uuid": UUID, "location": "x",
+        "format-version": 2, "table-uuid": UUID,
+        "location": std::env::temp_dir().to_string_lossy().replace('\\', "/"),
         "current-schema-id": 0, "current-snapshot-id": -1,
         "schemas": [{"schema-id": 0, "type": "struct", "fields": [
             {"id": 1, "name": "id", "required": true, "type": "long"},
@@ -265,6 +266,7 @@ impl Gateway {
             r#"
 [server]
 bind = "127.0.0.1:{port}"
+open_api = true
 [upstream]
 catalog_uri = "http://{upstream}"
 timeout_secs = 5

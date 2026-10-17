@@ -92,6 +92,7 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_upstream_auth(config.upstream.auth.clone())
     .with_catch_up(config.catch_up)
+    .with_allowed_locations(config.storage.allowed_locations.clone())
     .with_fence(config.ha.fence == integrity_server::config::Fence::MultiTable);
     let gateway = match &config.signing {
         Some(s) => {

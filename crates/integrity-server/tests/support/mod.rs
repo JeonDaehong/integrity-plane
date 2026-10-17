@@ -36,6 +36,8 @@ pub struct Upstream {
     pub transactions: u64,
     /// Requests that reached a gate.
     pub gated: u64,
+    /// Acknowledge transactions without applying them (a catalog that loses changes).
+    pub lose_transactions: bool,
 }
 
 pub type Shared = Arc<Mutex<Upstream>>;
@@ -152,6 +154,9 @@ fn commit_transaction(up: &mut Upstream, body: &[u8]) -> Response {
             }
         }
     }
+    if up.lose_transactions {
+        return StatusCode::NO_CONTENT.into_response();
+    }
     for c in changes {
         let path = path_of(c);
         let mut meta = up.tables[&path].clone();
@@ -163,9 +168,14 @@ fn commit_transaction(up: &mut Upstream, body: &[u8]) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// The temporary directory every test writes its files under: test tables live there.
+pub fn temp_location() -> String {
+    std::env::temp_dir().to_string_lossy().replace('\\', "/")
+}
+
 pub fn empty_table(uuid: &str) -> Value {
     json!({
-        "format-version": 2, "table-uuid": uuid, "location": "x",
+        "format-version": 2, "table-uuid": uuid, "location": temp_location(),
         "current-schema-id": 0, "current-snapshot-id": -1,
         "schemas": [{"schema-id": 0, "type": "struct", "fields": [
             {"id": 1, "name": "id", "required": true, "type": "long"},

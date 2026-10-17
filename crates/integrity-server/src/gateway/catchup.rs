@@ -36,6 +36,8 @@ pub(super) struct Behind {
     pub meta: TableMetadata,
     /// The snapshot the indexes reflect (`None`: no snapshot yet).
     pub indexed: Option<i64>,
+    /// Not anchored by this Plane: followed from its first snapshot, anchored once caught up.
+    pub fresh: bool,
 }
 
 /// One table validated up to its `main`, waiting to be applied.
@@ -58,9 +60,38 @@ impl Gateway {
         domain: &BTreeMap<String, (String, Option<i64>)>,
         behind: Vec<Behind>,
     ) -> Result<(), ApiError> {
+        self.follow_all(doc, ctx, constraints, domain, &behind)
+            .await?;
+        // A table first seen with data from other Planes is now enforced here from its first
+        // snapshot on: its chain starts there (RFC 0002 chain root).
+        for b in behind.iter().filter(|b| b.fresh) {
+            *doc = self
+                .registry
+                .update(|d| {
+                    let anchor = crate::store::Anchor {
+                        table_uuid: b.meta.table_uuid.to_lowercase(),
+                        snapshot: None,
+                        version: d.version(&b.identifier),
+                    };
+                    d.set_anchor(&b.identifier, anchor);
+                    Ok::<_, crate::store::StoreError>(d.clone())
+                })
+                .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn follow_all(
+        &self,
+        doc: &mut RegistryDoc,
+        ctx: &Ctx<'_>,
+        constraints: &[ConstraintConfig],
+        domain: &BTreeMap<String, (String, Option<i64>)>,
+        behind: &[Behind],
+    ) -> Result<(), ApiError> {
         if !self.catch_up.enabled {
             let b = &behind[0];
-            return Err(self.refuse_head(doc, &b.identifier, &b.meta, b.indexed, None));
+            return Err(self.refuse_behind(doc, b, None));
         }
         // Tables linked by a foreign key that both moved need the order of their commits: only
         // fenced commits record it (RFC 0011, RFC 0012).
@@ -73,7 +104,7 @@ impl Gateway {
             .then(|| (c.table.clone(), r.table.clone()))
         });
         if let Some((child, parent)) = linked {
-            return match self.catch_up_in_order(doc, ctx, domain, &behind).await {
+            return match self.catch_up_in_order(doc, ctx, domain, behind).await {
                 Ok(()) => Ok(()),
                 Err(Refusal::Head(why)) => {
                     let b = behind
@@ -83,25 +114,19 @@ impl Gateway {
                     let why = format!(
                         "{child} and {parent}, linked by a foreign key, both moved and {why}; rebuild the domain"
                     );
-                    Err(self.refuse_head(doc, &b.identifier, &b.meta, b.indexed, Some(&why)))
+                    Err(self.refuse_behind(doc, b, Some(&why)))
                 }
                 Err(Refusal::Api(e)) => Err(e),
             };
         }
 
         let mut followed = Vec::new();
-        for b in &behind {
+        for b in behind {
             let to = b.meta.main_snapshot_id().map(|s| s.0);
             match self.follow(doc, ctx, b, b.indexed, to).await {
                 Ok(f) => followed.push(f),
                 Err(Refusal::Head(why)) => {
-                    return Err(self.refuse_head(
-                        doc,
-                        &b.identifier,
-                        &b.meta,
-                        b.indexed,
-                        Some(&why),
-                    ));
+                    return Err(self.refuse_behind(doc, b, Some(&why)));
                 }
                 Err(Refusal::Api(e)) => return Err(e),
             }
@@ -397,6 +422,7 @@ impl Gateway {
             stats: Arc::new(pipeline::Stats::default()),
             scratch: self.store.scratch_dir().to_path_buf(),
             memory: self.scan_memory,
+            allowed: self.allowed_locations.clone(),
         };
         let outcome = tokio::task::spawn_blocking(move || pipeline::run(&job))
             .await

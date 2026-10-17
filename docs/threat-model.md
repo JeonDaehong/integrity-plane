@@ -128,6 +128,29 @@ the Plane; whoever can use the key through Vault's policy or the token's PIN can
 those credentials need the same care, and the backend's own audit log shows every signature.
 Without signing, a certificate proves consistency of the chain, not who produced it.
 
+### Writers naming other files (confused deputy)
+
+A writer names every file location of its commit, and the Plane reads them with its own
+credentials, which may reach more than the writer's: other buckets, other tables, files on its
+host. The Plane reads only files under the table's own locations (its `location` and `write.*.path`
+properties) and `[storage] allowed_locations` (RFC 0013); a commit naming anything else is refused
+before a byte is read. Without this, a writer could list another table's data file in its commit
+and read that table's keys from the violation report. Give the Plane's storage credentials no more
+than the warehouse anyway.
+
+### Traffic between writers, the Plane and the catalog
+
+The Plane serves plain HTTP. Writers' catalog credentials (forwarded upstream) and integrity API
+tokens cross that connection, so terminate TLS in front of the Plane (an ingress, a load balancer,
+a sidecar) and keep the Plane's port off untrusted networks. Its own requests to the upstream
+catalog and object storage use HTTPS when the configured URLs are `https://`.
+
+### The integrity API without tokens
+
+The Plane does not start without an API token unless `[server] open_api = true` (ADR 0027): an open
+API lets anyone who reaches it drop constraints or disable a domain, which forwards commits
+unchecked.
+
 ## Key values and PII
 
 Primary and foreign keys can be personal data (emails, national ids).

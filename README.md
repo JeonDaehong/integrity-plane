@@ -68,7 +68,8 @@ All of these are covered by tests in this repository; none has been run in produ
 
 What is not supported, or only partly: [`docs/limitations.md`](docs/limitations.md). Measurements:
 [`docs/benchmarks.md`](docs/benchmarks.md). Threats and mitigations:
-[`docs/threat-model.md`](docs/threat-model.md).
+[`docs/threat-model.md`](docs/threat-model.md); the internal security review and what an external
+review should cover: [`docs/security-review.md`](docs/security-review.md).
 
 ## Deploying
 

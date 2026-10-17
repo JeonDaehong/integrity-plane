@@ -156,9 +156,10 @@ async fn upstream(State(s): State<Shared>, req: Request) -> Response {
     axum::Json(json!({"metadata-location": "m", "metadata": meta})).into_response()
 }
 
-fn empty_table(uuid: &str) -> Value {
+/// An empty table whose files lie under `location` (RFC 0013).
+fn empty_table(uuid: &str, location: &str) -> Value {
     json!({
-        "format-version": 2, "table-uuid": uuid, "location": "x",
+        "format-version": 2, "table-uuid": uuid, "location": location,
         "current-schema-id": 0, "current-snapshot-id": -1,
         "schemas": [{"schema-id": 0, "type": "struct", "fields": [
             {"id": 1, "name": "id", "required": true, "type": "long"},
@@ -628,6 +629,10 @@ async fn main() -> Result<(), BoxError> {
     std::fs::create_dir_all(&control)?;
 
     let shared: Shared = Arc::new(Mutex::new(Upstream::default()));
+    // Every file the benchmark writes lies under here (`Files::location`).
+    let root =
+        o.s3.clone()
+            .unwrap_or_else(|| data.to_string_lossy().replace('\\', "/"));
     for (name, uuid) in [
         ("customer", "11111111-1111-1111-1111-111111111111"),
         ("orders", "22222222-2222-2222-2222-222222222222"),
@@ -640,7 +645,7 @@ async fn main() -> Result<(), BoxError> {
     ] {
         shared.lock().map_err(|_| "lock")?.tables.insert(
             format!("/v1/namespaces/bench/tables/{name}"),
-            empty_table(uuid),
+            empty_table(uuid, &root),
         );
     }
     let up = serve(

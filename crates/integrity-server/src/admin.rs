@@ -146,8 +146,15 @@ impl Gateway {
         let memory = self.scan_memory;
         let configs = configs.to_vec();
         let redact = self.redact_keys;
+        let allowed = self.allowed_locations.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            onboard::scan(io.as_ref(), &store, memory, &configs, &loaded, redact)
+            // Only the domain's tables' own files (RFC 0013).
+            let locations = loaded
+                .iter()
+                .flat_map(|m| integrity_iceberg::table_locations(&m.meta))
+                .chain(allowed);
+            let confined = integrity_iceberg::Confined::new(io.as_ref(), locations);
+            onboard::scan(&confined, &store, memory, &configs, &loaded, redact)
         })
         .await
         .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, format!("scan task failed: {e}")))??;
@@ -595,11 +602,15 @@ impl Gateway {
             memory: self.scan_memory,
         };
         let io = Arc::clone(&self.io);
-        let report = tokio::task::spawn_blocking(move || verify::verify(io.as_ref(), &input))
-            .await
-            .map_err(|e| {
-                ApiError::new(ErrorCode::IndexDegraded, format!("verify task failed: {e}"))
-            })?;
+        let allowed = self.allowed_locations.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            // Only the table's own files (RFC 0013).
+            let confined =
+                integrity_iceberg::Confined::for_table(io.as_ref(), &input.meta, &allowed);
+            verify::verify(&confined, &input)
+        })
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, format!("verify task failed: {e}")))?;
         // Only a break found under the Plane's own trust settings degrades the domain; a caller
         // pinning other keys or demanding more gets a report, not a say over enforcement.
         if let Some(broken) = report.first_broken.filter(|_| authoritative) {

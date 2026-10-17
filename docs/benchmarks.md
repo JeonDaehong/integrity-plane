@@ -368,6 +368,27 @@ compressing terminal records with zstd, one after the other on one instance.
 | Compaction of 10 files (10000000 rows) into one | end-to-end 25.37 s; validation 25.36 s | read 158.4 MiB | status 200 |
 | Merge-on-read delete of 1 row, 50 times (delete files accumulate) | first: end-to-end 632.4 ms / validation 628.3 ms; last: 86.4 ms / 81.0 ms | read first 8.0 MiB, last 8.1 MiB | |
 
+## Several Planes under chaos (RFC 0011, RFC 0012)
+
+`compat/soak_lakekeeper.sh --duration 3600 --chaos 180 --writers 6` on the dev instance
+(m6id.4xlarge), 2026-10-17: three Planes with `[ha] fence = "multi-table"` in front of Lakekeeper
+0.13.6 (S3 on SeaweedFS), six PyIceberg writers committing through random Planes (customer and
+order appends and deletes, with deliberate duplicates, dangling references and deletes of
+referenced customers), and a Plane killed with SIGKILL every 1.5–4.5 minutes and restarted 5–30 s
+later.
+
+| | |
+|---|---|
+| Plane kills | 17 |
+| Accepted commits | 1 243 (576 customer appends, 39 customer deletes, 348 order appends, 280 order deletes) |
+| Refused | 603 duplicate keys, 669 dangling references, 1 referenced delete, 13 NULL names |
+| Retried after a fenced 409 | 20 |
+| Final data, read from the catalog | 1 031 customers, 342 orders: no duplicate id, no order without its customer, no NULL name |
+| Every Plane at the end | took one more commit after catching up, `verify` passed on both tables, no degraded domain |
+
+About 500 client writes failed in the client before reaching a Plane (Lakekeeper's S3 remote
+signing refused them); they are counted apart and are not commits.
+
 ## Large tables (local Windows machine, `--scale`)
 
 `integrity-bench --scale N --file-rows 1000000 --settle 120` loads N rows in 1 M-row files straight

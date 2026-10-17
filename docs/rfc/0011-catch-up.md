@@ -40,6 +40,15 @@ of the domain whose `main` differs from its recorded head:
 2. Every snapshot after the head must carry a certificate. A snapshot whose changes the Plane
    cannot validate (outside the capability matrix, equality deletes) stops catch-up.
 
+### Tables this Plane never anchored
+
+A table with data whose constraints this Plane imported but never onboarded (it first sees the
+table after other Planes filled it, RFC 0012) has no anchor. It is followed like any other, from
+no snapshot: every snapshot since the table was created must be certified and validate again.
+Once caught up, it is anchored with no snapshot (its chain starts at its first snapshot). If it
+cannot be followed (a snapshot written around every Plane, expired history), it is refused as
+before RFC 0011: not enforced yet, onboard it (`INDEX_DEGRADED`, not degraded in the registry).
+
 ### Which tables may catch up together
 
 The order in which snapshots of *different* tables were committed is not recorded anywhere. For

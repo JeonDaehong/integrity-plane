@@ -1078,6 +1078,139 @@ async fn fenced_planes_take_commits_for_linked_tables_in_turn() {
     );
 }
 
+/// RFC 0013: a commit naming files outside its table's locations is refused before any of them
+/// is read; the Plane does not read other tables' (or its host's) files for a writer.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_outside_the_table_are_not_read() {
+    let e = env(None).await;
+    e.register_demo().await;
+    let set_location = |location: String| {
+        let mut up = e._shared.lock().unwrap();
+        let meta = up
+            .tables
+            .get_mut("/v1/namespaces/db/tables/customer")
+            .unwrap();
+        meta["location"] = json!(location);
+    };
+    // The writer's files lie beside the table, not under it.
+    set_location(e.files.location("customer-table"));
+    let (status, body) = e.through_plane("customer", &[(1, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-012"), "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("outside the locations"), "{message}");
+    // A location that is a prefix of another directory's name does not cover it.
+    let dir = e.files.location("");
+    set_location(dir.trim_end_matches('/')[..dir.trim_end_matches('/').len() - 1].to_owned());
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 400);
+    // Under the table's location, the same commit is validated.
+    set_location(dir);
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+}
+
+/// The demo constraints as a configuration file declares them (imported on first start).
+fn demo_configs() -> Vec<integrity_server::config::ConstraintConfig> {
+    let toml = r#"
+[server]
+bind = "127.0.0.1:0"
+[upstream]
+catalog_uri = "http://127.0.0.1:1"
+[control_store]
+path = "unused"
+[[constraint]]
+id = 1
+table = "db.customer"
+name = "pk_customer"
+type = "primary_key"
+columns = [1]
+[[constraint]]
+id = 2
+table = "db.orders"
+name = "pk_orders"
+type = "primary_key"
+columns = [1]
+[[constraint]]
+id = 3
+table = "db.orders"
+name = "fk_orders_customer"
+type = "foreign_key"
+columns = [2]
+references = { table = "db.customer", constraint = 1 }
+"#;
+    integrity_server::config::Config::from_toml(toml)
+        .unwrap()
+        .constraints
+}
+
+/// RFC 0011, RFC 0012: a Plane that first sees a table after other Planes filled it follows the
+/// whole certified history from the first snapshot, then enforces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plane_follows_a_table_another_plane_filled_from_its_first_snapshot() {
+    let e = env(None).await;
+    let mut planes = Vec::new();
+    for control in ["control-a", "control-b"] {
+        let dir = e.files.dir.0.join(control);
+        std::fs::create_dir_all(&dir).unwrap();
+        drop(Registry::open(dir.join("registry.redb"), &demo_configs()).unwrap());
+        planes.push(
+            start_gateway(
+                &e.files,
+                e.up,
+                None,
+                &[],
+                false,
+                None,
+                true,
+                false,
+                true,
+                control,
+                "indexes.redb",
+                "txn.redb",
+            )
+            .await,
+        );
+    }
+    let (a, b) = (planes[0].0.clone(), planes[1].0.clone());
+    assert_eq!(
+        e.append(&a, "customer", &[(1, None), (2, None)]).await.0,
+        200
+    );
+    assert_eq!(e.append(&a, "orders", &[(10, Some(1))]).await.0, 200);
+    assert_eq!(e.append(&a, "customer", &[(3, None)]).await.0, 200);
+    // b never saw these tables: it validates every snapshot from the first one, then decides.
+    let (status, body) = e.append(&b, "customer", &[(3, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-003"), "{body}");
+    let (status, body) = e.append(&b, "orders", &[(11, Some(4))]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-005"), "{body}");
+    assert_eq!(e.append(&b, "orders", &[(11, Some(2))]).await.0, 200);
+
+    // A table filled around every Plane cannot be followed: it needs onboarding, as before.
+    assert_eq!(e.bypassing("orders", &[(12, Some(1))]).await.0, 200);
+    let (c, _running) = {
+        let dir = e.files.dir.0.join("control-c");
+        std::fs::create_dir_all(&dir).unwrap();
+        drop(Registry::open(dir.join("registry.redb"), &demo_configs()).unwrap());
+        start_gateway(
+            &e.files,
+            e.up,
+            None,
+            &[],
+            false,
+            None,
+            true,
+            false,
+            true,
+            "control-c",
+            "indexes.redb",
+            "txn.redb",
+        )
+        .await
+    };
+    let (status, body) = e.append(&c, "customer", &[(5, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-010"), "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("register its constraints"), "{message}");
+}
+
 /// RFC 0012: a commit validated while another table of its domain was the same is refused by
 /// the catalog if that table moved before the commit reached it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1112,6 +1245,24 @@ async fn a_fenced_commit_fails_when_its_domain_moved() {
     let (status, body) = order.await.unwrap();
     assert_eq!(status, 409, "{body}");
     assert!(body_of(&e, "orders").await.as_array().unwrap().is_empty());
+}
+
+/// RFC 0012: a catalog that acknowledges a transaction it did not apply does not get the commit
+/// applied to the indexes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledged_transaction_that_was_lost_is_not_applied() {
+    let mut e = env(None).await;
+    e.fence = true;
+    e.restart("indexes.redb", "txn.redb").await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    e._shared.lock().unwrap().lose_transactions = true;
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!(status, 409, "{body}");
+    e._shared.lock().unwrap().lose_transactions = false;
+    // Key 2 is not in the indexes: the commit that was lost can be made again.
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+    assert_eq!(e.status().await["degraded"], Value::Null);
 }
 
 async fn body_of(e: &Env, table: &str) -> Value {

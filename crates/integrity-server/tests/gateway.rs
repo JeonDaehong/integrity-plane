@@ -384,7 +384,10 @@ fn relisting_commit(parent: &Value, io: &mut MemoryIo) -> Value {
         ),
     ]))
     .unwrap();
-    io.insert("mem://relist-manifest.avro", w.into_inner().unwrap());
+    io.insert(
+        "/tmp/oip-fixture/warehouse/db/orders/metadata/relist-manifest.avro",
+        w.into_inner().unwrap(),
+    );
 
     let list_schema = Schema::parse_str(
         r#"{"type": "record", "name": "manifest_file", "fields": [
@@ -401,7 +404,7 @@ fn relisting_commit(parent: &Value, io: &mut MemoryIo) -> Value {
     for m in manifests
         .iter()
         .map(|m| m.path.clone())
-        .chain(["mem://relist-manifest.avro".to_owned()])
+        .chain(["/tmp/oip-fixture/warehouse/db/orders/metadata/relist-manifest.avro".to_owned()])
     {
         w.append_value(Avro::Record(vec![
             ("manifest_path".into(), Avro::String(m)),
@@ -410,13 +413,16 @@ fn relisting_commit(parent: &Value, io: &mut MemoryIo) -> Value {
         ]))
         .unwrap();
     }
-    io.insert("mem://relist-list.avro", w.into_inner().unwrap());
+    io.insert(
+        "/tmp/oip-fixture/warehouse/db/orders/metadata/relist-list.avro",
+        w.into_inner().unwrap(),
+    );
 
     json!({
         "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": head}],
         "updates": [
             {"action": "add-snapshot", "snapshot": {"snapshot-id": 999, "parent-snapshot-id": head,
-                "sequence-number": 99, "timestamp-ms": 1, "manifest-list": "mem://relist-list.avro",
+                "sequence-number": 99, "timestamp-ms": 1, "manifest-list": "/tmp/oip-fixture/warehouse/db/orders/metadata/relist-list.avro",
                 "summary": {"operation": "append"}}},
             {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 999, "type": "branch"}
         ]

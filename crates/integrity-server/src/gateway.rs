@@ -43,6 +43,17 @@ use crate::store::{Anchor, AuditEvent, Registry, RegistryDoc, StoreError};
 mod catchup;
 mod fence;
 
+/// A table with data this Plane has not anchored and cannot follow from its first snapshot.
+fn not_onboarded(identifier: &str, why: Option<&str>) -> ApiError {
+    let why = why.map(|w| format!(" ({w})")).unwrap_or_default();
+    ApiError::new(
+        ErrorCode::IndexDegraded,
+        format!(
+            "{identifier} already has data{why}; register its constraints through the integrity API to onboard it"
+        ),
+    )
+}
+
 /// A table commit route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePath {
@@ -360,6 +371,8 @@ pub struct Gateway {
     pub(crate) catch_up: crate::config::CatchUpConfig,
     /// Forward commits as multi-table transactions asserting the domain (RFC 0012).
     pub(crate) fence: bool,
+    /// Locations readable besides each table's own (RFC 0013).
+    pub(crate) allowed_locations: Vec<String>,
 }
 
 pub(crate) enum Loaded {
@@ -403,6 +416,7 @@ impl Gateway {
             limits: Limits::default(),
             catch_up: crate::config::CatchUpConfig::default(),
             fence: false,
+            allowed_locations: Vec::new(),
         };
         gateway.check_control_store();
         Ok(gateway)
@@ -608,6 +622,12 @@ impl Gateway {
             token.to_owned(),
             body["expires_in"].as_u64().unwrap_or(3600),
         ))
+    }
+
+    /// Lets the Plane read `locations` besides each table's own (RFC 0013).
+    pub fn with_allowed_locations(mut self, locations: Vec<String>) -> Self {
+        self.allowed_locations = locations;
+        self
     }
 
     /// Forwards commits as multi-table transactions that assert every table of the domain
@@ -1110,14 +1130,15 @@ impl Gateway {
 
     /// Checks a domain member against its anchor (ADR 0011) and the indexes' head (RFC 0008): an
     /// empty table is anchored on first sight; a table with data needs onboarding; a replaced
-    /// table is refused. `Some(head)` when `main` is not the snapshot the indexes reflect: the
-    /// caller catches up from `head` or refuses (RFC 0011).
+    /// table is refused. `Some((head, fresh))` when `main` is not the snapshot the indexes reflect:
+    /// the caller catches up from `head` or refuses (RFC 0011). `fresh`: this Plane never anchored
+    /// the table, which another Plane filled; it can only follow its whole certified history.
     fn check_chain_head(
         &self,
         doc: &mut RegistryDoc,
         identifier: &str,
         meta: &TableMetadata,
-    ) -> Result<Option<Option<i64>>, ApiError> {
+    ) -> Result<Option<(Option<i64>, bool)>, ApiError> {
         let uuid = meta.table_uuid.to_lowercase();
         let head = meta.main_snapshot_id();
         let degraded = |e: integrity_index::IndexError| {
@@ -1149,30 +1170,48 @@ impl Gateway {
                     .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
                 Ok(None)
             }
-            None => Err(ApiError::new(
-                ErrorCode::IndexDegraded,
-                format!(
-                    "{identifier} already has data; register its constraints through the integrity API to onboard it"
-                ),
-            )),
+            // Another Plane may have taken every commit so far (RFC 0012): follow them all.
+            None if self.catch_up.enabled => {
+                let indexed = match self.store.head(identifier).map_err(degraded)? {
+                    Some(h) if h.table_uuid == uuid => h.snapshot,
+                    _ => None,
+                };
+                Ok(Some((indexed, true)))
+            }
+            None => Err(not_onboarded(identifier, None)),
             Some(a) if a.table_uuid != uuid => Err(ApiError::new(
                 ErrorCode::IndexDegraded,
                 format!("{identifier} was replaced by another table; rebuild its domain"),
             )),
             Some(_) => match self.store.head(identifier).map_err(degraded)? {
                 Some(h) if h.table_uuid == uuid && h.snapshot == head.map(|h| h.0) => Ok(None),
+                Some(h) if h.table_uuid == uuid => Ok(Some((h.snapshot, false))),
                 None => Err(ApiError::new(
                     ErrorCode::IndexDegraded,
                     format!(
                         "the index store does not record which snapshot of {identifier} it reflects (written before RFC 0008); rebuild its domain"
                     ),
                 )),
-                Some(h) if h.table_uuid == uuid => Ok(Some(h.snapshot)),
                 Some(_) => Err(ApiError::new(
                     ErrorCode::IndexDegraded,
                     format!("{identifier} was replaced by another table; rebuild its domain"),
                 )),
             },
+        }
+    }
+
+    /// Refuses a table that `catch_up` could not follow: a table this Plane never anchored is
+    /// not enforced yet (onboarding), any other one was moved around the indexes (RFC 0008).
+    fn refuse_behind(
+        &self,
+        doc: &mut RegistryDoc,
+        b: &catchup::Behind,
+        why: Option<&str>,
+    ) -> ApiError {
+        if b.fresh {
+            not_onboarded(&b.identifier, why)
+        } else {
+            self.refuse_head(doc, &b.identifier, &b.meta, b.indexed, why)
         }
     }
 
@@ -1352,11 +1391,12 @@ impl Gateway {
                 ),
             );
             bindings.insert(ident.clone(), binding);
-            if let Some(indexed) = indexed {
+            if let Some((indexed, fresh)) = indexed {
                 behind.push(catchup::Behind {
                     identifier: ident.clone(),
                     meta: meta.clone(),
                     indexed,
+                    fresh,
                 });
             }
             if ident == identifier {
@@ -1516,6 +1556,7 @@ impl Gateway {
             stats: Arc::new(pipeline::Stats::default()),
             scratch: self.store.scratch_dir().to_path_buf(),
             memory: self.scan_memory,
+            allowed: self.allowed_locations.clone(),
         };
         let stats = Arc::clone(&job.stats);
         let validating = Instant::now();
@@ -1675,6 +1716,7 @@ impl Gateway {
                 table,
                 uuid: &meta.table_uuid.to_lowercase(),
                 base: base_snapshot,
+                snapshot: final_snapshot,
                 others: &others,
             };
             self.forward_fenced(&fence, &headers, request.json())

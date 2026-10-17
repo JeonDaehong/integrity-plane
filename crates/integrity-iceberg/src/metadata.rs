@@ -51,6 +51,12 @@ pub struct TableMetadata {
     /// Default sort order id.
     #[serde(default)]
     pub default_sort_order_id: Option<i64>,
+    /// The table's base location.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Table properties.
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
 }
 
 /// A table schema.

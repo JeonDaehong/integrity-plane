@@ -3,6 +3,8 @@
 
 [server]
 bind = "0.0.0.0:8181"
+# No API token: local test setup only (ADR 0027).
+open_api = true
 
 [upstream]
 catalog_uri = "http://iceberg-rest:8181"

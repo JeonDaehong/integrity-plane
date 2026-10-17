@@ -8,7 +8,9 @@
 bind = "0.0.0.0:8181"
 # Require "Authorization: Bearer <token>" on /v1/integrity/* (except status, keys, /metrics).
 # Audit events name the holder of the token used (ADR 0026); admin_token is the token named "admin".
-# admin_token = "change-me"
+# The Plane does not start without a token (ADR 0027); `open_api = true` serves the API without one,
+# for local tests only.
+admin_token = "change-me"
 # [[server.api_tokens]]
 # name = "alice"
 # token_sha256 = "<hex SHA-256 of alice's token, e.g. printf %s TOKEN | sha256sum>"
@@ -101,6 +103,9 @@ endpoint = "http://minio:9000"
 region = "us-east-1"
 allow_http = true
 # access_key_id / secret_access_key may also come from AWS_* environment variables.
+# Locations the Plane may read besides each table's own location and write.*.path properties
+# (RFC 0013), e.g. where files added with add_files lie.
+# allowed_locations = ["s3://imports/legacy/"]
 
 [[constraint]]
 id = 1

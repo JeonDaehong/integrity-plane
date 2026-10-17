@@ -48,6 +48,20 @@ pub(super) fn parse_domain_state(text: &str) -> Option<BTreeMap<String, Option<i
         .collect()
 }
 
+/// Whether `snapshot` is `main` or one of its ancestors.
+fn on_main(meta: &integrity_iceberg::TableMetadata, snapshot: i64) -> bool {
+    let mut at = meta.main_snapshot_id().map(|s| s.0);
+    while let Some(id) = at {
+        if id == snapshot {
+            return true;
+        }
+        at = meta
+            .snapshot(integrity_types::SnapshotId(id))
+            .and_then(|s| s.parent_snapshot_id);
+    }
+    false
+}
+
 /// A table identifier as the REST protocol writes it.
 fn identifier_json(identifier: &str) -> Option<Value> {
     let (ns, table) = identifier.rsplit_once('.')?;
@@ -61,6 +75,8 @@ pub(super) struct Fence<'a> {
     /// Its uuid and the snapshot the commit was validated on.
     pub uuid: &'a str,
     pub base: Option<i64>,
+    /// The snapshot `main` moves to.
+    pub snapshot: i64,
     /// Every other table of the domain: identifier → (uuid, `main` the validation used).
     pub others: &'a BTreeMap<String, (String, Option<i64>)>,
 }
@@ -140,6 +156,26 @@ impl Gateway {
         }
         // The catalog answers a transaction without the table: load it, as the client expects.
         match self.load(&fence.table.path(), headers).await {
+            // An acknowledged transaction whose snapshot is not on `main` did not happen: some
+            // catalogs lose changes of concurrent transactions (RFC 0012, compatibility.md).
+            Ok(Loaded::Table(meta, _)) if !on_main(&meta, fence.snapshot) => Ok(Some(Captured {
+                status: 409,
+                headers: vec![(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                body: Bytes::from(
+                    serde_json::to_vec(&json!({"error": {
+                        "message": format!(
+                            "the catalog acknowledged the commit, but snapshot {} is not on main; retry",
+                            fence.snapshot
+                        ),
+                        "type": "CommitFailedException",
+                        "code": 409,
+                    }}))
+                    .unwrap_or_default(),
+                ),
+            })),
             Ok(Loaded::Table(_, body)) => Ok(Some(Captured {
                 status: 200,
                 headers: vec![(

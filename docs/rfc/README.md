@@ -19,3 +19,4 @@ File name: `NNNN-short-title.md`. Use [`template.md`](template.md).
 | [0010](0010-compressed-terminal-records.md) | Compressed terminal records in the transaction log | Accepted |
 | [0011](0011-catch-up.md) | Catching up from the table history | Accepted |
 | [0012](0012-fenced-domain-commits.md) | Fenced domain commits (several active Planes) | Accepted |
+| [0013](0013-confined-file-reads.md) | Reading only the table's files | Accepted |

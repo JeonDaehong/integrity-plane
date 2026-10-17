@@ -32,8 +32,11 @@ matter on day one:
 | `[upstream.auth]` | the Plane's own credentials for reading metadata, onboarding and `verify`; writers' commits are forwarded with the writers' credentials |
 | `[storage]` | how the Plane reads manifests and data files (S3 endpoint, region, credentials) |
 | `[control_store] path` | a local SSD; this is the Plane's state (indexes, transaction log, registry) |
-| `[server] admin_token` or `[[server.api_tokens]]` | protects the integrity API (constraints, rebuild, audit) |
+| `[server] admin_token` or `[[server.api_tokens]]` | protects the integrity API (constraints, rebuild, audit); the Plane does not start without one (ADR 0027) |
 | `[signing]` | optional; certificates signed with a key file, Vault Transit or an HSM (RFC 0005, RFC 0009) |
+
+The Plane serves plain HTTP: put TLS in front of it (ingress, load balancer), since writers'
+catalog credentials and API tokens pass through it.
 
 The control store must survive restarts (a volume or a host directory), and only one Plane may use
 it ([`recovery.md`](recovery.md#single-node-and-power-loss)). Back it up only while the Plane is
@@ -126,7 +129,9 @@ For availability, run two or more Planes behind a load balancer, each with its o
 fence = "multi-table"
 ```
 
-on every Plane (RFC 0012). Each commit then asserts the whole integrity domain at the catalog, and
+on every Plane (RFC 0012), with an upstream catalog that supports it: Lakekeeper, not Polaris 1.7,
+Nessie or the REST fixture (`compatibility.md`, "Catalogs for several Planes"). Each commit then
+asserts the whole integrity domain at the catalog, and
 a Plane that missed commits taken by another validates them again before its next one. Register
 the same constraints on every Plane in the same order (or declare them in the configuration file
 they share). Commits to one domain through different Planes at the same time retry on 409, so a

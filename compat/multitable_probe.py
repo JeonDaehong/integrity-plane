@@ -99,4 +99,58 @@ s, r = call("POST", "transactions/commit", {"table-changes": [
 check("assert-ref-snapshot-id is checked on a table without updates",
       s == 409 and prop("a") == "1", (s, r, prop("a")))
 
+# 4. Isolation under concurrency: two transactions at once, each changing one table and asserting
+# the other is unchanged. At most one of them may commit (otherwise the assertion on the table
+# without updates was checked too early). Schema changes move `current-schema-id`.
+import threading  # noqa: E402
+
+
+def schema_change(t, other, other_schema_id, n):
+    fields = [{"id": 1, "name": "id", "required": True, "type": "long"},
+              {"id": 100 + n, "name": f"c{n}", "required": False, "type": "long"}]
+    meta = call("GET", f"namespaces/mtprobe/tables/{t}")[1]["metadata"]
+    return {"table-changes": [
+        {"identifier": ident(t),
+         "requirements": [{"type": "assert-current-schema-id",
+                           "current-schema-id": meta["current-schema-id"]}],
+         "updates": [{"action": "add-schema", "schema": {"type": "struct", "fields": fields},
+                      "last-column-id": max(meta["last-column-id"], 100 + n)},
+                     {"action": "set-current-schema", "schema-id": -1}]},
+        {"identifier": ident(other),
+         "requirements": [{"type": "assert-current-schema-id", "current-schema-id": other_schema_id}],
+         "updates": []},
+    ]}
+
+
+both = 0
+lost = 0
+for n in range(1, 31):
+    ma = call("GET", "namespaces/mtprobe/tables/a")[1]["metadata"]
+    mb = call("GET", "namespaces/mtprobe/tables/b")[1]["metadata"]
+    bodies = [schema_change("a", "b", mb["current-schema-id"], 2 * n),
+              schema_change("b", "a", ma["current-schema-id"], 2 * n + 1)]
+    results = [None, None]
+    barrier = threading.Barrier(2)
+
+    def run(i):
+        barrier.wait()
+        results[i] = call("POST", "transactions/commit", bodies[i])[0]
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in (0, 1)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if all(s in (200, 204) for s in results):
+        both += 1
+    # A transaction answered as committed must have changed its table.
+    for i, (t, before) in enumerate((("a", ma), ("b", mb))):
+        after = call("GET", f"namespaces/mtprobe/tables/{t}")[1]["metadata"]
+        if results[i] in (200, 204) and after["current-schema-id"] == before["current-schema-id"]:
+            lost += 1
+check("concurrent transactions asserting each other's table: never both commit",
+      both == 0, f"both committed in {both} of 30 rounds")
+check("a transaction answered as committed was applied", lost == 0,
+      f"{lost} acknowledged transactions left their table unchanged")
+
 sys.exit(0 if ok else 1)

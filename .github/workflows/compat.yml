@@ -15,7 +15,8 @@ permissions:
 
 jobs:
   clients:
-    # Every client again with fenced multi-table commits (RFC 0012).
+    # Every client again with fenced multi-table commits (RFC 0012): functional coverage of the
+    # transaction path; the fixture is not safe for several Planes (docs/compatibility.md).
     strategy:
       fail-fast: false
       matrix:
@@ -41,9 +42,6 @@ jobs:
           mkdir -p /tmp/warehouse && chmod 777 /tmp/warehouse
           docker compose -f compat/docker-compose.yml up -d
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:8182/v1/config && break; sleep 2; done
-      - name: The upstream catalog's multi-table commits (RFC 0012)
-        if: matrix.fence == 'multi-table'
-        run: python3 compat/multitable_probe.py http://127.0.0.1:8182
       - name: Start gateway
         run: |
           ./target/release/integrity-server compat/integrity.toml > gateway.log 2>&1 &
@@ -187,6 +185,8 @@ jobs:
           prefix=$(bash compat/lakekeeper_setup.sh | tail -1)
           test -n "$prefix"
           echo "INTEGRITY__UPSTREAM__PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Multi-table commits are atomic under concurrency (RFC 0012)
+        run: python3 compat/multitable_probe.py http://127.0.0.1:8185/catalog "$INTEGRITY__UPSTREAM__PREFIX"
       - name: Start gateway
         run: |
           echo "prefix: $INTEGRITY__UPSTREAM__PREFIX"

@@ -115,6 +115,8 @@ pub struct Job {
     pub scratch: PathBuf,
     /// Bytes of keys a validation keeps in memory before spilling sorted runs.
     pub memory: usize,
+    /// Locations readable besides the table's own (RFC 0013).
+    pub allowed: Vec<String>,
 }
 
 /// What a validation read (metrics `integrity_bytes_read_total`, `integrity_keys_validated_total`).
@@ -173,7 +175,9 @@ fn api(e: impl std::fmt::Display, code: ErrorCode) -> ApiError {
 
 /// Runs the job.
 pub fn run(job: &Job) -> Result<Outcome, ApiError> {
-    let io = Budgeted::new(job.io.as_ref(), job.budget);
+    // Only the table's own files (RFC 0013): the writer names every location.
+    let confined = integrity_iceberg::Confined::for_table(job.io.as_ref(), &job.meta, &job.allowed);
+    let io = Budgeted::new(&confined as &(dyn FileIo + Send + Sync), job.budget);
     let outcome = run_with(job, &io);
     job.stats
         .bytes
@@ -181,7 +185,10 @@ pub fn run(job: &Job) -> Result<Outcome, ApiError> {
     outcome
 }
 
-fn run_with(job: &Job, io: &Budgeted<'_, dyn FileIo + Send + Sync>) -> Result<Outcome, ApiError> {
+fn run_with<'a>(
+    job: &'a Job,
+    io: &Budgeted<'a, dyn FileIo + Send + Sync + 'a>,
+) -> Result<Outcome, ApiError> {
     let timed: BTreeMap<ConstraintId, Timed<'_>> = job
         .indexes
         .iter()

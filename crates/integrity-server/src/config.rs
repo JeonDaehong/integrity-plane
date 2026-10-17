@@ -241,6 +241,9 @@ pub struct ServerConfig {
     /// its name. `admin_token` is the token named `admin`.
     #[serde(default)]
     pub api_tokens: Vec<ApiTokenConfig>,
+    /// Serve the integrity API without tokens (local tests and demos only, ADR 0027).
+    #[serde(default)]
+    pub open_api: bool,
 }
 
 /// `[[server.api_tokens]]` (ADR 0026): `token` or its hex SHA-256 `token_sha256`, not both.
@@ -307,7 +310,19 @@ impl ServerConfig {
             };
             out.push((t.name.clone(), digest));
         }
-        Ok(out)
+        // Closed by default (ADR 0027): an open API lets anyone who reaches the Plane drop
+        // constraints or disable a domain, which forwards its commits unchecked.
+        match (out.is_empty(), self.open_api) {
+            (true, false) => Err(ConfigError(
+                "the integrity API has no token: set server.admin_token or [[server.api_tokens]] \
+                 (server.open_api = true serves it without one, for local tests only)"
+                    .into(),
+            )),
+            (false, true) => Err(ConfigError(
+                "server.open_api = true and API tokens are set: choose one".into(),
+            )),
+            _ => Ok(out),
+        }
     }
 }
 
@@ -511,6 +526,10 @@ pub struct StorageConfig {
     /// Allow plain HTTP (local MinIO only).
     #[serde(default)]
     pub allow_http: bool,
+    /// Locations the Plane may read besides each table's own (RFC 0013), e.g. where files added
+    /// to tables with `add_files` lie.
+    #[serde(default)]
+    pub allowed_locations: Vec<String>,
 }
 
 /// One `[[constraint]]` entry (also the registry's stored form).
@@ -675,6 +694,43 @@ max_inline_validation_bytes = "2GiB"
             .server
             .tokens()
             .map_err(|e| e.0)
+    }
+
+    #[test]
+    fn the_api_is_closed_unless_opened_explicitly() {
+        let tokens = |server: &str| {
+            Config::from_toml(&BASE.replace("bind = \"127.0.0.1:8181\"", server))
+                .unwrap()
+                .server
+                .tokens()
+                .map_err(|e| e.0)
+        };
+        let e = tokens("bind = \"127.0.0.1:8181\"").unwrap_err();
+        assert!(e.contains("no token"), "{e}");
+        assert!(
+            tokens(
+                "bind = \"x\"
+open_api = true"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let e = tokens(
+            "bind = \"x\"
+open_api = true
+admin_token = \"t\"",
+        )
+        .unwrap_err();
+        assert!(e.contains("choose one"), "{e}");
+        assert_eq!(
+            tokens(
+                "bind = \"x\"
+admin_token = \"t\""
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[test]
