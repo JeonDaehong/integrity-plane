@@ -32,7 +32,8 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
   `ABORTED`; a 5xx or no answer ⇒ resolved as below. If applying or logging fails, the domain refuses
   commits until recovery or a rebuild, as after a crash.
 - Terminal records store the response, returned again for a repeated `Idempotency-Key`, and
-  when it was given. The terminal record and the deletion of the transaction's staged deltas are
+  when it was given, compressed with zstd (RFC 0010; records written before are read as they
+  are). The terminal record and the deletion of the transaction's staged deltas are
   one durable write: only unresolved transactions keep staged deltas.
 - Transactions are kept for `[txn_log] retention` after their terminal record (default `24h`, at
   least `30m`, the advertised idempotency key lifetime), then deleted, at start and at most once a

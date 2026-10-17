@@ -1311,6 +1311,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "zstd 0.14.0",
 ]
 
 [[package]]

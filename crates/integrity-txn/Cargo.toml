@@ -20,6 +20,8 @@ redb.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Terminal records are compressed (RFC 0010). MIT; the version parquet already uses.
+zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 redb.workspace = true

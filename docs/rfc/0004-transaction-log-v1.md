@@ -65,7 +65,8 @@ allocated from the log, strictly increasing, never reused.
   `oip/txn-staged/v1` under the same `txn_id`.
 - `COMMITTING`: empty object. Written immediately before the request is forwarded upstream.
 - `COMMITTED`, `ABORTED`, `REJECTED`: `status` (HTTP status returned to the client) and `body`
-  (the response body, JSON), so that a repeated `request_id` gets the same answer.
+  (the response body, JSON), so that a repeated `request_id` gets the same answer. Since RFC 0010
+  this payload is compressed as one zstd frame.
 
 ### Staged delta encoding
 

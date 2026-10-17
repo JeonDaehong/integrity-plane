@@ -71,7 +71,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Index stores written before RFC 0008 record no heads: every enforced domain refuses commits
   (`INDEX_DEGRADED`) until it is rebuilt once.
 - The transaction log keeps finished transactions for `[txn_log] retention` (default 24 h), then
-  deletes them; idempotency keys are honoured for that long. The audit log and the per-transaction
+  deletes them; idempotency keys are honoured for that long. Each keeps the response given, for an
+  accepted commit the table's whole metadata (compressed, RFC 0010), so the log grows with commits
+  per retention period times the size of the table's metadata; expire snapshots to keep it small. The audit log and the per-transaction
   error reports in `registry.redb` are never pruned.
 - The persistent index takes about 100 bytes per key.
 - Losing `registry.redb` cannot be detected from the other files; constraints from the

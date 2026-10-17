@@ -128,13 +128,51 @@ pub struct Unresolved {
     pub staged: Vec<StagedEntry>,
 }
 
-/// The payload of a terminal record: the decision and, since RFC 0006, when it was made.
+/// The payload of a terminal record: the decision and, since RFC 0006, when it was made;
+/// compressed since RFC 0010.
 #[derive(Serialize, Deserialize)]
 struct Terminal {
     status: u16,
     body: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     finished_at: Option<u64>,
+}
+
+/// Start of a zstd frame (RFC 8878): a terminal record compressed under RFC 0010.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+/// zstd level of terminal records (RFC 0010).
+const TERMINAL_LEVEL: i32 = 3;
+/// A terminal record never decompresses to more than this (RFC 0010).
+const TERMINAL_MAX: u64 = 256 << 20;
+
+impl Terminal {
+    /// The payload: the JSON as one zstd frame (RFC 0010).
+    fn encode(&self) -> Result<Vec<u8>, TxnError> {
+        let json = serde_json::to_vec(self).map_err(|e| TxnError::Storage(e.to_string()))?;
+        zstd::encode_all(json.as_slice(), TERMINAL_LEVEL)
+            .map_err(|e| TxnError::Storage(e.to_string()))
+    }
+
+    /// Reads a payload: a zstd frame, or plain JSON as written before RFC 0010.
+    fn decode(payload: &[u8]) -> Result<Self, TxnError> {
+        if payload.first() == Some(&b'{') {
+            return serde_json::from_slice(payload).map_err(corrupt);
+        }
+        if !payload.starts_with(&ZSTD_MAGIC) {
+            return Err(TxnError::Corrupt);
+        }
+        let mut json = Vec::new();
+        let decoder = zstd::stream::read::Decoder::new(payload).map_err(corrupt)?;
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(decoder, TERMINAL_MAX + 1),
+            &mut json,
+        )
+        .map_err(corrupt)?;
+        if json.len() as u64 > TERMINAL_MAX {
+            return Err(TxnError::Corrupt);
+        }
+        serde_json::from_slice(&json).map_err(corrupt)
+    }
 }
 
 /// Everything recorded about one transaction (`GET /v1/integrity/transactions/{id}`).
@@ -642,7 +680,7 @@ impl TxnLog {
                     }
                     TxnState::Committing => {}
                     TxnState::Committed | TxnState::Aborted | TxnState::Rejected => {
-                        let d: Terminal = serde_json::from_slice(&payload).map_err(corrupt)?;
+                        let d = Terminal::decode(&payload)?;
                         t.finished_at = Some(d.finished_at.unwrap_or(legacy_finished_at));
                     }
                 }
@@ -813,7 +851,7 @@ impl TxnLog {
                 }
                 TxnState::Committing => {}
                 TxnState::Committed | TxnState::Aborted | TxnState::Rejected => {
-                    let d: Terminal = serde_json::from_slice(&payload).map_err(corrupt)?;
+                    let d = Terminal::decode(&payload)?;
                     decision = Some(Decision {
                         status: d.status,
                         body: d.body,
@@ -1042,12 +1080,12 @@ impl TxnLog {
             });
         }
         let now = (self.options.clock)();
-        let payload = serde_json::to_vec(&Terminal {
+        let payload = Terminal {
             status: decision.status,
             body: decision.body,
             finished_at: Some(now),
-        })
-        .map_err(|e| TxnError::Storage(e.to_string()))?;
+        }
+        .encode()?;
         self.append(txn, state, &payload)?;
         let due = {
             let mut index = self.index.lock().map_err(poisoned)?;
@@ -1233,6 +1271,96 @@ mod tests {
     use integrity_core::{KeyDelta, KeySchema, KeyValue, TypeFamily};
     use integrity_index::{IndexDelta, IndexKind, KeyIndex, MemoryIndex};
     use integrity_types::SnapshotId;
+
+    /// Table metadata the way a catalog returns it after many commits.
+    fn metadata(snapshots: u64) -> Value {
+        let snaps: Vec<Value> = (1..=snapshots)
+            .map(|i| {
+                serde_json::json!({
+                    "snapshot-id": 7_000_000_000_000_000_000_i64 + i as i64,
+                    "parent-snapshot-id": 7_000_000_000_000_000_000_i64 + i as i64 - 1,
+                    "sequence-number": i, "timestamp-ms": 1_760_000_000_000_u64 + i * 997,
+                    "manifest-list": format!("s3://bucket/warehouse/db/t/metadata/snap-{i}-1-0e5c6f3a.avro"),
+                    "summary": {"operation": "append", "added-records": "1", "total-records": i.to_string(),
+                        "integrity.cert": blake3::hash(&i.to_le_bytes()).to_hex().to_string(),
+                        "integrity.cert-version": "1", "integrity.constraint-set-version": "1"},
+                    "schema-id": 0
+                })
+            })
+            .collect();
+        serde_json::json!({"metadata-location": "s3://bucket/m.json", "metadata": {"snapshots": snaps}})
+    }
+
+    #[test]
+    fn terminal_records_are_compressed_and_read_back_unchanged() {
+        let dir = std::env::temp_dir().join(format!("oip-terminal-zstd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("txn.redb");
+        let body = metadata(2_000);
+        let json_len = serde_json::to_vec(&body).unwrap().len();
+        let decision = Decision { status: 200, body };
+        let txn = {
+            let log = TxnLog::open(&path).unwrap();
+            let txn = log
+                .begin(Prepared {
+                    request_id: Some("r-1".into()),
+                    table: "t".into(),
+                    identifier: "db.t".into(),
+                    load_path: "/t".into(),
+                })
+                .unwrap();
+            log.finish(txn, TxnState::Aborted, decision.clone())
+                .unwrap();
+            let records = log.records().unwrap();
+            let (_, record) = records.last().unwrap();
+            let (state, _, payload) = decode_record(record).unwrap();
+            assert_eq!(state, TxnState::Aborted);
+            assert!(payload.starts_with(&ZSTD_MAGIC));
+            assert!(
+                payload.len() * 8 < json_len,
+                "{} bytes for {json_len} bytes of JSON",
+                payload.len()
+            );
+            txn
+        };
+        let log = TxnLog::open(&path).unwrap();
+        assert_eq!(log.decision(txn), Some(decision.clone()));
+        assert_eq!(log.decision_for("r-1").unwrap(), Some(decision));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_json_terminal_records_are_read_and_bad_frames_are_corrupt() {
+        let plain = serde_json::to_vec(&Terminal {
+            status: 409,
+            body: serde_json::json!({"error": {"code": 409}}),
+            finished_at: Some(5),
+        })
+        .unwrap();
+        let read = Terminal::decode(&plain).unwrap();
+        assert_eq!((read.status, read.finished_at), (409, Some(5)));
+
+        let compressed = Terminal {
+            status: 200,
+            body: metadata(3),
+            finished_at: None,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(Terminal::decode(&compressed).unwrap().body, metadata(3));
+        let mut truncated = compressed.clone();
+        truncated.truncate(compressed.len() / 2);
+        assert_eq!(Terminal::decode(&truncated).err(), Some(TxnError::Corrupt));
+        assert_eq!(Terminal::decode(b"xyz").err(), Some(TxnError::Corrupt));
+        // A frame that inflates beyond the bound is refused, not read into memory.
+        let bomb = zstd::encode_all(
+            std::io::Read::take(std::io::repeat(b' '), TERMINAL_MAX + 1024),
+            TERMINAL_LEVEL,
+        )
+        .unwrap();
+        assert_eq!(Terminal::decode(&bomb).err(), Some(TxnError::Corrupt));
+    }
 
     #[test]
     fn an_unresolved_transaction_written_before_rfc_0006_still_replays() {

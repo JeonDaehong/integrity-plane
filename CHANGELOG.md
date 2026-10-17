@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Terminal records in the transaction log are compressed with zstd (RFC 0010). They keep the
+  response given, for an accepted commit the table's whole metadata, for `[txn_log] retention`;
+  in a benchmark of 3 200 commits to one table the log had reached 4 GiB. Logs written before are
+  read unchanged; a version without RFC 0010 cannot read the new records (downgrade note in the
+  RFC).
+
 - Signing keys outside the Plane (RFC 0009): `[signing] backend = "vault-transit"` signs with a
   HashiCorp Vault Transit `ed25519` key (pinned to one key version per run), `backend = "pkcs11"`
   with an Ed25519 key in a PKCS#11 token. Signatures and verification are unchanged (RFC 0005).
