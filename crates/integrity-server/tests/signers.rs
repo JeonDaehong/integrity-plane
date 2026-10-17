@@ -113,15 +113,23 @@ async fn a_real_vault_transit_key_signs_certificates() {
             .json(&body)
             .send()
     };
+    // A mount of its own per run: a dev server keeps earlier runs' mounts.
+    let mount = format!(
+        "oip-transit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     let mounted = post(
-        "sys/mounts/oip-transit",
+        &format!("sys/mounts/{mount}"),
         serde_json::json!({"type": "transit"}),
     )
     .await
     .unwrap();
     assert!(mounted.status().is_success(), "{}", mounted.status());
     let created = post(
-        "oip-transit/keys/oip",
+        &format!("{mount}/keys/oip"),
         serde_json::json!({"type": "ed25519"}),
     )
     .await
@@ -129,7 +137,7 @@ async fn a_real_vault_transit_key_signs_certificates() {
     assert!(created.status().is_success(), "{}", created.status());
 
     let mut config = transit(&address, None);
-    config.mount = "oip-transit".into();
+    config.mount = mount;
     let signer = Signer::Vault(std::sync::Arc::new(
         VaultSigner::connect(&config, token.clone(), Duration::from_secs(10))
             .await
