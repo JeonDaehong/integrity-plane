@@ -77,6 +77,12 @@ retention = "24h"
 # key_label = "cert-signing"      # CKA_LABEL of the private and the public key
 # pin_file = "/run/secrets/hsm-pin"         # default: the INTEGRITY_PKCS11_PIN environment variable
 
+[ha]
+# "multi-table": forward commits as multi-table transactions asserting every table of the domain,
+# so several Planes can take commits for the same tables (RFC 0012). Needs an upstream catalog
+# with multi-table commits. Default "none": one Plane per domain.
+fence = "none"
+
 [catch_up]
 # Follow certified snapshots the indexes have not seen (a restored control store, another Plane),
 # validating them again, instead of refusing them until a rebuild (RFC 0011).

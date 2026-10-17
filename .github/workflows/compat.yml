@@ -15,8 +15,15 @@ permissions:
 
 jobs:
   clients:
+    # Every client again with fenced multi-table commits (RFC 0012).
+    strategy:
+      fail-fast: false
+      matrix:
+        fence: [none, multi-table]
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      INTEGRITY__HA__FENCE: ${{ matrix.fence }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -34,6 +41,9 @@ jobs:
           mkdir -p /tmp/warehouse && chmod 777 /tmp/warehouse
           docker compose -f compat/docker-compose.yml up -d
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:8182/v1/config && break; sleep 2; done
+      - name: The upstream catalog's multi-table commits (RFC 0012)
+        if: matrix.fence == 'multi-table'
+        run: python3 compat/multitable_probe.py http://127.0.0.1:8182
       - name: Start gateway
         run: |
           ./target/release/integrity-server compat/integrity.toml > gateway.log 2>&1 &

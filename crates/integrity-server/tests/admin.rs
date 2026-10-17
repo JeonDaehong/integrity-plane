@@ -38,6 +38,8 @@ struct Env {
     signer: Option<Signer>,
     /// `[catch_up] enabled` (RFC 0011).
     catch_up: bool,
+    /// `[ha] fence = "multi-table"` (RFC 0012).
+    fence: bool,
     running: Option<Running>,
 }
 
@@ -57,6 +59,7 @@ async fn start_gateway(
     signer: Option<Signer>,
     catch_up: bool,
     require_signatures: bool,
+    fence: bool,
     control: &str,
     index_file: &str,
     log_file: &str,
@@ -103,7 +106,8 @@ async fn start_gateway(
     .with_catch_up(integrity_server::config::CatchUpConfig {
         enabled: catch_up,
         ..Default::default()
-    });
+    })
+    .with_fence(fence);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -180,6 +184,7 @@ async fn env_named(
         signer.clone(),
         true,
         false,
+        false,
         "control",
         "indexes.redb",
         "txn.redb",
@@ -197,6 +202,7 @@ async fn env_named(
         redact,
         signer,
         catch_up: true,
+        fence: false,
         running: Some(running),
     }
 }
@@ -243,6 +249,7 @@ impl Env {
             self.signer.clone(),
             self.catch_up,
             false,
+            self.fence,
             "control",
             index_file,
             log_file,
@@ -755,6 +762,7 @@ async fn a_second_plane_catches_up_with_the_first() {
         None,
         true,
         false,
+        false,
         "control-b",
         "indexes.redb",
         "txn.redb",
@@ -824,6 +832,7 @@ async fn with_signatures_required_unsigned_snapshots_are_not_followed() {
         Some(integrity_core::CertSigner::from_seed(&[9u8; 32]).into()),
         true,
         true,
+        false,
         "control-b",
         "indexes.redb",
         "txn.redb",
@@ -1011,6 +1020,104 @@ async fn a_copy_that_catches_up_has_the_same_indexes() {
         })
         .await;
     }
+}
+
+/// RFC 0012: two fenced Planes take commits for an FK parent and child in turn; each catches up
+/// with the other's commits in the order they happened, and decides as one Plane would.
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_planes_take_commits_for_linked_tables_in_turn() {
+    let mut e = env(None).await;
+    e.fence = true;
+    e.restart("indexes.redb", "txn.redb").await;
+    e.register_demo().await;
+    let (b, _running) = start_gateway(
+        &e.files,
+        e.up,
+        None,
+        &[],
+        false,
+        None,
+        true,
+        false,
+        true,
+        "control-b",
+        "indexes.redb",
+        "txn.redb",
+    )
+    .await;
+    let a = std::mem::replace(&mut e.gateway, b.clone());
+    e.register_demo().await;
+    e.gateway = a.clone();
+
+    assert_eq!(e.append(&a, "customer", &[(1, None)]).await.0, 200);
+    assert_eq!(e.append(&b, "orders", &[(10, Some(1))]).await.0, 200);
+    assert_eq!(e.append(&a, "customer", &[(2, None)]).await.0, 200);
+    assert_eq!(e.append(&a, "orders", &[(11, Some(2))]).await.0, 200);
+    // Both tables moved for b: it replays them in the recorded order before deciding.
+    let (status, body) = e.append(&b, "customer", &[(3, None)]).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = e.append(&b, "orders", &[(12, Some(99))]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-005"), "{body}");
+    let (status, body) = e.append(&b, "customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-003"), "{body}");
+    let (status, body) = e.append(&a, "orders", &[(10, Some(3))]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-003"), "{body}");
+
+    let snaps = body_of(&e, "customer").await;
+    let summary = &snaps.as_array().unwrap().last().unwrap()["summary"];
+    assert!(
+        summary["integrity.domain-state"]
+            .as_str()
+            .unwrap()
+            .starts_with("22222222-2222-2222-2222-222222222222@")
+    );
+    let up = e._shared.lock().unwrap();
+    assert_eq!(
+        up.transactions, 5,
+        "every accepted commit went as a transaction"
+    );
+}
+
+/// RFC 0012: a commit validated while another table of its domain was the same is refused by
+/// the catalog if that table moved before the commit reached it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_commit_fails_when_its_domain_moved() {
+    let mut e = env(None).await;
+    e.fence = true;
+    e.restart("indexes.redb", "txn.redb").await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    e._shared
+        .lock()
+        .unwrap()
+        .gates
+        .insert("/v1/transactions/commit".into(), Arc::clone(&gate));
+    let e = Arc::new(e);
+    // The order is validated against customer as it is now, then waits at the catalog.
+    let order = tokio::spawn({
+        let e = Arc::clone(&e);
+        async move { e.through_plane("orders", &[(10, Some(1))]).await }
+    });
+    for _ in 0..200 {
+        if e._shared.lock().unwrap().gated > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Meanwhile customer moves (a writer around this Plane, or another Plane).
+    e._shared.lock().unwrap().gates.clear();
+    assert_eq!(e.bypassing("customer", &[(2, None)]).await.0, 200);
+    gate.add_permits(1);
+    let (status, body) = order.await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert!(body_of(&e, "orders").await.as_array().unwrap().is_empty());
+}
+
+async fn body_of(e: &Env, table: &str) -> Value {
+    let url = format!("{}/v1/namespaces/db/tables/{table}", e.upstream);
+    let meta: Value = e.http.get(&url).send().await.unwrap().json().await.unwrap();
+    meta["metadata"]["snapshots"].clone()
 }
 
 #[tokio::test(flavor = "multi_thread")]

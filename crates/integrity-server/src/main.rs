@@ -91,7 +91,8 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         client_header,
     )
     .with_upstream_auth(config.upstream.auth.clone())
-    .with_catch_up(config.catch_up);
+    .with_catch_up(config.catch_up)
+    .with_fence(config.ha.fence == integrity_server::config::Fence::MultiTable);
     let gateway = match &config.signing {
         Some(s) => {
             let timeout = Duration::from_secs(config.upstream.timeout_secs);

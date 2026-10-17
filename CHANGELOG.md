@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Several Planes in front of the same tables (RFC 0012): with `[ha] fence = "multi-table"`, a
+  commit is forwarded as one multi-table transaction that also asserts `main` of every other
+  table of its integrity domain, so the catalog refuses it (409) if another Plane, or a writer,
+  changed the domain after it was validated. Certified snapshots record the domain state they
+  were validated against (`integrity.domain-state`), and catching up replays FK-linked tables in
+  that order. The client gets the table as loaded after the commit. Verified upstream catalogs:
+  Iceberg REST fixture, Polaris, Lakekeeper, Nessie (`compat/multitable_probe.py`); CI runs every
+  client with the fence.
+
 - Catching up from the table history (RFC 0011): when `main` of a domain table moved past the
   snapshot its indexes reflect, the Plane validates the certified snapshots since then again from
   their data files, checks that they reproduce their certificates, and applies them before the

@@ -8,7 +8,7 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - CHECK constraints, branch-gated publication, picking up constraints from engine DDL: planned
   for 0.2. Certificates can be signed (RFC 0005). Merge-on-read position deletes and v3 deletion
   vectors are supported (ADR 0017, ADR 0018).
-- Multi-table atomic commits (`/transactions/commit` is refused), high availability: 0.3.
+- Multi-table atomic commits from clients (`/transactions/commit` is refused): 0.3.
 - Other table formats than Iceberg (ADR 0012); `ON DELETE CASCADE`; per-key locking (ADR 0015).
 
 ## Commits
@@ -64,12 +64,17 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Operations
 
-- Single node. The control store is local files; there is no replication or failover, and while
-  the Plane is down writers cannot commit to enforced tables (fail closed). A second process on
-  the same control store refuses to start. A control store restored from an older copy, or a
-  second Plane with its own control store, catches up from the table history before its next
-  commit (RFC 0011), except when two tables linked by a foreign key both moved: then the domain
-  needs a rebuild ([`recovery.md`](recovery.md#single-node-and-power-loss)).
+- Each Plane is one process with its own control store (local files). For availability, run
+  several behind a load balancer with `[ha] fence = "multi-table"` (RFC 0012); the upstream catalog
+  must support multi-table commits (verified: the REST fixture, Polaris, Lakekeeper, Nessie).
+  Without the fence, run one Plane per domain: while it is down, writers cannot commit to enforced
+  tables (fail closed). A restored control store, or another Plane, catches up from the table
+  history (RFC 0011); FK-linked tables that both moved need fenced commits or a rebuild
+  ([`recovery.md`](recovery.md#single-node-and-power-loss)).
+- Planes behind one load balancer each keep their own registry: constraints must be registered on
+  each, in the same order (the constraint set version is part of the certificate). Commits across
+  one domain are serialized by the catalog: concurrent commits to a domain through different Planes
+  retry on 409.
 - Catching up validates every missed snapshot again, so it costs what those commits cost, inside
   the next commit's latency and read budget.
 - Index stores written before RFC 0008 record no heads: every enforced domain refuses commits

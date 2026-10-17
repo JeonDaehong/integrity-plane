@@ -24,7 +24,8 @@
 | `remove-snapshots`, properties, sort order, partition spec | Pass-through | Phase 6 |
 | Commits to refs other than `main` | Pass-through, uncertified | Phase 6 |
 | Moving `main` to an existing snapshot | Rejected | Phase 6 |
-| Multi-table commit endpoint | Rejected | Phase 7 (gateway) |
+| Multi-table commit endpoint (from clients) | Rejected | Phase 7 (gateway) |
+| Multi-table commits to the upstream catalog (`[ha] fence`, RFC 0012) | Used | `compat/multitable_probe.py`: REST fixture 1.10.1, Polaris 1.7.0, Lakekeeper 0.13.6, Nessie 0.108.8; CI runs every client with the fence |
 | Unknown update action or requirement type | Rejected, naming it | Phase 6 |
 | Non-Parquet data files | Rejected | Phase 6 |
 

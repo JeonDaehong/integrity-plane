@@ -41,6 +41,7 @@ use crate::report;
 use crate::store::{Anchor, AuditEvent, Registry, RegistryDoc, StoreError};
 
 mod catchup;
+mod fence;
 
 /// A table commit route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +358,8 @@ pub struct Gateway {
     pub(crate) limits: Limits,
     /// Catching up from the table history (RFC 0011).
     pub(crate) catch_up: crate::config::CatchUpConfig,
+    /// Forward commits as multi-table transactions asserting the domain (RFC 0012).
+    pub(crate) fence: bool,
 }
 
 pub(crate) enum Loaded {
@@ -399,6 +402,7 @@ impl Gateway {
             metrics: Metrics::default(),
             limits: Limits::default(),
             catch_up: crate::config::CatchUpConfig::default(),
+            fence: false,
         };
         gateway.check_control_store();
         Ok(gateway)
@@ -604,6 +608,13 @@ impl Gateway {
             token.to_owned(),
             body["expires_in"].as_u64().unwrap_or(3600),
         ))
+    }
+
+    /// Forwards commits as multi-table transactions that assert every table of the domain
+    /// (RFC 0012, `[ha] fence = "multi-table"`).
+    pub fn with_fence(mut self, fence: bool) -> Self {
+        self.fence = fence;
+        self
     }
 
     /// Catches up from the table history as `config` says (RFC 0011).
@@ -1298,6 +1309,8 @@ impl Gateway {
         let mut names = report::ColumnNames::new();
         let mut target_meta = None;
         let mut behind = Vec::new();
+        // Every table of the domain: identifier → (uuid, `main`).
+        let mut domain_state = BTreeMap::new();
         // The written table first: a stale commit fails its requirements before anything else
         // is loaded, keeping the queue short while writers race.
         let order = std::iter::once(identifier.clone())
@@ -1331,6 +1344,13 @@ impl Gateway {
             let binding = registry::bind(&constraints, &ident, &meta)?;
             report::add_names(&mut names, &ident, &meta);
             let indexed = self.check_chain_head(&mut doc, &ident, &meta)?;
+            domain_state.insert(
+                ident.clone(),
+                (
+                    meta.table_uuid.to_lowercase(),
+                    meta.main_snapshot_id().map(|s| s.0),
+                ),
+            );
             bindings.insert(ident.clone(), binding);
             if let Some(indexed) = indexed {
                 behind.push(catchup::Behind {
@@ -1350,15 +1370,13 @@ impl Gateway {
         let indexes = self.indexes(&resolved)?;
         if !behind.is_empty() {
             // Indexes behind `main`: follow the table history first (RFC 0011).
-            self.catch_up(
-                &mut doc,
-                &constraints,
-                &bindings,
-                &resolved,
-                &indexes,
-                behind,
-            )
-            .await?;
+            let ctx = catchup::Ctx {
+                bindings: &bindings,
+                resolved: &resolved,
+                indexes: &indexes,
+            };
+            self.catch_up(&mut doc, &ctx, &constraints, &domain_state, behind)
+                .await?;
         }
         let validator = Validator::new(resolved);
         let table_id = bindings[&identifier].table.clone();
@@ -1594,6 +1612,30 @@ impl Gateway {
             certificates.push(cert.to_hex());
             previous = cert;
         }
+        // The rest of the domain as validated, for the fence and the record (RFC 0012).
+        let mut others = domain_state.clone();
+        others.remove(&identifier);
+        if self.fence {
+            let recorded = fence::domain_state(
+                &others
+                    .values()
+                    .map(|(uuid, at)| (uuid.clone(), *at))
+                    .collect(),
+            );
+            for plan in &plans {
+                request
+                    .set_summary_fields(
+                        plan.step.update_index,
+                        &[(fence::SUMMARY_DOMAIN_STATE, recorded.clone())],
+                    )
+                    .map_err(|e| {
+                        abort(
+                            ApiError::new(ErrorCode::UnsupportedCommitOperation, e.to_string()),
+                            TxnState::Aborted,
+                        )
+                    })?;
+            }
+        }
         let snapshots: Vec<i64> = plans.iter().map(|p| p.step.snapshot.0).collect();
         let final_snapshot = *snapshots.last().ok_or_else(|| {
             abort(
@@ -1628,12 +1670,24 @@ impl Gateway {
         fault::hit(FaultPoint::AfterValidatedLog);
         fault::hit(FaultPoint::BeforeUpstream);
 
-        let captured = match self
-            .send(Method::POST, path_and_query, &headers, forwarded)
-            .await
-        {
-            Ok(resp) => Captured::read(resp).await.ok(),
-            Err(_) => None,
+        let captured = if self.fence {
+            let fence = fence::Fence {
+                table,
+                uuid: &meta.table_uuid.to_lowercase(),
+                base: base_snapshot,
+                others: &others,
+            };
+            self.forward_fenced(&fence, &headers, request.json())
+                .await
+                .map_err(|e| abort(e, TxnState::Aborted))?
+        } else {
+            match self
+                .send(Method::POST, path_and_query, &headers, forwarded)
+                .await
+            {
+                Ok(resp) => Captured::read(resp).await.ok(),
+                Err(_) => None,
+            }
         };
         match captured {
             Some(c) if (200..300).contains(&c.status) => {

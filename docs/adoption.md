@@ -117,7 +117,22 @@ machine) and refuses the constraint, with a report, if the data already violates
 the domain wait while the scan runs, so register large tables at a quiet time. An initial bulk
 load is cheaper before the constraints exist than through them (`benchmarks.md`).
 
-## 6. Operate it
+## 6. More than one Plane
+
+For availability, run two or more Planes behind a load balancer, each with its own control store:
+
+```toml
+[ha]
+fence = "multi-table"
+```
+
+on every Plane (RFC 0012). Each commit then asserts the whole integrity domain at the catalog, and
+a Plane that missed commits taken by another validates them again before its next one. Register
+the same constraints on every Plane in the same order (or declare them in the configuration file
+they share). Commits to one domain through different Planes at the same time retry on 409, so a
+sticky load balancer (by table) avoids most retries.
+
+## 7. Operate it
 
 - **Metrics** (`/metrics`, Prometheus): alert on `integrity_bypass_detected_total`,
   `integrity_signer_failures_total`, `integrity_domain_state{state="degraded"}`, and watch
@@ -132,7 +147,7 @@ load is cheaper before the constraints exist than through them (`benchmarks.md`)
 - **Upgrades**: read the CHANGELOG. 0.1.0 needs one rebuild per domain after upgrading from 0.0.2
   (RFC 0008).
 
-## 7. Errors writers will see
+## 8. Errors writers will see
 
 | Code | HTTP | Meaning | What the writer does |
 |---|---|---|---|

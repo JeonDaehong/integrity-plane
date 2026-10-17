@@ -18,3 +18,4 @@ File name: `NNNN-short-title.md`. Use [`template.md`](template.md).
 | [0009](0009-external-signers.md) | Signing keys in Vault Transit or PKCS#11 (adds INT-018) | Accepted |
 | [0010](0010-compressed-terminal-records.md) | Compressed terminal records in the transaction log | Accepted |
 | [0011](0011-catch-up.md) | Catching up from the table history | Accepted |
+| [0012](0012-fenced-domain-commits.md) | Fenced domain commits (several active Planes) | Accepted |

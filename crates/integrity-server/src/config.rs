@@ -33,12 +33,35 @@ pub struct Config {
     /// Catching up from the table history (RFC 0011).
     #[serde(default)]
     pub catch_up: CatchUpConfig,
+    /// Several Planes in front of the same tables (RFC 0012).
+    #[serde(default)]
+    pub ha: HaConfig,
     /// Certificate signing (RFC 0005); absent = certificates are not signed.
     #[serde(default)]
     pub signing: Option<SigningConfig>,
     /// Constraints imported into the registry on first start.
     #[serde(default, rename = "constraint")]
     pub constraints: Vec<ConstraintConfig>,
+}
+
+/// `[ha]` (RFC 0012).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaConfig {
+    /// How commits are protected against other Planes.
+    #[serde(default)]
+    pub fence: Fence,
+}
+
+/// `[ha] fence`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fence {
+    /// Single-table commits: one Plane per domain.
+    #[default]
+    None,
+    /// Multi-table transactions asserting every table of the domain.
+    MultiTable,
 }
 
 /// `[catch_up]` (RFC 0011).
@@ -849,10 +872,12 @@ chunk_writes = 0
                 ("INTEGRITY__ERRORS__REDACT_KEYS", "true"),
                 ("INTEGRITY__LIMITS__MAX_INLINE_VALIDATION_BYTES", "1MiB"),
                 ("INTEGRITY__SERVER__ADMIN_TOKEN", "s3cret"),
+                ("INTEGRITY__HA__FENCE", "multi-table"),
                 ("PATH", "/usr/bin"),
             ]),
         )
         .unwrap();
+        assert_eq!(c.ha.fence, Fence::MultiTable);
         assert_eq!(c.upstream.catalog_uri, "http://b:8181");
         assert_eq!(c.upstream.timeout_secs, 7);
         assert!(c.errors.redact_keys);

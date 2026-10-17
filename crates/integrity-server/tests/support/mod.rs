@@ -32,6 +32,10 @@ pub struct Upstream {
     pub gates: HashMap<String, Arc<Semaphore>>,
     /// Tables whose reads wait for a permit.
     pub read_gates: HashMap<String, Arc<Semaphore>>,
+    /// Multi-table commits received (RFC 0012).
+    pub transactions: u64,
+    /// Requests that reached a gate.
+    pub gated: u64,
 }
 
 pub type Shared = Arc<Mutex<Upstream>>;
@@ -54,10 +58,14 @@ pub async fn upstream(State(s): State<Shared>, req: Request) -> Response {
     if method == "POST" {
         let gate = s.lock().unwrap().gates.get(&path).cloned();
         if let Some(gate) = gate {
+            s.lock().unwrap().gated += 1;
             gate.acquire().await.unwrap().forget();
         }
     }
     let mut up = s.lock().unwrap();
+    if method == "POST" && path.ends_with("/transactions/commit") {
+        return commit_transaction(&mut up, &body);
+    }
     let Some(meta) = up.tables.get(&path).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -69,10 +77,28 @@ pub async fn upstream(State(s): State<Shared>, req: Request) -> Response {
     let base = req["requirements"][0]["snapshot-id"].clone();
     let current = meta["refs"]["main"]["snapshot-id"].clone();
     if current != base {
-        return (StatusCode::CONFLICT, axum::Json(json!({"error": {"message": "stale", "type": "CommitFailedException", "code": 409}}))).into_response();
+        return conflict("stale");
     }
+    let head = apply_updates(&mut meta, &req["updates"]);
+    up.tables.insert(path.clone(), meta.clone());
+    up.history.push((path, head.unwrap()));
+    axum::Json(json!({"metadata-location": "m", "metadata": meta})).into_response()
+}
+
+fn conflict(message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(
+            json!({"error": {"message": message, "type": "CommitFailedException", "code": 409}}),
+        ),
+    )
+        .into_response()
+}
+
+/// Applies a commit's updates; the new `main`, if it moved.
+fn apply_updates(meta: &mut Value, updates: &Value) -> Option<i64> {
     let mut head = None;
-    for u in req["updates"].as_array().unwrap() {
+    for u in updates.as_array().unwrap() {
         match u["action"].as_str().unwrap() {
             "add-snapshot" => meta["snapshots"]
                 .as_array_mut()
@@ -86,9 +112,55 @@ pub async fn upstream(State(s): State<Shared>, req: Request) -> Response {
             _ => {}
         }
     }
-    up.tables.insert(path.clone(), meta.clone());
-    up.history.push((path, head.unwrap()));
-    axum::Json(json!({"metadata-location": "m", "metadata": meta})).into_response()
+    head
+}
+
+/// `POST /v1/transactions/commit`: every requirement of every table first, then all updates, or
+/// nothing (as the catalogs RFC 0012 relies on do).
+fn commit_transaction(up: &mut Upstream, body: &[u8]) -> Response {
+    up.transactions += 1;
+    let req: Value = serde_json::from_slice(body).unwrap();
+    let changes = req["table-changes"].as_array().unwrap();
+    let path_of = |c: &Value| {
+        let ns: Vec<&str> = c["identifier"]["namespace"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        format!(
+            "/v1/namespaces/{}/tables/{}",
+            ns.join("%1F"),
+            c["identifier"]["name"].as_str().unwrap()
+        )
+    };
+    for c in changes {
+        let Some(meta) = up.tables.get(&path_of(c)) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        for r in c["requirements"].as_array().unwrap() {
+            let holds = match r["type"].as_str().unwrap() {
+                "assert-table-uuid" => meta["table-uuid"] == r["uuid"],
+                "assert-ref-snapshot-id" => {
+                    let current = &meta["refs"][r["ref"].as_str().unwrap()]["snapshot-id"];
+                    *current == r["snapshot-id"]
+                }
+                _ => true,
+            };
+            if !holds {
+                return conflict(&format!("requirement failed: {r}"));
+            }
+        }
+    }
+    for c in changes {
+        let path = path_of(c);
+        let mut meta = up.tables[&path].clone();
+        if let Some(head) = apply_updates(&mut meta, &c["updates"]) {
+            up.history.push((path.clone(), head));
+        }
+        up.tables.insert(path, meta);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub fn empty_table(uuid: &str) -> Value {

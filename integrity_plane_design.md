@@ -548,7 +548,7 @@ Benchmarks MUST report object-store bytes read and end-to-end commit latency, no
 |---|---|
 | 0.1 | Vertical slice above |
 | 0.2 | CHECK (DataFusion, row-local, deterministic functions only); MoR position deletes & DVs; branch-gated publication; signed certificates; rollback re-validation; DDL pickup |
-| 0.3 | Multi-table atomic commits (REST `/transactions/commit`); HA with shared control store |
+| 0.3 | Multi-table atomic commits from clients (REST `/transactions/commit`) |
 | 0.4 | Second format adapter (driven by community demand) |
 | later | Incrementally maintainable assertions; planner hints from *enforced* uniqueness |
 

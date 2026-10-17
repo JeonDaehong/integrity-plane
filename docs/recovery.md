@@ -156,8 +156,14 @@ false` refuses every table that moved, as RFC 0008 did.
 An index store written before RFC 0008 has no heads; its domains answer `INDEX_DEGRADED` until
 rebuilt once.
 
-Two Planes taking commits for the same tables at once are not supported yet (RFC 0012): commits of
-FK-linked tables through both are refused, and each Plane validates the other's commits again.
+**Several Planes (RFC 0012).** With `[ha] fence = "multi-table"`, each commit is forwarded as a
+multi-table transaction that asserts `main` of every table of its domain, and each certified
+snapshot records the domain state it was validated against. Several Planes, each with its own
+control store, can then take commits for the same tables at once: a commit validated against a
+domain another Plane changed meanwhile is refused by the catalog (409, the client retries), and a
+Plane that is behind replays the other's commits in their recorded order, FK-linked tables
+included. If one Plane fails, the others keep taking commits; a replaced Plane catches up from
+its last copy or is onboarded again.
 
 **Power loss.** Only process kills are tested (`tests/crash.rs`); a kill keeps the operating
 system's page cache, so it does not show what reaches the disk. What the Plane relies on:

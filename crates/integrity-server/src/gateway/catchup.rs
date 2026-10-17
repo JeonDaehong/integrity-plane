@@ -4,7 +4,9 @@
 //! snapshot by snapshot: each snapshot after the head is validated again from its data files,
 //! exactly as a commit, and the certificate that validation computes must be the snapshot's own.
 //! Everything validated is applied at one epoch, with the new heads, in one index transaction.
-//! What cannot be proved this way is refused as before (`BYPASS_DETECTED`).
+//! What cannot be proved this way is refused as before (`BYPASS_DETECTED`). Tables linked by a
+//! foreign key that both moved are followed one snapshot at a time, in the order their fenced
+//! commits recorded (RFC 0012).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -51,40 +53,46 @@ impl Gateway {
     pub(super) async fn catch_up(
         &self,
         doc: &mut RegistryDoc,
+        ctx: &Ctx<'_>,
         constraints: &[ConstraintConfig],
-        bindings: &BTreeMap<String, Binding>,
-        resolved: &[ResolvedConstraint],
-        indexes: &BTreeMap<ConstraintId, PersistentIndex>,
+        domain: &BTreeMap<String, (String, Option<i64>)>,
         behind: Vec<Behind>,
     ) -> Result<(), ApiError> {
         if !self.catch_up.enabled {
             let b = &behind[0];
             return Err(self.refuse_head(doc, &b.identifier, &b.meta, b.indexed, None));
         }
-        // The order of commits to different tables is not recorded: tables linked by a foreign
-        // key cannot catch up together (RFC 0011).
+        // Tables linked by a foreign key that both moved need the order of their commits: only
+        // fenced commits record it (RFC 0011, RFC 0012).
         let moved: BTreeSet<&str> = behind.iter().map(|b| b.identifier.as_str()).collect();
-        for c in constraints {
-            if let Some(r) = &c.references
-                && r.table != c.table
+        let linked = constraints.iter().find_map(|c| {
+            let r = c.references.as_ref()?;
+            (r.table != c.table
                 && moved.contains(c.table.as_str())
-                && moved.contains(r.table.as_str())
-            {
-                let b = behind
-                    .iter()
-                    .find(|b| b.identifier == c.table)
-                    .unwrap_or(&behind[0]);
-                let why = format!(
-                    "{} and {}, linked by a foreign key, both moved; rebuild the domain",
-                    c.table, r.table
-                );
-                return Err(self.refuse_head(doc, &b.identifier, &b.meta, b.indexed, Some(&why)));
-            }
+                && moved.contains(r.table.as_str()))
+            .then(|| (c.table.clone(), r.table.clone()))
+        });
+        if let Some((child, parent)) = linked {
+            return match self.catch_up_in_order(doc, ctx, domain, &behind).await {
+                Ok(()) => Ok(()),
+                Err(Refusal::Head(why)) => {
+                    let b = behind
+                        .iter()
+                        .find(|b| b.identifier == child)
+                        .unwrap_or(&behind[0]);
+                    let why = format!(
+                        "{child} and {parent}, linked by a foreign key, both moved and {why}; rebuild the domain"
+                    );
+                    Err(self.refuse_head(doc, &b.identifier, &b.meta, b.indexed, Some(&why)))
+                }
+                Err(Refusal::Api(e)) => Err(e),
+            };
         }
 
         let mut followed = Vec::new();
         for b in &behind {
-            match self.follow(doc, bindings, resolved, indexes, b).await {
+            let to = b.meta.main_snapshot_id().map(|s| s.0);
+            match self.follow(doc, ctx, b, b.indexed, to).await {
                 Ok(f) => followed.push(f),
                 Err(Refusal::Head(why)) => {
                     return Err(self.refuse_head(
@@ -98,8 +106,90 @@ impl Gateway {
                 Err(Refusal::Api(e)) => return Err(e),
             }
         }
+        self.apply_followed(ctx.indexes, followed).await
+    }
 
-        // Every caught-up table at one epoch, with its head, in one transaction.
+    /// Catches up tables linked by foreign keys in the order their fenced commits recorded
+    /// (RFC 0012): a table advances by one snapshot when the domain state that snapshot was
+    /// validated against is the current one. Each step is applied with its head before the next
+    /// one is validated against it.
+    async fn catch_up_in_order(
+        &self,
+        doc: &RegistryDoc,
+        ctx: &Ctx<'_>,
+        domain: &BTreeMap<String, (String, Option<i64>)>,
+        behind: &[Behind],
+    ) -> Result<(), Refusal> {
+        let mut pending = Vec::new();
+        for b in behind {
+            let to = b.meta.main_snapshot_id().map(|s| s.0);
+            let chain = self.chain(&b.meta, b.indexed, to)?;
+            for id in &chain {
+                let recorded = b
+                    .meta
+                    .snapshot(SnapshotId(*id))
+                    .and_then(|s| s.summary.get(super::fence::SUMMARY_DOMAIN_STATE));
+                if recorded.is_none() {
+                    return Err(Refusal::Head(format!(
+                        "snapshot {id} of {} records no domain state (not a fenced commit)",
+                        b.identifier
+                    )));
+                }
+            }
+            pending.push((b, chain, 0_usize));
+        }
+        // The state of every table of the domain, by uuid, as the indexes reflect it.
+        let mut state: BTreeMap<String, Option<i64>> = domain
+            .iter()
+            .map(|(ident, (uuid, main))| {
+                let at = behind
+                    .iter()
+                    .find(|b| b.identifier == *ident)
+                    .map_or(*main, |b| b.indexed);
+                (uuid.clone(), at)
+            })
+            .collect();
+        while pending.iter().any(|(_, chain, next)| *next < chain.len()) {
+            let mut advanced = false;
+            for (b, chain, next) in &mut pending {
+                let Some(&id) = chain.get(*next) else {
+                    continue;
+                };
+                let uuid = b.meta.table_uuid.to_lowercase();
+                let mut others = state.clone();
+                others.remove(&uuid);
+                let recorded = b
+                    .meta
+                    .snapshot(SnapshotId(id))
+                    .and_then(|s| s.summary.get(super::fence::SUMMARY_DOMAIN_STATE))
+                    .and_then(|v| super::fence::parse_domain_state(v));
+                if recorded.as_ref() != Some(&others) {
+                    continue;
+                }
+                let from = state.get(&uuid).copied().flatten();
+                let f = self.follow(doc, ctx, b, from, Some(id)).await?;
+                self.apply_followed(ctx.indexes, vec![f])
+                    .await
+                    .map_err(Refusal::Api)?;
+                state.insert(uuid, Some(id));
+                *next += 1;
+                advanced = true;
+            }
+            if !advanced {
+                return Err(Refusal::Head(
+                    "no snapshot was validated against the current domain state".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies validated tables at one epoch, each with its head, in one index transaction.
+    async fn apply_followed(
+        &self,
+        indexes: &BTreeMap<ConstraintId, PersistentIndex>,
+        followed: Vec<Followed>,
+    ) -> Result<(), ApiError> {
         let epoch = 1 + indexes
             .values()
             .filter_map(|i| i.epoch().ok())
@@ -154,29 +244,22 @@ impl Gateway {
         Ok(())
     }
 
-    /// Validates the snapshots of one table after its head, oldest first, as one commit.
-    async fn follow(
+    /// The snapshots after `from` up to `to`, oldest first; `to` must descend from `from`.
+    fn chain(
         &self,
-        doc: &RegistryDoc,
-        bindings: &BTreeMap<String, Binding>,
-        resolved: &[ResolvedConstraint],
-        indexes: &BTreeMap<ConstraintId, PersistentIndex>,
-        b: &Behind,
-    ) -> Result<Followed, Refusal> {
-        let meta = &b.meta;
-        let main = meta
-            .main_snapshot_id()
-            .ok_or_else(|| Refusal::Head("main has no snapshot".into()))?;
-        // `main` must descend from the head.
-        let mut steps = Vec::new();
-        let mut at = Some(main.0);
-        while at != b.indexed {
+        meta: &TableMetadata,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> Result<Vec<i64>, Refusal> {
+        let mut ids = Vec::new();
+        let mut at = to;
+        while at != from {
             let Some(id) = at else {
                 return Err(Refusal::Head(
                     "main does not descend from it (rolled back or replaced)".into(),
                 ));
             };
-            if steps.len() >= self.catch_up.max_snapshots {
+            if ids.len() >= self.catch_up.max_snapshots {
                 return Err(Refusal::Head(format!(
                     "more than {} snapshots behind",
                     self.catch_up.max_snapshots
@@ -187,10 +270,29 @@ impl Gateway {
                     "snapshot {id} is not in the table metadata (expired)"
                 ))
             })?;
-            steps.push(snap);
+            ids.push(id);
             at = snap.parent_snapshot_id;
         }
-        steps.reverse();
+        ids.reverse();
+        Ok(ids)
+    }
+
+    /// Validates the snapshots of one table after `from` up to `to`, oldest first, as one commit.
+    async fn follow(
+        &self,
+        doc: &RegistryDoc,
+        ctx: &Ctx<'_>,
+        b: &Behind,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> Result<Followed, Refusal> {
+        let meta = &b.meta;
+        let to = to.ok_or_else(|| Refusal::Head("main has no snapshot".into()))?;
+        let steps: Vec<_> = self
+            .chain(meta, from, Some(to))?
+            .into_iter()
+            .filter_map(|id| meta.snapshot(SnapshotId(id)))
+            .collect();
 
         let version = ConstraintSetVersion(doc.version(&b.identifier));
         let mut expected = Vec::new();
@@ -229,7 +331,7 @@ impl Gateway {
             }
         }
         let change = MainChange {
-            parent: b.indexed.map(SnapshotId),
+            parent: from.map(SnapshotId),
             steps: steps
                 .iter()
                 .map(|s| {
@@ -250,8 +352,8 @@ impl Gateway {
                 .collect::<Result<_, Refusal>>()?,
         };
 
-        let binding = &bindings[&b.identifier];
-        let validator = Validator::new(resolved.to_vec());
+        let binding = &ctx.bindings[&b.identifier];
+        let validator = Validator::new(ctx.resolved.to_vec());
         let table_id = binding.table.clone();
         let columns = validator
             .projection(&table_id)
@@ -274,7 +376,7 @@ impl Gateway {
             .map_err(|e| Refusal::Api(ApiError::new(ErrorCode::IndexDegraded, e.to_string())))?;
         let uuid = parse_table_uuid(&meta.table_uuid)
             .map_err(|_| Refusal::Head("table uuid is not a UUID".into()))?;
-        let mut previous = match b.indexed {
+        let mut previous = match from {
             None => Digest::ZERO,
             Some(h) => match snapshot_certificate(meta, SnapshotId(h)) {
                 Ok(Some(c)) => c,
@@ -291,7 +393,7 @@ impl Gateway {
             change,
             columns,
             validator,
-            indexes: indexes.clone(),
+            indexes: ctx.indexes.clone(),
             stats: Arc::new(pipeline::Stats::default()),
             scratch: self.store.scratch_dir().to_path_buf(),
             memory: self.scan_memory,
@@ -342,10 +444,10 @@ impl Gateway {
             identifier: b.identifier.clone(),
             head: TableHead {
                 table_uuid: meta.table_uuid.to_lowercase(),
-                snapshot: Some(main.0),
+                snapshot: Some(to),
             },
             snapshots: steps.len(),
-            indexed: b.indexed,
+            indexed: from,
             staged,
         })
     }
@@ -368,6 +470,13 @@ fn signed_by_us(
         .get(&key_id)
         .and_then(|k| integrity_core::signature::public_key_from_hex(&k.public_key))
         .is_some_and(|key| integrity_core::signature::verify(&key, cert, &signature))
+}
+
+/// What validating a table again needs from the commit.
+pub(super) struct Ctx<'a> {
+    pub bindings: &'a BTreeMap<String, Binding>,
+    pub resolved: &'a [ResolvedConstraint],
+    pub indexes: &'a BTreeMap<ConstraintId, PersistentIndex>,
 }
 
 /// Why a table could not catch up.
