@@ -30,12 +30,44 @@ pub struct Config {
     /// Transaction log retention (RFC 0006).
     #[serde(default)]
     pub txn_log: TxnLogConfig,
+    /// Catching up from the table history (RFC 0011).
+    #[serde(default)]
+    pub catch_up: CatchUpConfig,
     /// Certificate signing (RFC 0005); absent = certificates are not signed.
     #[serde(default)]
     pub signing: Option<SigningConfig>,
     /// Constraints imported into the registry on first start.
     #[serde(default, rename = "constraint")]
     pub constraints: Vec<ConstraintConfig>,
+}
+
+/// `[catch_up]` (RFC 0011).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatchUpConfig {
+    /// Follow certified snapshots the indexes have not seen instead of refusing them.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Most snapshots of one table caught up before a commit; more needs a rebuild.
+    #[serde(default = "default_catch_up_snapshots")]
+    pub max_snapshots: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_catch_up_snapshots() -> usize {
+    1_000
+}
+
+impl Default for CatchUpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_snapshots: default_catch_up_snapshots(),
+        }
+    }
 }
 
 /// `[signing]` (RFC 0005, backends RFC 0009).

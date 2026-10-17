@@ -63,6 +63,8 @@ pub struct Metrics {
     pub bypass_detected: AtomicU64,
     /// Commits refused because their certificate could not be signed (RFC 0009).
     pub signer_failures: AtomicU64,
+    /// Snapshots validated again to catch up with the table history (RFC 0011).
+    pub catch_up_snapshots: AtomicU64,
     /// Commits refused because their domain's queue was full (RFC 0007).
     pub limited_queue: AtomicU64,
     /// Commits refused because their client exceeded its rate (RFC 0007).
@@ -167,6 +169,12 @@ impl Metrics {
             "integrity_signer_failures_total",
             "Commits refused because their certificate could not be signed (RFC 0009).",
             &[("", get(&self.signer_failures))],
+        );
+        counter(
+            &mut out,
+            "integrity_catch_up_snapshots_total",
+            "Snapshots validated again to catch up with the table history (RFC 0011).",
+            &[("", get(&self.catch_up_snapshots))],
         );
         counter(
             &mut out,

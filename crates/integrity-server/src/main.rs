@@ -90,7 +90,8 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         config.limits.commits_per_client,
         client_header,
     )
-    .with_upstream_auth(config.upstream.auth.clone());
+    .with_upstream_auth(config.upstream.auth.clone())
+    .with_catch_up(config.catch_up);
     let gateway = match &config.signing {
         Some(s) => {
             let timeout = Duration::from_secs(config.upstream.timeout_secs);

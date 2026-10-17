@@ -40,6 +40,8 @@ use crate::registry;
 use crate::report;
 use crate::store::{Anchor, AuditEvent, Registry, RegistryDoc, StoreError};
 
+mod catchup;
+
 /// A table commit route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePath {
@@ -353,6 +355,8 @@ pub struct Gateway {
     pub(crate) metrics: Metrics,
     /// Request limits (RFC 0007).
     pub(crate) limits: Limits,
+    /// Catching up from the table history (RFC 0011).
+    pub(crate) catch_up: crate::config::CatchUpConfig,
 }
 
 pub(crate) enum Loaded {
@@ -394,6 +398,7 @@ impl Gateway {
             commit_requests: std::sync::Mutex::new(BTreeMap::new()),
             metrics: Metrics::default(),
             limits: Limits::default(),
+            catch_up: crate::config::CatchUpConfig::default(),
         };
         gateway.check_control_store();
         Ok(gateway)
@@ -599,6 +604,12 @@ impl Gateway {
             token.to_owned(),
             body["expires_in"].as_u64().unwrap_or(3600),
         ))
+    }
+
+    /// Catches up from the table history as `config` says (RFC 0011).
+    pub fn with_catch_up(mut self, config: crate::config::CatchUpConfig) -> Self {
+        self.catch_up = config;
+        self
     }
 
     /// Signs certificates with `signer` (RFC 0005, RFC 0009) and records its public key in the
@@ -1088,14 +1099,14 @@ impl Gateway {
 
     /// Checks a domain member against its anchor (ADR 0011) and the indexes' head (RFC 0008): an
     /// empty table is anchored on first sight; a table with data needs onboarding; a replaced
-    /// table is refused; and `main` must be the snapshot the indexes reflect, otherwise it was
-    /// written around this Plane (by a writer, another Plane, or before a restored control store).
+    /// table is refused. `Some(head)` when `main` is not the snapshot the indexes reflect: the
+    /// caller catches up from `head` or refuses (RFC 0011).
     fn check_chain_head(
         &self,
         doc: &mut RegistryDoc,
         identifier: &str,
         meta: &TableMetadata,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Option<Option<i64>>, ApiError> {
         let uuid = meta.table_uuid.to_lowercase();
         let head = meta.main_snapshot_id();
         let degraded = |e: integrity_index::IndexError| {
@@ -1125,7 +1136,7 @@ impl Gateway {
                         Ok::<_, StoreError>(d.clone())
                     })
                     .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, e.to_string()))?;
-                Ok(())
+                Ok(None)
             }
             None => Err(ApiError::new(
                 ErrorCode::IndexDegraded,
@@ -1138,40 +1149,58 @@ impl Gateway {
                 format!("{identifier} was replaced by another table; rebuild its domain"),
             )),
             Some(_) => match self.store.head(identifier).map_err(degraded)? {
-                Some(h) if h.table_uuid == uuid && h.snapshot == head.map(|h| h.0) => Ok(()),
+                Some(h) if h.table_uuid == uuid && h.snapshot == head.map(|h| h.0) => Ok(None),
                 None => Err(ApiError::new(
                     ErrorCode::IndexDegraded,
                     format!(
                         "the index store does not record which snapshot of {identifier} it reflects (written before RFC 0008); rebuild its domain"
                     ),
                 )),
-                Some(h) => {
-                    let main = head.map_or_else(|| "(none)".to_owned(), |h| h.to_string());
-                    let reason = match head.map(|h| snapshot_certificate(meta, h)) {
-                        Some(Ok(Some(_))) => format!(
-                            "{identifier}: snapshot {main} of main is certified, but the indexes reflect snapshot {}: it was committed through another Plane, or the control store was restored from an older copy",
-                            h.snapshot
-                                .map_or_else(|| "(none)".to_owned(), |s| s.to_string())
-                        ),
-                        _ => format!(
-                            "{identifier}: snapshot {main} of main was not committed through the Plane"
-                        ),
-                    };
-                    if let Ok(d) = self.registry.update(|d| {
-                        d.degraded.insert(identifier.to_owned(), reason.clone());
-                        Ok::<_, StoreError>(d.clone())
-                    }) {
-                        *doc = d;
-                    }
-                    self.metrics.bypass_detected.fetch_add(1, Ordering::Relaxed);
-                    let mut event = AuditEvent::new("BYPASS_DETECTED", Some(identifier));
-                    event.result_snapshot = head.map(|h| h.0);
-                    event.detail = Some(reason.clone());
-                    self.audit(event);
-                    Err(ApiError::new(ErrorCode::BypassDetected, reason))
-                }
+                Some(h) if h.table_uuid == uuid => Ok(Some(h.snapshot)),
+                Some(_) => Err(ApiError::new(
+                    ErrorCode::IndexDegraded,
+                    format!("{identifier} was replaced by another table; rebuild its domain"),
+                )),
             },
         }
+    }
+
+    /// Refuses a domain whose table `identifier` moved where its indexes cannot follow
+    /// (RFC 0008, RFC 0011): degrades it until a rebuild and audits `BYPASS_DETECTED`.
+    pub(crate) fn refuse_head(
+        &self,
+        doc: &mut RegistryDoc,
+        identifier: &str,
+        meta: &TableMetadata,
+        indexed: Option<i64>,
+        why: Option<&str>,
+    ) -> ApiError {
+        let head = meta.main_snapshot_id();
+        let main = head.map_or_else(|| "(none)".to_owned(), |h| h.to_string());
+        let indexed = indexed.map_or_else(|| "(none)".to_owned(), |s| s.to_string());
+        let reason = match (why, head.map(|h| snapshot_certificate(meta, h))) {
+            (Some(why), _) => format!(
+                "{identifier}: snapshot {main} of main cannot be caught up from snapshot {indexed}, which the indexes reflect: {why}"
+            ),
+            (None, Some(Ok(Some(_)))) => format!(
+                "{identifier}: snapshot {main} of main is certified, but the indexes reflect snapshot {indexed}: it was committed through another Plane, or the control store was restored from an older copy"
+            ),
+            (None, _) => {
+                format!("{identifier}: snapshot {main} of main was not committed through the Plane")
+            }
+        };
+        if let Ok(d) = self.registry.update(|d| {
+            d.degraded.insert(identifier.to_owned(), reason.clone());
+            Ok::<_, StoreError>(d.clone())
+        }) {
+            *doc = d;
+        }
+        self.metrics.bypass_detected.fetch_add(1, Ordering::Relaxed);
+        let mut event = AuditEvent::new("BYPASS_DETECTED", Some(identifier));
+        event.result_snapshot = head.map(|h| h.0);
+        event.detail = Some(reason.clone());
+        self.audit(event);
+        ApiError::new(ErrorCode::BypassDetected, reason)
     }
 
     async fn commit(
@@ -1268,6 +1297,7 @@ impl Gateway {
         let mut bindings = BTreeMap::new();
         let mut names = report::ColumnNames::new();
         let mut target_meta = None;
+        let mut behind = Vec::new();
         // The written table first: a stale commit fails its requirements before anything else
         // is loaded, keeping the queue short while writers race.
         let order = std::iter::once(identifier.clone())
@@ -1300,8 +1330,15 @@ impl Gateway {
             }
             let binding = registry::bind(&constraints, &ident, &meta)?;
             report::add_names(&mut names, &ident, &meta);
-            self.check_chain_head(&mut doc, &ident, &meta)?;
+            let indexed = self.check_chain_head(&mut doc, &ident, &meta)?;
             bindings.insert(ident.clone(), binding);
+            if let Some(indexed) = indexed {
+                behind.push(catchup::Behind {
+                    identifier: ident.clone(),
+                    meta: meta.clone(),
+                    indexed,
+                });
+            }
             if ident == identifier {
                 target_meta = Some(meta);
             }
@@ -1311,6 +1348,18 @@ impl Gateway {
 
         let resolved = registry::resolve(&constraints, &bindings)?;
         let indexes = self.indexes(&resolved)?;
+        if !behind.is_empty() {
+            // Indexes behind `main`: follow the table history first (RFC 0011).
+            self.catch_up(
+                &mut doc,
+                &constraints,
+                &bindings,
+                &resolved,
+                &indexes,
+                behind,
+            )
+            .await?;
+        }
         let validator = Validator::new(resolved);
         let table_id = bindings[&identifier].table.clone();
         let binding_columns = bindings[&identifier].columns.clone();

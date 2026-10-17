@@ -55,8 +55,10 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   (Ed25519) is not implemented yet.
 - The signing backend is called once per certificate, on the commit path; its latency adds to
   every commit, and while it cannot sign, commits are refused (INT-018).
-- A snapshot written around the Plane is refused at the next commit only while it is `main`
-  (RFC 0008); bypassed snapshots that are no longer `main` are found by `verify`.
+- A snapshot written around the Plane is refused at the next commit (RFC 0008, RFC 0011), except
+  one whose certificate was computed correctly for valid data: catching up accepts it, as a commit
+  through the Plane would have been. With `[signing] require = true` only snapshots signed with
+  this Plane's keys are followed.
 - `verify` cannot recompute snapshots with equality deletes (reported `UNVERIFIABLE`) or chains whose
   snapshots have expired, and only verifies back to the latest anchor.
 
@@ -64,10 +66,12 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 - Single node. The control store is local files; there is no replication or failover, and while
   the Plane is down writers cannot commit to enforced tables (fail closed). A second process on
-  the same control store refuses to start. A second Plane with its own control store in front of
-  the same tables, or a control store restored from an older copy, makes the next commit fail with
-  `BYPASS_DETECTED` until the domain is rebuilt (RFC 0008,
-  [`recovery.md`](recovery.md#single-node-and-power-loss)).
+  the same control store refuses to start. A control store restored from an older copy, or a
+  second Plane with its own control store, catches up from the table history before its next
+  commit (RFC 0011), except when two tables linked by a foreign key both moved: then the domain
+  needs a rebuild ([`recovery.md`](recovery.md#single-node-and-power-loss)).
+- Catching up validates every missed snapshot again, so it costs what those commits cost, inside
+  the next commit's latency and read budget.
 - Index stores written before RFC 0008 record no heads: every enforced domain refuses commits
   (`INDEX_DEGRADED`) until it is rebuilt once.
 - The transaction log keeps finished transactions for `[txn_log] retention` (default 24 h), then

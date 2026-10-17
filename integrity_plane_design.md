@@ -356,7 +356,7 @@ cert_n = H( "oip-cert-v1"
 - **Optional signing** (0.2): an Ed25519 signature over `cert_n`, with the public key published at `/v1/integrity/keys`.
 - `integrity verify <table>` walks `main` from the current snapshot back and reports the first snapshot whose certificate is missing or does not chain. `key_delta_digest` can be recomputed from data files, so verification needs no trust in the Plane's indexes.
 - A broken chain emits `BYPASS_DETECTED` and moves the domain to `DEGRADED` (§19) until an operator re-certifies via index rebuild.
-- Before validating a commit, `main` of every table of the domain MUST be the snapshot the Plane's indexes reflect (their recorded head, written atomically with every index change; RFC 0008). A certificate alone is not enough: it does not show that these indexes contain the snapshot's keys (another Plane, a restored control store). A mismatch is `BYPASS_DETECTED`.
+- Before validating a commit, `main` of every table of the domain MUST be the snapshot the Plane's indexes reflect (their recorded head, written atomically with every index change; RFC 0008). A certificate alone is not enough: it does not show that these indexes contain the snapshot's keys (another Plane, a restored control store). A `main` that descends from the head through certified snapshots is caught up first: they are validated again from their data files and must reproduce their certificates (RFC 0011). Anything else is `BYPASS_DETECTED`.
 
 ### 19. Degraded state and rebuild
 

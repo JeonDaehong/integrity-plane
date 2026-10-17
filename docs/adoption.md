@@ -100,7 +100,7 @@ group. Readers that should use the catalog directly get their own rule, ideally 
 that cannot commit.
 
 What is left if a writer still gets around the Plane: the next commit through it fails with
-`BYPASS_DETECTED` and the domain stops taking commits until rebuilt (RFC 0008), and
+`BYPASS_DETECTED` and the domain stops taking commits until rebuilt (RFC 0008, RFC 0011), and
 `integrity verify` names the snapshot. Watch `integrity_bypass_detected_total`.
 
 ## 5. Register constraints
@@ -125,7 +125,8 @@ load is cheaper before the constraints exist than through them (`benchmarks.md`)
 - **Verify** each enforced table on a schedule: `integrity verify db.customer` (exit code 1 on a
   broken chain).
 - **When the Plane is down**, writers cannot commit to enforced tables (fail closed). Restart it on
-  the same control store; to move hosts, stop it and copy the whole control store.
+  the same control store; to move hosts, stop it and copy the whole control store. A copy taken
+  earlier also works: the Plane catches up from the table history (RFC 0011).
 - **Degraded domains** (`INDEX_DEGRADED`, `BYPASS_DETECTED`): find the cause in the audit log
   (`integrity audit`), then `integrity rebuild <constraint id>`.
 - **Upgrades**: read the CHANGELOG. 0.1.0 needs one rebuild per domain after upgrading from 0.0.2

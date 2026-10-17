@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Catching up from the table history (RFC 0011): when `main` of a domain table moved past the
+  snapshot its indexes reflect, the Plane validates the certified snapshots since then again from
+  their data files, checks that they reproduce their certificates, and applies them before the
+  next commit, instead of refusing until a rebuild. A control store restored from an older copy, or
+  a second Plane, now continues on its own; uncertified, forged, rolled-back snapshots and
+  FK-linked tables that both moved are still refused. `[catch_up] enabled`, `max_snapshots`;
+  `INDEX_CAUGHT_UP` audit events; `integrity_catch_up_snapshots_total`. With
+  `[signing] require = true`, only snapshots signed with this Plane's keys are followed.
+
 - Releases publish a container image to `ghcr.io/jeondaehong/integrity-plane` (linux/amd64,
   linux/arm64) and binaries for Linux, macOS and Windows. The image now runs as an unprivileged
   user (uid 10001): a control-store volume created by an earlier image needs

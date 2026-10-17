@@ -77,6 +77,12 @@ retention = "24h"
 # key_label = "cert-signing"      # CKA_LABEL of the private and the public key
 # pin_file = "/run/secrets/hsm-pin"         # default: the INTEGRITY_PKCS11_PIN environment variable
 
+[catch_up]
+# Follow certified snapshots the indexes have not seen (a restored control store, another Plane),
+# validating them again, instead of refusing them until a rebuild (RFC 0011).
+enabled = true
+max_snapshots = 1000
+
 [errors]
 # Keep key values out of violation reports and the audit log (keys can be personal data).
 redact_keys = false

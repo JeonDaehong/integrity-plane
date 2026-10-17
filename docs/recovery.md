@@ -132,23 +132,32 @@ start as above.
 **Index heads (RFC 0008).** The index store records, for every enforced table, the `main` snapshot
 its indexes reflect, in the same transaction as the index changes: a commit's apply (and recovery's
 re-apply), an install by onboarding or rebuild, and the anchoring of an empty table. Before
-validating, every table of the domain must have `main` equal to its recorded head, otherwise the
-commit fails with `BYPASS_DETECTED` and the domain is degraded until rebuilt. This catches what a
-certificate alone does not show:
+validating, every table of the domain must have `main` equal to its recorded head.
 
-- *Two Planes with separate control stores in front of the same tables.* Each one's certified
-  commits are missing from the other's indexes; the other refuses its next commit.
-- *A control store restored from an older copy* (backup, VM or disk snapshot) while commits went
-  through after the copy was taken. The restored files agree with each other, so the checks in
-  [Lost control-store files](#lost-control-store-files) pass, but the heads are older than `main`.
-  Rebuild every domain (`POST /v1/integrity/indexes/{id}/rebuild`) after restoring.
-- *`main` moved back around the Plane* to an earlier certified snapshot.
+**Catching up (RFC 0011).** When `main` has moved on from the head, the Plane follows the table
+history: if every snapshot since the head is certified and descends from it, it validates them
+again from their data files, exactly as commits, checks that this gives each snapshot's own
+certificate, and applies them with the new heads in one index transaction, then validates the
+commit. This is what happens when:
+
+- *a control store was restored from an older copy* (backup, VM or disk snapshot) after commits went
+  through: the restored files agree with each other, so the checks in
+  [Lost control-store files](#lost-control-store-files) pass, and the next commit catches up;
+- *a second Plane with its own control store* committed to the same tables: the other one catches
+  up before its next commit.
+
+What cannot be followed is refused with `BYPASS_DETECTED` and the domain is degraded until rebuilt:
+a snapshot without a certificate, a certificate that does not match its data or whose data violates
+a constraint, `main` moved back or replaced, more than `[catch_up] max_snapshots` snapshots, a
+constraint set version other than the current one, and **two tables linked by a foreign key that
+both moved** (the order of their commits is not recorded; RFC 0012 will). `[catch_up] enabled =
+false` refuses every table that moved, as RFC 0008 did.
 
 An index store written before RFC 0008 has no heads; its domains answer `INDEX_DEGRADED` until
 rebuilt once.
 
-Two Planes on the same tables are still not supported: each refuses commits after the other's,
-so writers see `BYPASS_DETECTED` instead of a working setup.
+Two Planes taking commits for the same tables at once are not supported yet (RFC 0012): commits of
+FK-linked tables through both are refused, and each Plane validates the other's commits again.
 
 **Power loss.** Only process kills are tested (`tests/crash.rs`); a kill keeps the operating
 system's page cache, so it does not show what reaches the disk. What the Plane relies on:
