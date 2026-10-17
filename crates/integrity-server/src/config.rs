@@ -246,6 +246,9 @@ pub struct ServerConfig {
     pub open_api: bool,
 }
 
+/// Tokens from examples and documentation, refused as secrets (ADR 0027).
+const PLACEHOLDER_TOKENS: [&str; 3] = ["change-me", "changeme", "CHANGE-ME"];
+
 /// `[[server.api_tokens]]` (ADR 0026): `token` or its hex SHA-256 `token_sha256`, not both.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +287,11 @@ impl ServerConfig {
     pub fn tokens(&self) -> Result<Vec<(String, [u8; 32])>, ConfigError> {
         let mut out = Vec::new();
         if let Some(t) = &self.admin_token {
+            if PLACEHOLDER_TOKENS.contains(&t.as_str()) {
+                return Err(ConfigError(format!(
+                    "server.admin_token is the example's placeholder {t:?}: set a secret token"
+                )));
+            }
             out.push(("admin".to_owned(), token_digest(t)));
         }
         for t in &self.api_tokens {
@@ -302,6 +310,9 @@ impl ServerConfig {
                 return Err(err("name used twice (admin_token is \"admin\")"));
             }
             let digest = match (&t.token, &t.token_sha256) {
+                (Some(token), None) if PLACEHOLDER_TOKENS.contains(&token.as_str()) => {
+                    return Err(err("is the example's placeholder token: set a secret one"));
+                }
                 (Some(token), None) if !token.is_empty() => token_digest(token),
                 (None, Some(hex)) => {
                     parse_sha256_hex(hex).ok_or_else(|| err("token_sha256 is not 64 hex digits"))?
@@ -707,30 +718,16 @@ max_inline_validation_bytes = "2GiB"
         };
         let e = tokens("bind = \"127.0.0.1:8181\"").unwrap_err();
         assert!(e.contains("no token"), "{e}");
-        assert!(
-            tokens(
-                "bind = \"x\"
-open_api = true"
-            )
-            .unwrap()
-            .is_empty()
-        );
-        let e = tokens(
-            "bind = \"x\"
-open_api = true
-admin_token = \"t\"",
-        )
-        .unwrap_err();
+        assert!(tokens("bind = \"x\"\nopen_api = true").unwrap().is_empty());
+        let e = tokens("bind = \"x\"\nopen_api = true\nadmin_token = \"t\"").unwrap_err();
         assert!(e.contains("choose one"), "{e}");
         assert_eq!(
-            tokens(
-                "bind = \"x\"
-admin_token = \"t\""
-            )
-            .unwrap()
-            .len(),
+            tokens("bind = \"x\"\nadmin_token = \"t\"").unwrap().len(),
             1
         );
+        // The example configuration's placeholder is not a secret.
+        let e = tokens("bind = \"x\"\nadmin_token = \"change-me\"").unwrap_err();
+        assert!(e.contains("placeholder"), "{e}");
     }
 
     #[test]

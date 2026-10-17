@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.1.0 — 2026-10-17
+
+Third pre-release. **Pre-alpha, not production-ready**: see
+[`docs/limitations.md`](docs/limitations.md) and [`docs/security-review.md`](docs/security-review.md).
+This release is about running the Plane next to others and recovering on its own: index heads and
+catching up from the table history, several Planes behind a load balancer (on Lakekeeper), signing
+keys in Vault or an HSM, a smaller transaction log, fixes from an internal security review, and
+published container images and binaries.
+
+**Upgrading from 0.0.2:**
+- Add an API token (`[server] admin_token` or `[[server.api_tokens]]`), or `[server] open_api =
+  true` where an open API is intended: the Plane does not start without one, nor with the
+  example's placeholder `change-me` (ADR 0027).
+- Rebuild every domain once (`POST /v1/integrity/indexes/{id}/rebuild`): 0.0.2 index stores record
+  no heads (RFC 0008) and answer `INDEX_DEGRADED` until rebuilt.
+- Tables with files outside their location (imported with `add_files`) need
+  `[storage] allowed_locations` (RFC 0013).
+- The container image runs as uid 10001: `chown -R 10001:10001` a control-store volume created by
+  an earlier image.
+- A 0.0.2 binary cannot read a 0.1.0 transaction log (compressed terminal records, RFC 0010).
+
+Measured on AWS (`docs/benchmarks.md`): compacting 100 M rows 45 s (70 s in 0.0.2's version C),
+a merge-on-read delete of one row 9 ms (74 ms), a 20 M-row append in 23 s of validation and
+2.4 GB; one hour of three Planes under chaos (17 kills) left no duplicate or dangling key.
+
+
 - Hostile Parquet files can no longer abort the Plane by declaring huge sizes: the footer and every
   page header of a column chunk are checked before the decoder allocates what they declare
   (collections longer than their bytes, a schema element with more children than the schema, pages

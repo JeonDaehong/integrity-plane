@@ -149,8 +149,8 @@ sticky load balancer (by table) avoids most retries.
   earlier also works: the Plane catches up from the table history (RFC 0011).
 - **Degraded domains** (`INDEX_DEGRADED`, `BYPASS_DETECTED`): find the cause in the audit log
   (`integrity audit`), then `integrity rebuild <constraint id>`.
-- **Upgrades**: read the CHANGELOG. 0.1.0 needs one rebuild per domain after upgrading from 0.0.2
-  (RFC 0008).
+- **Upgrades**: read the CHANGELOG. 0.1.0 needs an API token and one rebuild per domain after
+  upgrading from 0.0.2 (ADR 0027, RFC 0008).
 
 ## 8. Errors writers will see
 

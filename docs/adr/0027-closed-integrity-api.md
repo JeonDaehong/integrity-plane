@@ -16,7 +16,8 @@ the token commented out, so the default deployment was the open one.
 The Plane refuses to start when no API token is configured, unless `[server] open_api = true` says
 the API is meant to be open (local tests, demos). Setting both a token and `open_api` is an error.
 The test and demo configurations in this repository set `open_api = true`; the example
-configuration sets a placeholder `admin_token`.
+configuration sets a placeholder `admin_token` (`change-me`), which the Plane refuses as a token, so
+a copied example does not start until a real secret is set.
 
 ## Consequences
 
