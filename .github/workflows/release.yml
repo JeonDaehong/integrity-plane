@@ -1,0 +1,156 @@
+name: Release
+
+# On a version tag: the container image on GitHub Container Registry (linux/amd64 and linux/arm64)
+# and prebuilt binaries attached to the GitHub release. A manual run builds everything without
+# publishing, to check the workflow.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Image name (GHCR names are lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push by digest on a tag)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.description=Commit-time PK/UNIQUE/NOT NULL/FK enforcement for Apache Iceberg (pre-alpha)
+          outputs: ${{ github.event_name == 'push' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+      - name: Smoke test the image
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          docker buildx build --load -t oip-smoke --platform linux/amd64 .
+          docker run --rm --entrypoint integrity-server oip-smoke --version
+          docker run --rm --entrypoint integrity oip-smoke --help >/dev/null
+          test "$(docker run --rm --entrypoint id oip-smoke -u)" != 0
+      - name: Record the digest
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p digests
+          d='${{ steps.build.outputs.digest }}'
+          touch "digests/${d#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: digest-${{ matrix.runner }}
+          path: digests/*
+
+  manifest:
+    if: github.event_name == 'push'
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Image name (GHCR names are lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the multi-platform image
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create -t "$IMAGE:$version" -t "$IMAGE:latest" \
+            $(cd digests && printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$version"
+
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p integrity-server -p integrity-cli
+      - name: Package
+        shell: bash
+        run: |
+          name="integrity-plane-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          cp "target/release/integrity-server$ext" "target/release/integrity$ext" "$name/"
+          cp LICENSE NOTICE README.md deploy/integrity.example.toml "$name/"
+          if [[ "$ext" == ".exe" ]]; then
+            7z a -tzip "$name.zip" "$name" >/dev/null; archive="$name.zip"
+          else
+            tar czf "$name.tar.gz" "$name"; archive="$name.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null; then sha256sum "$archive" > "$archive.sha256"
+          else shasum -a 256 "$archive" > "$archive.sha256"; fi
+          "./$name/integrity-server$ext" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: integrity-plane-*
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [manifest, binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Attach the binaries to the release (created as a draft prerelease if missing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --draft --prerelease --verify-tag \
+              --title "$GITHUB_REF_NAME" --notes "See CHANGELOG.md."
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber

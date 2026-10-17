@@ -22,6 +22,20 @@ async fn main() -> ExitCode {
         eprintln!("usage: integrity-server <config.toml>");
         return ExitCode::from(2);
     };
+    match path.as_str() {
+        "--version" | "-V" => {
+            println!("integrity-server {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        "--help" | "-h" => {
+            println!(
+                "usage: integrity-server <config.toml>\n\
+                 Configuration reference: deploy/integrity.example.toml"
+            );
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     match run(&path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

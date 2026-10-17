@@ -379,6 +379,10 @@ fn main() -> ExitCode {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("integrity {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let inv = match parse(&args) {
         Ok(i) => i,
         Err(e) => {

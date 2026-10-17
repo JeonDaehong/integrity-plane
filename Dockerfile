@@ -10,8 +10,12 @@ RUN cargo build --release --locked -p integrity-server -p integrity-cli
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /var/lib/integrity integrity \
+    && mkdir -p /var/lib/integrity && chown integrity:integrity /var/lib/integrity
 COPY --from=build /src/target/release/integrity-server /src/target/release/integrity /usr/local/bin/
+# Not root: the control store is the only place the Plane writes.
+USER integrity
 EXPOSE 8181
 VOLUME /var/lib/integrity
 ENTRYPOINT ["integrity-server"]
