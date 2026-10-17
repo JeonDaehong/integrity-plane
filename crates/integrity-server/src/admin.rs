@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use axum::http::HeaderMap;
 use integrity_iceberg::TableMetadata;
 use integrity_iceberg::metadata::FieldLookup;
-use integrity_index::IndexBuild;
+use integrity_index::{IndexBuild, TableHead};
 use integrity_txn::{FaultPoint, TxnId, fault};
 use integrity_types::{ErrorCode, FieldId};
 use serde::Deserialize;
@@ -161,14 +161,27 @@ impl Gateway {
         })
     }
 
-    /// Installs every scanned index at one epoch above all of them, in one transaction.
+    /// Installs every scanned index at one epoch above all of them, with the heads of the scanned
+    /// tables, in one transaction.
     fn install(&self, scanned: &mut Scanned) -> Result<(), ApiError> {
         let builds = std::mem::take(&mut scanned.builds);
         if builds.len() > 1 {
             fault::hit(FaultPoint::DuringRebuildSwap);
         }
+        // The heads with the indexes (RFC 0008): what each table was scanned at.
+        let heads: Vec<(&str, TableHead)> = scanned
+            .anchors
+            .iter()
+            .map(|(ident, (uuid, snapshot))| {
+                let head = TableHead {
+                    table_uuid: uuid.clone(),
+                    snapshot: *snapshot,
+                };
+                (ident.as_str(), head)
+            })
+            .collect();
         self.store
-            .install(builds)
+            .install(builds, &heads)
             .map_err(|e| ApiError::new(ErrorCode::IndexDegraded, format!("index store: {e}")))?;
         Ok(())
     }

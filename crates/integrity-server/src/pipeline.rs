@@ -26,7 +26,7 @@ use integrity_iceberg::{
 };
 use integrity_index::{
     IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex, PersistentStore, Run,
-    StagedDelta,
+    StagedDelta, TableHead,
 };
 use integrity_txn::{FaultPoint, StagedEntry, StagedSource, TxnId, TxnLog, fault};
 use integrity_types::{ConstraintId, ErrorCode, FieldId, SnapshotId, TableId};
@@ -987,12 +987,14 @@ fn same(
 }
 
 /// Applies a commit's staged deltas as validation left them, at `epoch`, atomically across its
-/// indexes: what the transaction log holds, without reading it back. Idempotent (ADR 0003).
+/// indexes: what the transaction log holds, without reading it back. Records the committed
+/// table's `head` in the same transaction (RFC 0008). Idempotent (ADR 0003).
 pub fn apply_staged(
     store: &PersistentStore,
     staged: &Staged,
     indexes: &BTreeMap<ConstraintId, PersistentIndex>,
     epoch: u64,
+    head: (&str, TableHead),
 ) -> Result<(), ApiError> {
     let batch = staged
         .sources()?
@@ -1008,13 +1010,13 @@ pub fn apply_staged(
     fault::hit(FaultPoint::DuringIndexApply);
     // One atomic transaction for every index of the commit.
     store
-        .apply_streamed(batch, IndexEpoch(epoch))
+        .apply_streamed(batch, IndexEpoch(epoch), &[head])
         .map_err(|e| api(e, ErrorCode::IndexDegraded))
 }
 
 /// Applies a commit's staged deltas, read from the transaction log one chunk at a time (RFC
 /// 0006), at `epoch`, atomically across its indexes: how recovery finishes a commit. Idempotent:
-/// re-applying after a crash is a no-op (ADR 0003).
+/// re-applying after a crash is a no-op (ADR 0003). Records `head` like [`apply_staged`].
 pub fn apply(
     store: &PersistentStore,
     log: &TxnLog,
@@ -1022,6 +1024,7 @@ pub fn apply(
     staged: &[StagedEntry],
     indexes: &BTreeMap<ConstraintId, PersistentIndex>,
     epoch: u64,
+    head: (&str, TableHead),
 ) -> Result<(), ApiError> {
     let logged =
         |e: integrity_txn::TxnError| ApiError::new(ErrorCode::IndexDegraded, e.to_string());
@@ -1040,6 +1043,6 @@ pub fn apply(
     fault::hit(FaultPoint::DuringIndexApply);
     // One atomic transaction for every index of the commit.
     store
-        .apply_streamed(batch, IndexEpoch(epoch))
+        .apply_streamed(batch, IndexEpoch(epoch), &[head])
         .map_err(|e| api(e, ErrorCode::IndexDegraded))
 }

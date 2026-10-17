@@ -123,7 +123,7 @@ fn compare(domain: &Domain, row_group: usize, memory: usize) -> Result<bool, Str
     let bounded = scan(&Local, &store, memory, &configs, &members, false);
     let clean = match (reference, bounded) {
         (Ok(Ok(contents)), Ok(ScanOutcome::Clean(builds))) => {
-            store.install(builds).unwrap();
+            store.install(builds, &[]).unwrap();
             for (id, (kind, entries)) in contents {
                 let installed = store.index(id, kind).unwrap().entries().unwrap();
                 if installed != entries {

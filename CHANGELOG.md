@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Index heads (RFC 0008): the index store records the `main` snapshot each table's indexes
+  reflect, atomically with every index change, and a commit is refused with `BYPASS_DETECTED` when
+  `main` of any table of its domain is not that snapshot. A certified snapshot no longer passes
+  on its certificate alone, which catches a second Plane in front of the same tables, a control
+  store restored from an older copy, and `main` moved back around the Plane. **Upgrading:** index
+  stores from 0.0.2 record no heads; every enforced domain answers `INDEX_DEGRADED` until it is
+  rebuilt once (`POST /v1/integrity/indexes/{id}/rebuild`).
+
 - The transaction log deletes a commit's staged index deltas with its terminal record and prunes
   finished transactions after `[txn_log] retention` (default `24h`, at least `30m`; RFC 0006):
   it no longer grows with write volume, and keeps only recent transactions in memory. A request

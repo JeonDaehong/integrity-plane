@@ -38,6 +38,16 @@ pub fn load_or_create(path: &Path) -> Result<CertSigner, String> {
             file.write_all(&seed)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| format!("{}: {e}", path.display()))?;
+            // The file's directory entry too: without it, power loss can lose the key after
+            // certificates were signed with it. Unix only: std cannot open a directory on Windows.
+            #[cfg(unix)]
+            {
+                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::File::open(dir)
+                        .and_then(|d| d.sync_all())
+                        .map_err(|e| format!("{}: {e}", dir.display()))?;
+                }
+            }
             Ok(CertSigner::from_seed(&seed))
         }
         Err(e) => Err(format!("{}: {e}", path.display())),

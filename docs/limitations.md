@@ -52,8 +52,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   store. Next step: signer backends that keep the key in an HSM or KMS (PKCS#11 and Vault Transit
   first, both with Ed25519; then cloud KMS). AWS KMS and Azure Key Vault may need a second signature
   algorithm (ECDSA P-256), which is a certificate format change (new RFC).
-- A forged certificate copied into a bypassing snapshot passes the commit-time check; only `verify`
-  detects it.
+- A snapshot written around the Plane is refused at the next commit only while it is `main`
+  (RFC 0008); bypassed snapshots that are no longer `main` are found by `verify`.
 - `verify` cannot recompute snapshots with equality deletes (reported `UNVERIFIABLE`) or chains whose
   snapshots have expired, and only verifies back to the latest anchor.
 
@@ -62,8 +62,11 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Single node. The control store is local files; there is no replication or failover, and while
   the Plane is down writers cannot commit to enforced tables (fail closed). A second process on
   the same control store refuses to start. A second Plane with its own control store in front of
-  the same tables is not detected and is unsafe, and so is restoring an older copy of the control
-  store without rebuilding ([`recovery.md`](recovery.md#single-node-and-power-loss)).
+  the same tables, or a control store restored from an older copy, makes the next commit fail with
+  `BYPASS_DETECTED` until the domain is rebuilt (RFC 0008,
+  [`recovery.md`](recovery.md#single-node-and-power-loss)).
+- Index stores written before RFC 0008 record no heads: every enforced domain refuses commits
+  (`INDEX_DEGRADED`) until it is rebuilt once.
 - The transaction log keeps finished transactions for `[txn_log] retention` (default 24 h), then
   deletes them; idempotency keys are honoured for that long. The audit log and the per-transaction
   error reports in `registry.redb` are never pruned.

@@ -10,6 +10,9 @@
 //! durable transaction: readers see the old or the new indexes, never a mix, and a crash before the
 //! swap leaves the old ones untouched.
 //!
+//! The store also records each enforced table's head, the `main` snapshot its indexes reflect
+//! (RFC 0008), written in the same transaction as the index changes that make it true.
+//!
 //! redb can panic (`unreachable!`) on some corrupted files instead of returning an error. Every
 //! call into redb therefore runs under `catch_unwind`: a panic becomes [`IndexError::Corrupt`] and
 //! poisons the store, so all later calls fail closed too. This requires `panic = "unwind"`.
@@ -34,6 +37,59 @@ const META_LEN: usize = 1 + 1 + 8 + 1 + 8 + 32;
 /// Identity of the store file, created once: lets the owner notice that the file was deleted and
 /// recreated (all indexes empty) instead of trusting it (ADR 0005).
 const STORE: TableDefinition<&str, &[u8]> = TableDefinition::new("oip/index-store/v1");
+/// The head of each table, by table identifier (RFC 0008).
+const HEADS: TableDefinition<&str, &[u8]> = TableDefinition::new("oip/index-heads/v1");
+const HEAD_VERSION: u8 = 1;
+
+/// The `main` snapshot of a table that the indexes reflect (RFC 0008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableHead {
+    /// The table's UUID, lowercase.
+    pub table_uuid: String,
+    /// The `main` snapshot id, `None` for a table without one.
+    pub snapshot: Option<i64>,
+}
+
+impl TableHead {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.table_uuid.len());
+        out.push(HEAD_VERSION);
+        out.push(u8::from(self.snapshot.is_some()));
+        out.extend_from_slice(&self.snapshot.unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(self.table_uuid.as_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let (fixed, uuid) = bytes.split_at_checked(10).ok_or(IndexError::Corrupt)?;
+        if fixed[0] != HEAD_VERSION {
+            return Err(IndexError::Corrupt);
+        }
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&fixed[2..]);
+        let snapshot = match fixed[1] {
+            0 => None,
+            1 => Some(i64::from_be_bytes(id)),
+            _ => return Err(IndexError::Corrupt),
+        };
+        let table_uuid = String::from_utf8(uuid.to_vec()).map_err(|_| IndexError::Corrupt)?;
+        Ok(Self {
+            table_uuid,
+            snapshot,
+        })
+    }
+}
+
+/// Writes `heads` within `txn`.
+fn write_heads(txn: &redb::WriteTransaction, heads: &[(&str, TableHead)]) -> Result<()> {
+    let mut table = txn.open_table(HEADS).map_err(storage)?;
+    for (identifier, head) in heads {
+        table
+            .insert(*identifier, head.encode().as_slice())
+            .map_err(storage)?;
+    }
+    Ok(())
+}
 
 /// Converts any redb error. Messages from redb describe files and pages, never key contents.
 fn storage(e: impl Into<redb::Error>) -> IndexError {
@@ -141,8 +197,13 @@ impl PersistentStore {
     /// Makes every build the contents of its index, all at one epoch above the current epoch of
     /// every one of them, in one atomic, durable transaction (spec §19 step 5): either every index
     /// switches or none does. Returns that epoch. Clears the replay identity of each index: the
-    /// next apply must be a new epoch.
-    pub fn install(&self, builds: Vec<IndexBuild>) -> Result<IndexEpoch> {
+    /// next apply must be a new epoch. Records `heads`, the snapshots the builds were scanned at,
+    /// in the same transaction (RFC 0008).
+    pub fn install(
+        &self,
+        builds: Vec<IndexBuild>,
+        heads: &[(&str, TableHead)],
+    ) -> Result<IndexEpoch> {
         let mut builds = builds;
         for b in &mut builds {
             if !Arc::ptr_eq(&b.shared, &self.shared) {
@@ -175,6 +236,7 @@ impl PersistentStore {
                 }
                 epoch
             };
+            write_heads(&txn, heads)?;
             txn.commit().map_err(storage)?;
             Ok(epoch)
         })
@@ -200,17 +262,19 @@ impl PersistentStore {
                 (*index, staged.header(), Box::new(writes) as Writes<'_>)
             })
             .collect();
-        self.apply_streamed(streams, epoch)
+        self.apply_streamed(streams, epoch, &[])
     }
 
     /// [`PersistentStore::apply_all`] for staged deltas read as streams of their writes (ADR
     /// 0025): each stream must yield exactly its header's writes, in strictly increasing key
     /// order, with its digest; otherwise nothing is applied ([`IndexError::Corrupt`]). Memory does
-    /// not grow with the number of writes.
+    /// not grow with the number of writes. `heads` are recorded in the same transaction, also when
+    /// no index changes (RFC 0008).
     pub fn apply_streamed(
         &self,
         batch: Vec<(&PersistentIndex, StagedHeader, Writes<'_>)>,
         epoch: IndexEpoch,
+        heads: &[(&str, TableHead)],
     ) -> Result<()> {
         if batch
             .iter()
@@ -226,10 +290,42 @@ impl PersistentStore {
                 // An error drops the transaction: nothing of the batch is applied.
                 wrote |= index.write_in(&txn, &header, writes, epoch)?;
             }
+            if !heads.is_empty() {
+                write_heads(&txn, heads)?;
+                wrote = true;
+            }
             if wrote {
                 txn.commit().map_err(storage)?;
             }
             Ok(())
+        })
+    }
+
+    /// The recorded head of table `identifier`, if any (RFC 0008).
+    pub fn head(&self, identifier: &str) -> Result<Option<TableHead>> {
+        self.shared.guard(|db| {
+            let read = db.begin_read().map_err(storage)?;
+            let table = match read.open_table(HEADS) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(storage(e)),
+            };
+            table
+                .get(identifier)
+                .map_err(storage)?
+                .map(|g| TableHead::decode(g.value()))
+                .transpose()
+        })
+    }
+
+    /// Records the head of table `identifier` on its own, durably: for a table whose indexes
+    /// change without an apply (an empty table anchored on first sight, RFC 0008).
+    pub fn set_head(&self, identifier: &str, head: TableHead) -> Result<()> {
+        self.shared.guard(|db| {
+            let mut txn = db.begin_write().map_err(storage)?;
+            txn.set_two_phase_commit(true);
+            write_heads(&txn, &[(identifier, head)])?;
+            txn.commit().map_err(storage)
         })
     }
 

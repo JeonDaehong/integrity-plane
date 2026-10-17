@@ -22,7 +22,7 @@ use integrity_iceberg::{
     Classification, CommitRequest, FileIo, Rejection, TableMetadata, check_requirements, classify,
     inject_certificate, snapshot_certificate,
 };
-use integrity_index::{IndexKind, KeyIndex, PersistentIndex, PersistentStore};
+use integrity_index::{IndexKind, KeyIndex, PersistentIndex, PersistentStore, TableHead};
 use integrity_txn::{
     Decision as TxnDecision, FaultPoint, Prepared, StagedEntry, TxnId, TxnLog, TxnState, Validated,
     fault,
@@ -1041,6 +1041,10 @@ impl Gateway {
                                 })?;
                                 indexes.insert(id, index);
                             }
+                            let head = TableHead {
+                                table_uuid: meta.table_uuid.to_lowercase(),
+                                snapshot: Some(v.final_snapshot),
+                            };
                             if let Err(e) = pipeline::apply(
                                 &self.store,
                                 &self.log,
@@ -1048,6 +1052,7 @@ impl Gateway {
                                 &u.staged,
                                 &indexes,
                                 v.epoch,
+                                (&u.prepared.identifier, head),
                             ) {
                                 self.mark_transient(&u.prepared.identifier, &e.message);
                                 return Err(e);
@@ -1085,9 +1090,10 @@ impl Gateway {
         Ok(())
     }
 
-    /// Checks a domain member against its anchor (ADR 0011): an empty table is anchored on first
-    /// sight; a table with data needs onboarding; a replaced table is refused; and `main` must be
-    /// the anchor or a certified snapshot, otherwise a writer bypassed the Plane.
+    /// Checks a domain member against its anchor (ADR 0011) and the indexes' head (RFC 0008): an
+    /// empty table is anchored on first sight; a table with data needs onboarding; a replaced
+    /// table is refused; and `main` must be the snapshot the indexes reflect, otherwise it was
+    /// written around this Plane (by a writer, another Plane, or before a restored control store).
     fn check_chain_head(
         &self,
         doc: &mut RegistryDoc,
@@ -1096,8 +1102,21 @@ impl Gateway {
     ) -> Result<(), ApiError> {
         let uuid = meta.table_uuid.to_lowercase();
         let head = meta.main_snapshot_id();
+        let degraded = |e: integrity_index::IndexError| {
+            ApiError::new(ErrorCode::IndexDegraded, format!("index store: {e}"))
+        };
         match doc.anchors.get(identifier) {
             None if head.is_none() => {
+                // The head first: an anchor never exists without one.
+                self.store
+                    .set_head(
+                        identifier,
+                        TableHead {
+                            table_uuid: uuid.clone(),
+                            snapshot: None,
+                        },
+                    )
+                    .map_err(degraded)?;
                 *doc = self
                     .registry
                     .update(|d| {
@@ -1122,14 +1141,26 @@ impl Gateway {
                 ErrorCode::IndexDegraded,
                 format!("{identifier} was replaced by another table; rebuild its domain"),
             )),
-            Some(a) if head.map(|h| h.0) == a.snapshot => Ok(()),
-            Some(_) => match head.map(|h| snapshot_certificate(meta, h)) {
-                Some(Ok(Some(_))) => Ok(()),
-                _ => {
-                    let reason = format!(
-                        "{identifier}: snapshot {} of main was not committed through the Plane",
-                        head.map_or_else(|| "(none)".to_owned(), |h| h.to_string())
-                    );
+            Some(_) => match self.store.head(identifier).map_err(degraded)? {
+                Some(h) if h.table_uuid == uuid && h.snapshot == head.map(|h| h.0) => Ok(()),
+                None => Err(ApiError::new(
+                    ErrorCode::IndexDegraded,
+                    format!(
+                        "the index store does not record which snapshot of {identifier} it reflects (written before RFC 0008); rebuild its domain"
+                    ),
+                )),
+                Some(h) => {
+                    let main = head.map_or_else(|| "(none)".to_owned(), |h| h.to_string());
+                    let reason = match head.map(|h| snapshot_certificate(meta, h)) {
+                        Some(Ok(Some(_))) => format!(
+                            "{identifier}: snapshot {main} of main is certified, but the indexes reflect snapshot {}: it was committed through another Plane, or the control store was restored from an older copy",
+                            h.snapshot
+                                .map_or_else(|| "(none)".to_owned(), |s| s.to_string())
+                        ),
+                        _ => format!(
+                            "{identifier}: snapshot {main} of main was not committed through the Plane"
+                        ),
+                    };
                     if let Ok(d) = self.registry.update(|d| {
                         d.degraded.insert(identifier.to_owned(), reason.clone());
                         Ok::<_, StoreError>(d.clone())
@@ -1565,6 +1596,10 @@ impl Gateway {
                     epoch,
                     staged,
                     indexes,
+                    head: TableHead {
+                        table_uuid: meta.table_uuid.to_lowercase(),
+                        snapshot: Some(final_snapshot),
+                    },
                     decision: c.decision(),
                     identifier,
                     event,
@@ -1614,6 +1649,8 @@ struct Accepted {
     epoch: u64,
     staged: pipeline::Staged,
     indexes: BTreeMap<ConstraintId, PersistentIndex>,
+    /// What the indexes reflect once written (RFC 0008).
+    head: TableHead,
     decision: TxnDecision,
     identifier: String,
     event: AuditEvent,
@@ -1632,6 +1669,7 @@ impl Gateway {
             epoch,
             staged,
             indexes,
+            head,
             decision,
             identifier,
             event,
@@ -1639,8 +1677,9 @@ impl Gateway {
             _shared,
         } = accepted;
         let gateway = Arc::clone(&self);
+        let table = identifier.clone();
         let applied = tokio::task::spawn_blocking(move || {
-            pipeline::apply_staged(&gateway.store, &staged, &indexes, epoch)
+            pipeline::apply_staged(&gateway.store, &staged, &indexes, epoch, (&table, head))
         })
         .await;
         match applied {

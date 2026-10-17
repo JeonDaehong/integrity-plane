@@ -34,7 +34,9 @@ A table with data and no anchor is not enforced (`INDEX_DEGRADED`, onboarding re
 A table whose UUID differs from its anchor was replaced and is refused the same way.
 
 **Bypass detection.** Before validating a commit, the head of `main` of every table of the domain
-must be the anchor snapshot or carry a certificate. Otherwise the commit fails with
+must be the anchor snapshot or carry a certificate (superseded by RFC 0008: it must be the head the
+index store recorded with the indexes; a certificate alone is not enough). Otherwise the commit
+fails with
 `BYPASS_DETECTED` (423), the domain is marked degraded in the registry (it survives restarts), and
 the event is audited. Checking every member, not only the written table, matters: a child commit is
 validated against the parent's index, which a bypassed parent write has made stale.

@@ -52,10 +52,11 @@ async fn start_gateway(
     named: &[(String, String)],
     redact: bool,
     seed: Option<[u8; 32]>,
+    control: &str,
     index_file: &str,
     log_file: &str,
 ) -> (String, Running) {
-    let control = files.dir.0.join("control");
+    let control = files.dir.0.join(control);
     std::fs::create_dir_all(&control).unwrap();
     // After a restart the previous gateway's files can stay locked for a moment (Windows).
     let mut opened = None;
@@ -170,6 +171,7 @@ async fn env_named(
         &named,
         redact,
         seed,
+        "control",
         "indexes.redb",
         "txn.redb",
     )
@@ -193,10 +195,21 @@ impl Env {
     /// Stops the gateway and starts another on the same registry, with the given index store and
     /// transaction log files (a new name plays a file that was deleted and recreated).
     async fn restart(&mut self, index_file: &str, log_file: &str) {
+        self.restart_after(index_file, log_file, |_| {}).await;
+    }
+
+    /// Like `restart`, running `stopped` on the control-store directory while no gateway runs.
+    async fn restart_after(
+        &mut self,
+        index_file: &str,
+        log_file: &str,
+        stopped: impl FnOnce(&std::path::Path),
+    ) {
         self.http = reqwest::Client::new(); // drop pooled connections to the old server
         let old = self.running.take().unwrap();
         let _ = old.stop.send(());
         old.task.await.unwrap();
+        stopped(&self.files.dir.0.join("control"));
         let (gateway, running) = start_gateway(
             &self.files,
             self.up,
@@ -204,6 +217,7 @@ impl Env {
             &self.named,
             self.redact,
             self.seed,
+            "control",
             index_file,
             log_file,
         )
@@ -680,6 +694,154 @@ fn statuses(report: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// Copies the control-store files `names` from `from` to `to` (a backup, or its restore).
+fn copy_files(from: &std::path::Path, to: &std::path::Path, names: &[&str]) {
+    std::fs::create_dir_all(to).unwrap();
+    for name in names {
+        // A stopped gateway's files can stay locked for a moment (Windows).
+        let mut copied = false;
+        for _ in 0..100 {
+            if std::fs::copy(from.join(name), to.join(name)).is_ok() {
+                copied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(copied, "copy {name}");
+    }
+}
+
+const CONTROL_FILES: [&str; 3] = ["registry.redb", "indexes.redb", "txn.redb"];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_plane_with_its_own_control_store_is_detected() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+
+    // A second Plane, with its own control store, in front of the same catalog (RFC 0008).
+    let (second, _running) = start_gateway(
+        &e.files,
+        e.up,
+        None,
+        &[],
+        false,
+        None,
+        "control-b",
+        "indexes.redb",
+        "txn.redb",
+    )
+    .await;
+    let first = std::mem::replace(&mut e.gateway, second.clone());
+    e.register_demo().await;
+    e.gateway = first;
+
+    // The first Plane certifies a commit that the second one's indexes never see.
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+    // Through the second Plane, the duplicate of key 2 is not validated against stale indexes.
+    let (status, body) = e.append(&second, "customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-015"), "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("another Plane"), "{message}");
+    // The first Plane still enforces.
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-003"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_store_restored_from_an_older_copy_is_detected_until_rebuilt() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    let backup = e.files.dir.0.join("backup");
+    e.restart_after("indexes.redb", "txn.redb", |control| {
+        copy_files(control, &backup, &CONTROL_FILES);
+    })
+    .await;
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+
+    // The older copy is consistent in itself, but misses the commit of key 2 (RFC 0008).
+    e.restart_after("indexes.redb", "txn.redb", |control| {
+        copy_files(&backup, control, &CONTROL_FILES);
+    })
+    .await;
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-015"), "{body}");
+    let (status, body) = e.through_plane("orders", &[(10, Some(2))]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-010"), "{body}");
+
+    let (status, body) = e.api("POST", "indexes/1/rebuild", None).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (400, "INT-003"), "{body}");
+    assert_eq!(e.through_plane("orders", &[(10, Some(2))]).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rolling_main_back_to_a_certified_snapshot_is_a_bypass() {
+    let e = env(None).await;
+    e.register_demo().await;
+    let (_, first) = e.through_plane("customer", &[(1, None)]).await;
+    let earlier = head_of(&first);
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+    assert_eq!(e.through_plane("orders", &[(10, Some(2))]).await.0, 200);
+
+    // A writer moves main back around the Plane: customer 2 is gone, the order still points at it.
+    let url = format!("{}/v1/namespaces/db/tables/customer", e.upstream);
+    let meta: Value = e.http.get(&url).send().await.unwrap().json().await.unwrap();
+    let current = meta["metadata"]["refs"]["main"]["snapshot-id"].clone();
+    let body = json!({
+        "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": current}],
+        "updates": [{"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": earlier, "type": "branch"}]
+    });
+    assert!(
+        e.http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let (status, body) = e.through_plane("orders", &[(11, Some(2))]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-015"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_store_without_heads_is_refused_until_rebuilt() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    assert_eq!(e.through_plane("customer", &[(1, None)]).await.0, 200);
+    // An index store written before RFC 0008 records no heads.
+    e.restart_after("indexes.redb", "txn.redb", |control| {
+        // A stopped gateway's files can stay locked for a moment (Windows).
+        let db = (0..100)
+            .find_map(|_| {
+                redb::Database::open(control.join("indexes.redb"))
+                    .inspect_err(|_| std::thread::sleep(Duration::from_millis(100)))
+                    .ok()
+            })
+            .unwrap();
+        let w = db.begin_write().unwrap();
+        w.delete_table(redb::TableDefinition::<&str, &[u8]>::new(
+            "oip/index-heads/v1",
+        ))
+        .unwrap();
+        w.commit().unwrap();
+    })
+    .await;
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (423, "INT-010"), "{body}");
+    // Not persisted as degraded: nothing was bypassed.
+    assert_eq!(e.status().await["degraded"], Value::Null);
+
+    let (status, body) = e.api("POST", "indexes/1/rebuild", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn verify_pinpoints_the_snapshot_written_around_the_plane() {
     let e = env(None).await;
@@ -734,12 +896,12 @@ async fn verify_recomputes_certificates_instead_of_trusting_them() {
         })
         .await;
     assert_eq!(status, 200);
-    // The head looks certified, so commit-time checks let the next commit through ...
+    // The head looks certified, but it is not the snapshot the indexes reflect (RFC 0008) ...
     let (status, body) = e.through_plane("customer", &[(3, None)]).await;
-    assert_eq!(status, 200, "{body}");
-    // ... but verify recomputes every certificate from the data files.
+    assert_eq!((status, code(&body).as_str()), (423, "INT-015"), "{body}");
+    // ... and verify recomputes every certificate from the data files.
     let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
-    assert_eq!(statuses(&report), ["OK", "MISMATCH", "OK"], "{report}");
+    assert_eq!(statuses(&report), ["OK", "MISMATCH"], "{report}");
     assert_eq!(report["first_broken"], head_of(&forged));
 }
 

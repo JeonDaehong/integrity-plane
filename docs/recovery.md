@@ -128,20 +128,26 @@ catalog directly, which only writers must not. To move the Plane to another host
 stop it, copy the whole control store, and start it there: unfinished transactions are resolved at
 start as above.
 
-**Not detected, therefore not supported:**
+**Index heads (RFC 0008).** The index store records, for every enforced table, the `main` snapshot
+its indexes reflect, in the same transaction as the index changes: a commit's apply (and recovery's
+re-apply), an install by onboarding or rebuild, and the anchoring of an empty table. Before
+validating, every table of the domain must have `main` equal to its recorded head, otherwise the
+commit fails with `BYPASS_DETECTED` and the domain is degraded until rebuilt. This catches what a
+certificate alone does not show:
 
-- *Two Planes with separate control stores in front of the same tables.* The commit-time bypass
-  check accepts any parent snapshot that carries a certificate; it does not check that the
-  certificate was issued by this Plane's indexes. Each Plane would miss the other's keys and could
-  accept duplicates or dangling references.
-- *Restoring an older copy of the control store* (backup, VM or disk snapshot) while commits went
+- *Two Planes with separate control stores in front of the same tables.* Each one's certified
+  commits are missing from the other's indexes; the other refuses its next commit.
+- *A control store restored from an older copy* (backup, VM or disk snapshot) while commits went
   through after the copy was taken. The restored files agree with each other, so the checks in
-  [Lost control-store files](#lost-control-store-files) pass, but the indexes miss the later
-  commits, whose snapshots carry certificates. After restoring, rebuild every domain
-  (`POST /v1/integrity/indexes/{id}/rebuild`) before letting writers back in.
+  [Lost control-store files](#lost-control-store-files) pass, but the heads are older than `main`.
+  Rebuild every domain (`POST /v1/integrity/indexes/{id}/rebuild`) after restoring.
+- *`main` moved back around the Plane* to an earlier certified snapshot.
 
-Recording the snapshot each table's indexes were last applied for, and refusing a parent that is
-not it, would turn both into `BYPASS_DETECTED`; it is not implemented yet.
+An index store written before RFC 0008 has no heads; its domains answer `INDEX_DEGRADED` until
+rebuilt once.
+
+Two Planes on the same tables are still not supported: each refuses commits after the other's,
+so writers see `BYPASS_DETECTED` instead of a working setup.
 
 **Power loss.** Only process kills are tested (`tests/crash.rs`); a kill keeps the operating
 system's page cache, so it does not show what reaches the disk. What the Plane relies on:
@@ -153,8 +159,7 @@ system's page cache, so it does not show what reaches the disk. What the Plane r
   is stable (write caches without power-loss protection, some network filesystems) void this.
 - Sort runs and spilled keys in the scratch directories are never flushed; they are deleted at
   start and nothing reads them after a restart.
-- A newly generated signing key file is flushed, but its directory is not; if power fails just
-  after the first start with `[signing]`, the key may be gone, a new one is generated, and
-  certificates signed before are no longer verifiable with the published key.
+- A newly generated signing key file is flushed before it is used, and on Unix its directory
+  entry too.
 - On start the index store is fully checksum-verified; a torn or corrupted file is refused as
   `Corrupt` and its domains must be rebuilt, never trusted (see [Index store](#index-store)).

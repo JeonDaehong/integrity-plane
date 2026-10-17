@@ -29,7 +29,8 @@ A writer that reaches the upstream catalog directly can commit anything.
 - **Deployment requirement:** writers must not be able to reach the upstream catalog (network
   policy, credentials scoped to the Plane). This is the primary control.
 - **Detection at commit time:** before validating, the Plane checks every table of the domain:
-  `main` must be its anchor or carry a certificate. Otherwise the commit fails with
+  `main` must be the snapshot its indexes reflect, which the index store records with every index
+  change (RFC 0008). Otherwise the commit fails with
   `BYPASS_DETECTED` (423), the domain stays degraded until an operator rebuilds it, and the event is
   audited (ADR 0011). Checking every table matters: a bypassed write to an FK parent makes the
   validation of its children unsound.
@@ -37,9 +38,10 @@ A writer that reaches the upstream catalog directly can commit anything.
   back to the chain start and names the first snapshot that is missing a certificate or whose
   certificate does not match. It catches a writer that copies a valid-looking certificate into its
   own snapshot, which the commit-time check alone does not.
-- **Not detected:** a second Plane with its own control store in front of the same tables, or a
-  control store restored from an older copy; certified snapshots committed elsewhere pass the
-  commit-time check (see [`recovery.md`](recovery.md#single-node-and-power-loss)).
+- **Certified elsewhere:** a snapshot certified by a second Plane with its own control store, or
+  committed after the copy a control store was restored from, carries a valid certificate but is
+  not what the indexes reflect; it is refused the same way (RFC 0008,
+  [`recovery.md`](recovery.md#single-node-and-power-loss)).
 
 ### Tampering with data files after publication
 

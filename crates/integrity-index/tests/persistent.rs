@@ -6,7 +6,9 @@
 mod common;
 
 use common::*;
-use integrity_index::{IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, PersistentStore};
+use integrity_index::{
+    IndexEpoch, IndexError, IndexKind, IndexValue, KeyIndex, PersistentStore, TableHead,
+};
 use integrity_types::{ConstraintId, SnapshotId};
 
 #[test]
@@ -157,7 +159,7 @@ fn builds_are_installed_atomically_beside_the_live_contents() {
         let unique = store.index(ConstraintId(4), IndexKind::Unique).unwrap();
         assert!(unique.entries().unwrap().is_empty());
         // One epoch above every index's current one.
-        assert_eq!(store.install(vec![a, b]).unwrap(), IndexEpoch(2));
+        assert_eq!(store.install(vec![a, b], &[]).unwrap(), IndexEpoch(2));
     }
     let store = PersistentStore::open(&path).unwrap();
     let refs = store.index(ConstraintId(3), IndexKind::Reference).unwrap();
@@ -189,7 +191,7 @@ fn builds_are_installed_atomically_beside_the_live_contents() {
     drop(stale);
     assert_eq!(refs.entries().unwrap().len(), 2);
     let empty = store.build(ConstraintId(3), IndexKind::Reference).unwrap();
-    assert_eq!(store.install(vec![empty]).unwrap(), IndexEpoch(4));
+    assert_eq!(store.install(vec![empty], &[]).unwrap(), IndexEpoch(4));
     assert!(refs.entries().unwrap().is_empty());
     // A discarded build leaves the index alone.
     let mut gone = store.build(ConstraintId(4), IndexKind::Unique).unwrap();
@@ -290,8 +292,14 @@ fn a_streamed_apply_equals_apply_all_and_refuses_writes_that_do_not_match() {
                 (&a, sa.header(), Box::new(bad.into_iter())),
             ],
             IndexEpoch(3),
+            &[("db.t", head(Some(3)))],
         );
         assert!(result.is_err());
+        assert_eq!(
+            store.head("db.t").unwrap(),
+            None,
+            "no head without the indexes"
+        );
         assert_eq!(a.epoch().unwrap(), IndexEpoch(1));
         assert_eq!(b.epoch().unwrap(), IndexEpoch(0));
         assert_eq!(b.get_many(&[k(1)]).unwrap(), vec![None]);
@@ -313,6 +321,7 @@ fn a_streamed_apply_equals_apply_all_and_refuses_writes_that_do_not_match() {
                     (&b, sb.header(), Box::new(writes_of(&sb).into_iter())),
                 ],
                 IndexEpoch(3),
+                &[],
             )
             .unwrap();
     }
@@ -320,4 +329,78 @@ fn a_streamed_apply_equals_apply_all_and_refuses_writes_that_do_not_match() {
     assert_eq!(b.entries().unwrap(), tb.entries().unwrap());
     assert_eq!(a.epoch().unwrap(), IndexEpoch(3));
     assert_eq!(b.epoch().unwrap(), IndexEpoch(3));
+}
+
+fn head(snapshot: Option<i64>) -> TableHead {
+    TableHead {
+        table_uuid: "11111111-1111-1111-1111-111111111111".into(),
+        snapshot,
+    }
+}
+
+#[test]
+fn heads_are_written_with_the_indexes_and_survive_reopen() {
+    let dir = TempDir::new("heads");
+    let path = dir.path().join("index.redb");
+    {
+        let store = PersistentStore::open(&path).unwrap();
+        assert_eq!(store.head("db.t").unwrap(), None);
+        store.set_head("db.t", head(None)).unwrap();
+        assert_eq!(store.head("db.t").unwrap(), Some(head(None)));
+
+        // An install records the scanned heads with the builds.
+        let mut build = store.build(ConstraintId(1), IndexKind::Unique).unwrap();
+        build
+            .push(
+                k(1),
+                IndexValue::Unique {
+                    last_snapshot: SnapshotId(1),
+                },
+            )
+            .unwrap();
+        let other = TableHead {
+            table_uuid: "22222222-2222-2222-2222-222222222222".into(),
+            snapshot: Some(-4),
+        };
+        store
+            .install(
+                vec![build],
+                &[("db.t", head(Some(10))), ("db.u", other.clone())],
+            )
+            .unwrap();
+        assert_eq!(store.head("db.t").unwrap(), Some(head(Some(10))));
+        assert_eq!(store.head("db.u").unwrap(), Some(other));
+
+        // An apply records the committed table's head, also when it writes no entry, and again
+        // when replayed.
+        let a = store.index(ConstraintId(1), IndexKind::Unique).unwrap();
+        let sa = a.stage(&delta(2, &[(2, 1)])).unwrap();
+        for _ in 0..2 {
+            store
+                .apply_streamed(
+                    vec![(&a, sa.header(), Box::new(writes_of(&sa).into_iter()))],
+                    IndexEpoch(2),
+                    &[("db.t", head(Some(11)))],
+                )
+                .unwrap();
+            assert_eq!(store.head("db.t").unwrap(), Some(head(Some(11))));
+        }
+        store
+            .apply_streamed(Vec::new(), IndexEpoch(3), &[("db.t", head(Some(12)))])
+            .unwrap();
+        // A conflicting apply records nothing.
+        let stale = a.stage(&delta(3, &[(3, 1)])).unwrap();
+        assert!(
+            store
+                .apply_streamed(
+                    vec![(&a, stale.header(), Box::new(writes_of(&stale).into_iter()))],
+                    IndexEpoch(1),
+                    &[("db.t", head(Some(13)))],
+                )
+                .is_err()
+        );
+    }
+    let store = PersistentStore::open(&path).unwrap();
+    assert_eq!(store.head("db.t").unwrap(), Some(head(Some(12))));
+    assert_eq!(store.head("db.v").unwrap(), None);
 }

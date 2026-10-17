@@ -25,7 +25,7 @@ use integrity_types::SnapshotId;
 
 pub use memory::MemoryIndex;
 pub use overlay::Overlay;
-pub use persistent::{IndexBuild, PersistentIndex, PersistentStore, Writes};
+pub use persistent::{IndexBuild, PersistentIndex, PersistentStore, TableHead, Writes};
 pub use run::{FinishedRun, Records, Run};
 pub use sort::{KeySorter, SortedBytes, SortedKeys};
 
