@@ -44,7 +44,7 @@ Every response for a decision the Plane made is definite. The gateway never retu
 | Constraint violated | INT-003 … INT-008 | 400 |
 | Unsupported operation, invalid request, budget exceeded | INT-001, INT-012, INT-014 | 400 |
 | Stale base snapshot (failed requirement, new snapshot not on current `main`) | INT-009 | 409 |
-| Transient: unresolved recovery, storage read failure | INT-011, **INT-016** | 409 |
+| Transient: unresolved recovery, storage read failure, signer unavailable | INT-011, **INT-016**, INT-018 (RFC 0009) | 409 |
 | Operator action needed: index degraded, chain broken | INT-010, INT-015 | 423 |
 | Internal error before forwarding | INT-010 (domain set to degraded) | 423 |
 | Upstream catalog response after forwarding | — | passed through unchanged |

@@ -15,13 +15,14 @@ use std::time::Duration;
 use axum::Router;
 use integrity_index::PersistentStore;
 use integrity_server::fileio::ObjectStoreIo;
+use integrity_server::signing::Signer;
 use integrity_server::store::Registry;
 use integrity_server::{Gateway, router};
 use integrity_txn::TxnLog;
 use serde_json::{Value, json};
 
 mod support;
-use support::{Dir, Files, Row, Shared, Upstream, empty_table, upstream};
+use support::{Dir, Files, Row, Shared, Upstream, VaultMode, empty_table, upstream};
 
 struct Env {
     http: reqwest::Client,
@@ -34,7 +35,7 @@ struct Env {
     /// Named integrity API tokens `(name, token)` (ADR 0026).
     named: Vec<(String, String)>,
     redact: bool,
-    seed: Option<[u8; 32]>,
+    signer: Option<Signer>,
     running: Option<Running>,
 }
 
@@ -51,7 +52,7 @@ async fn start_gateway(
     token: Option<&str>,
     named: &[(String, String)],
     redact: bool,
-    seed: Option<[u8; 32]>,
+    signer: Option<Signer>,
     control: &str,
     index_file: &str,
     log_file: &str,
@@ -94,10 +95,7 @@ async fn start_gateway(
     )
     .with_admin_token(token.map(str::to_owned))
     .with_redact_keys(redact)
-    .with_signer(
-        seed.map(|s| integrity_core::CertSigner::from_seed(&s)),
-        false,
-    );
+    .with_signer(signer, false);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -164,13 +162,14 @@ async fn env_named(
             .with_state(Arc::clone(&shared)),
     )
     .await;
+    let signer: Option<Signer> = seed.map(|s| integrity_core::CertSigner::from_seed(&s).into());
     let (gateway, running) = start_gateway(
         &files,
         up,
         token,
         &named,
         redact,
-        seed,
+        signer.clone(),
         "control",
         "indexes.redb",
         "txn.redb",
@@ -186,7 +185,7 @@ async fn env_named(
         token: token.map(str::to_owned),
         named,
         redact,
-        seed,
+        signer,
         running: Some(running),
     }
 }
@@ -216,7 +215,7 @@ impl Env {
             self.token.as_deref(),
             &self.named,
             self.redact,
-            self.seed,
+            self.signer.clone(),
             "control",
             index_file,
             log_file,
@@ -1423,7 +1422,7 @@ async fn signed_certificates_verify_and_tampering_is_caught() {
     assert!(report["first_broken"].is_i64());
 
     // Rotation: a new key signs new snapshots; both keys stay published and trusted.
-    e.seed = Some([8u8; 32]);
+    e.signer = Some(integrity_core::CertSigner::from_seed(&[8u8; 32]).into());
     e.restart("indexes.redb", "txn.redb").await;
     assert_eq!(e.through_plane("customer", &[(3, None)]).await.0, 200);
     let (_, keys) = e.api("GET", "keys", None).await;
@@ -1451,12 +1450,63 @@ async fn signed_certificates_verify_and_tampering_is_caught() {
     assert_eq!(signatures(&report)[1], "INVALID");
 }
 
+/// RFC 0009: a key held by Vault Transit signs like a key file; while Vault cannot sign, commits
+/// are refused before anything is forwarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vault_held_key_signs_and_an_unavailable_vault_refuses_commits() {
+    let mut e = env(None).await;
+    e.register_demo().await;
+    let (address, vault) = support::serve_vault(vec![[5u8; 32]]).await;
+    let config = integrity_server::config::VaultTransitConfig {
+        address,
+        mount: "transit".into(),
+        key: "oip".into(),
+        key_version: None,
+        token_file: None,
+        namespace: None,
+    };
+    let signer = integrity_server::signing::VaultSigner::connect(
+        &config,
+        support::VAULT_TOKEN.into(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    e.signer = Some(Signer::Vault(Arc::new(signer)));
+    e.restart("indexes.redb", "txn.redb").await;
+
+    let (status, body) = e.through_plane("customer", &[(1, None)]).await;
+    assert_eq!(status, 200, "{body}");
+    let summary = &body["metadata"]["snapshots"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["summary"];
+    let file_key = integrity_core::CertSigner::from_seed(&[5u8; 32]);
+    assert_eq!(summary["integrity.cert-key-id"], file_key.key_id());
+
+    vault.lock().unwrap().mode = VaultMode::Sealed;
+    let before = e._shared.lock().unwrap().history.len();
+    let (status, body) = e.through_plane("customer", &[(2, None)]).await;
+    assert_eq!((status, code(&body).as_str()), (409, "INT-018"), "{body}");
+    assert_eq!(
+        e._shared.lock().unwrap().history.len(),
+        before,
+        "nothing forwarded"
+    );
+
+    vault.lock().unwrap().mode = VaultMode::Sign;
+    assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(signatures(&report), ["VALID", "VALID"], "{report}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn requiring_signatures_flags_snapshots_from_before_signing() {
     let mut e = env(None).await;
     e.register_demo().await;
     let (_, unsigned) = e.through_plane("customer", &[(1, None)]).await;
-    e.seed = Some([5u8; 32]);
+    e.signer = Some(integrity_core::CertSigner::from_seed(&[5u8; 32]).into());
     e.restart("indexes.redb", "txn.redb").await;
     assert_eq!(e.through_plane("customer", &[(2, None)]).await.0, 200);
     let (_, report) = e.api("GET", "verify?table=db.customer", None).await;

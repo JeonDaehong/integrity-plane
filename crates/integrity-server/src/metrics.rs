@@ -59,8 +59,10 @@ pub struct Metrics {
     pub recovered_committed: AtomicU64,
     /// Transactions resolved by recovery as aborted.
     pub recovered_aborted: AtomicU64,
-    /// Commits refused because a domain member's head was not certified.
+    /// Commits refused because a domain member's head was not what the indexes reflect.
     pub bypass_detected: AtomicU64,
+    /// Commits refused because their certificate could not be signed (RFC 0009).
+    pub signer_failures: AtomicU64,
     /// Commits refused because their domain's queue was full (RFC 0007).
     pub limited_queue: AtomicU64,
     /// Commits refused because their client exceeded its rate (RFC 0007).
@@ -162,6 +164,12 @@ impl Metrics {
         );
         counter(
             &mut out,
+            "integrity_signer_failures_total",
+            "Commits refused because their certificate could not be signed (RFC 0009).",
+            &[("", get(&self.signer_failures))],
+        );
+        counter(
+            &mut out,
             "integrity_rate_limited_total",
             "Requests refused with 429 before anything was forwarded, by limit (RFC 0007).",
             &[
@@ -218,6 +226,7 @@ mod tests {
         assert!(text.contains("integrity_validation_seconds_bucket{le=\"10\"} 2\n"));
         assert!(text.contains("integrity_validation_seconds_bucket{le=\"+Inf\"} 3\n"));
         assert!(text.contains("integrity_bypass_detected_total 0\n"));
+        assert!(text.contains("integrity_signer_failures_total 0\n"));
         assert!(text.contains("integrity_domain_state{state=\"degraded\"} 1\n"));
         assert!(text.contains("integrity_rate_limited_total{reason=\"queue\"} 0\n"));
         for line in text.lines().filter(|l| !l.starts_with('#')) {

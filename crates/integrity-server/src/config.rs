@@ -38,15 +38,128 @@ pub struct Config {
     pub constraints: Vec<ConstraintConfig>,
 }
 
-/// `[signing]` (RFC 0005).
+/// `[signing]` (RFC 0005, backends RFC 0009).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SigningConfig {
-    /// File holding the 32-byte Ed25519 seed; generated (owner-only) if it does not exist.
-    pub key_file: PathBuf,
+    /// Where the key is held.
+    #[serde(default)]
+    pub backend: SigningBackend,
+    /// `backend = "file"`: file holding the 32-byte Ed25519 seed; generated (owner-only) if it
+    /// does not exist.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
     /// `verify` treats unsigned snapshots and unknown keys as a broken chain.
     #[serde(default)]
     pub require: bool,
+    /// `backend = "vault-transit"`.
+    #[serde(default)]
+    pub vault: Option<VaultTransitConfig>,
+    /// `backend = "pkcs11"`.
+    #[serde(default)]
+    pub pkcs11: Option<Pkcs11Config>,
+}
+
+/// Where the signing key is held (RFC 0009).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SigningBackend {
+    /// A seed file in the control store (RFC 0005).
+    #[default]
+    File,
+    /// A HashiCorp Vault Transit key.
+    VaultTransit,
+    /// A PKCS#11 token (an HSM).
+    Pkcs11,
+}
+
+/// `[signing.vault]` (RFC 0009).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultTransitConfig {
+    /// Vault's address, e.g. `https://vault.example:8200`.
+    pub address: String,
+    /// The Transit engine's mount path.
+    #[serde(default = "default_transit_mount")]
+    pub mount: String,
+    /// The name of an `ed25519` Transit key.
+    pub key: String,
+    /// The key version to sign with; default: the latest version at start.
+    #[serde(default)]
+    pub key_version: Option<u64>,
+    /// File holding the Vault token; default: the `VAULT_TOKEN` environment variable.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Vault Enterprise namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+fn default_transit_mount() -> String {
+    "transit".into()
+}
+
+/// `[signing.pkcs11]` (RFC 0009).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pkcs11Config {
+    /// The token's PKCS#11 library.
+    pub module: PathBuf,
+    /// The label of the token holding the key.
+    pub token_label: String,
+    /// `CKA_LABEL` of the Ed25519 private key and of its public key.
+    pub key_label: String,
+    /// File holding the user PIN; default: the `INTEGRITY_PKCS11_PIN` environment variable.
+    #[serde(default)]
+    pub pin_file: Option<PathBuf>,
+}
+
+/// The settings of the configured signing backend.
+#[derive(Debug, Clone, Copy)]
+pub enum SignerSettings<'a> {
+    /// `backend = "file"`.
+    File(&'a std::path::Path),
+    /// `backend = "vault-transit"`.
+    VaultTransit(&'a VaultTransitConfig),
+    /// `backend = "pkcs11"`.
+    Pkcs11(&'a Pkcs11Config),
+}
+
+impl SigningConfig {
+    /// The chosen backend's settings; settings of another backend are an error (RFC 0009).
+    pub fn settings(&self) -> Result<SignerSettings<'_>, ConfigError> {
+        let stray = |what: &str| {
+            Err(ConfigError(format!(
+                "signing.{what} is set but signing.backend is {:?}",
+                self.backend
+            )))
+        };
+        match self.backend {
+            SigningBackend::File => {}
+            _ if self.key_file.is_some() => return stray("key_file"),
+            _ => {}
+        }
+        if self.vault.is_some() && self.backend != SigningBackend::VaultTransit {
+            return stray("vault");
+        }
+        if self.pkcs11.is_some() && self.backend != SigningBackend::Pkcs11 {
+            return stray("pkcs11");
+        }
+        let missing = |what: &str| ConfigError(format!("signing.{what} is required"));
+        Ok(match self.backend {
+            SigningBackend::File => SignerSettings::File(
+                self.key_file
+                    .as_deref()
+                    .ok_or_else(|| missing("key_file"))?,
+            ),
+            SigningBackend::VaultTransit => {
+                SignerSettings::VaultTransit(self.vault.as_ref().ok_or_else(|| missing("vault"))?)
+            }
+            SigningBackend::Pkcs11 => {
+                SignerSettings::Pkcs11(self.pkcs11.as_ref().ok_or_else(|| missing("pkcs11"))?)
+            }
+        })
+    }
 }
 
 /// `[errors]` (spec §24, §26).
@@ -589,6 +702,71 @@ max_inline_validation_bytes = "2GiB"
             if let Err(e) = Config::from_toml(text) {
                 panic!("{name}: {e}");
             }
+        }
+    }
+
+    #[test]
+    fn signing_backends_take_only_their_own_settings() {
+        let base = "[server]\nbind = \"0.0.0.0:8181\"\n[upstream]\ncatalog_uri = \"http://c\"\n\
+                    [control_store]\npath = \"/tmp/x\"\n";
+        let settings = |signing: &str| -> Result<String, String> {
+            let c = Config::from_toml(&format!("{base}{signing}")).map_err(|e| e.to_string())?;
+            let s = c.signing.unwrap();
+            match s.settings().map_err(|e| e.0)? {
+                SignerSettings::File(p) => Ok(format!("file {}", p.display())),
+                SignerSettings::VaultTransit(v) => Ok(format!(
+                    "vault {} {} {} {:?}",
+                    v.address, v.mount, v.key, v.key_version
+                )),
+                SignerSettings::Pkcs11(p) => {
+                    Ok(format!("pkcs11 {} {}", p.token_label, p.key_label))
+                }
+            }
+        };
+        // RFC 0005's form keeps its meaning.
+        assert_eq!(
+            settings("[signing]\nkey_file = \"k\"\nrequire = true\n").unwrap(),
+            "file k"
+        );
+        assert_eq!(
+            settings(
+                "[signing]\nbackend = \"vault-transit\"\n[signing.vault]\naddress = \"https://v\"\nkey = \"oip\"\n"
+            )
+            .unwrap(),
+            "vault https://v transit oip None"
+        );
+        assert_eq!(
+            settings(
+                "[signing]\nbackend = \"pkcs11\"\n[signing.pkcs11]\nmodule = \"/m.so\"\ntoken_label = \"t\"\nkey_label = \"k\"\n"
+            )
+            .unwrap(),
+            "pkcs11 t k"
+        );
+        for (bad, expect) in [
+            (
+                "[signing]\nrequire = true\n",
+                "signing.key_file is required",
+            ),
+            (
+                "[signing]\nbackend = \"vault-transit\"\nkey_file = \"k\"\n",
+                "signing.key_file is set",
+            ),
+            (
+                "[signing]\nkey_file = \"k\"\n[signing.vault]\naddress = \"a\"\nkey = \"k\"\n",
+                "signing.vault is set",
+            ),
+            (
+                "[signing]\nbackend = \"pkcs11\"\n",
+                "signing.pkcs11 is required",
+            ),
+            ("[signing]\nbackend = \"kms\"\n", "unknown variant"),
+            (
+                "[signing]\nbackend = \"vault-transit\"\n[signing.vault]\naddress = \"a\"\nkey = \"k\"\ntoken = \"t\"\n",
+                "unknown field",
+            ),
+        ] {
+            let e = settings(bad).unwrap_err();
+            assert!(e.contains(expect), "{bad}: {e}");
         }
     }
 

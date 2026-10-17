@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Signing keys outside the Plane (RFC 0009): `[signing] backend = "vault-transit"` signs with a
+  HashiCorp Vault Transit `ed25519` key (pinned to one key version per run), `backend = "pkcs11"`
+  with an Ed25519 key in a PKCS#11 token. Signatures and verification are unchanged (RFC 0005).
+  A commit whose certificate cannot be signed is refused before forwarding with the new code
+  INT-018 `SIGNER_UNAVAILABLE` (409); `integrity_signer_failures_total` counts them. New
+  dependency: `cryptoki` (Apache-2.0). On Unix, a newly created key file's directory is flushed
+  too.
+
 - Index heads (RFC 0008): the index store records the `main` snapshot each table's indexes
   reflect, atomically with every index change, and a commit is refused with `BYPASS_DETECTED` when
   `main` of any table of its domain is not that snapshot. A certified snapshot no longer passes

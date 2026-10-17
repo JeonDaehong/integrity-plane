@@ -62,7 +62,7 @@ writers are verified in Phase 7.
 |---|---|---|---|---|---|
 | Constraint violated, unsupported, budget | INT-001, 003–008, 012, 014 | 400 | `BadRequestException`, fails fast | `BadRequestError` | error, fails fast |
 | Stale base | INT-009 | 409 | `CommitFailedException`, bounded retry | `CommitFailedException` | retried |
-| Transient Plane state | INT-011, INT-016 | 409 | as above | as above | as above |
+| Transient Plane state | INT-011, INT-016, INT-018 | 409 | as above | as above | as above |
 | Operator action needed | INT-010, INT-015 | 423 | `RESTException`, fails fast | `RESTError` | error |
 | Request limit reached | INT-017 | 429 + `Retry-After` | retried with backoff, then `RESTException` | `RESTError` | not verified |
 | Upstream response after forwarding | — | unchanged | — | — | — |

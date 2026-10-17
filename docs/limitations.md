@@ -48,10 +48,13 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Certificates and verification
 
-- Certificates are signed only with `[signing]` configured; the key is a file in the control
-  store. Next step: signer backends that keep the key in an HSM or KMS (PKCS#11 and Vault Transit
-  first, both with Ed25519; then cloud KMS). AWS KMS and Azure Key Vault may need a second signature
-  algorithm (ECDSA P-256), which is a certificate format change (new RFC).
+- Certificates are signed only with `[signing]` configured. The key is a file in the control
+  store, a Vault Transit key or a key in a PKCS#11 token (RFC 0009); PKCS#11 is tested with SoftHSM2
+  only, not with hardware HSMs. Cloud KMS is not supported: AWS KMS and Azure Key Vault would need a
+  second signature algorithm (ECDSA P-256), a certificate format change (new RFC); Google Cloud KMS
+  (Ed25519) is not implemented yet.
+- The signing backend is called once per certificate, on the commit path; its latency adds to
+  every commit, and while it cannot sign, commits are refused (INT-018).
 - A snapshot written around the Plane is refused at the next commit only while it is `main`
   (RFC 0008); bypassed snapshots that are no longer `main` are found by `verify`.
 - `verify` cannot recompute snapshots with equality deletes (reported `UNVERIFIABLE`) or chains whose

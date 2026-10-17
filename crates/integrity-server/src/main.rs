@@ -78,10 +78,12 @@ async fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_upstream_auth(config.upstream.auth.clone());
     let gateway = match &config.signing {
-        Some(s) => gateway.with_signer(
-            Some(integrity_server::signing::load_or_create(&s.key_file)?),
-            s.require,
-        ),
+        Some(s) => {
+            let timeout = Duration::from_secs(config.upstream.timeout_secs);
+            let signer = integrity_server::signing::Signer::from_config(s, timeout).await?;
+            tracing::info!("signing certificates with key {}", signer.key_id());
+            gateway.with_signer(Some(signer), s.require)
+        }
         None => gateway,
     };
     if let Err(e) = gateway.recover_on_start().await {

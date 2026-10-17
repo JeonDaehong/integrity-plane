@@ -40,11 +40,13 @@ pub enum ErrorCode {
     StorageReadFailed,
     /// `INT-017`: a request limit was reached; nothing was forwarded (RFC 0007).
     RateLimited,
+    /// `INT-018`: the commit's certificate could not be signed; nothing was forwarded (RFC 0009).
+    SignerUnavailable,
 }
 
 impl ErrorCode {
     /// Every code, in numeric order.
-    pub const ALL: [ErrorCode; 17] = [
+    pub const ALL: [ErrorCode; 18] = [
         ErrorCode::InvalidConstraint,
         ErrorCode::ConstraintNotFound,
         ErrorCode::DuplicatePrimaryKey,
@@ -62,6 +64,7 @@ impl ErrorCode {
         ErrorCode::BypassDetected,
         ErrorCode::StorageReadFailed,
         ErrorCode::RateLimited,
+        ErrorCode::SignerUnavailable,
     ];
 
     /// The numeric part of the code, e.g. `5` for `INT-005`.
@@ -84,6 +87,7 @@ impl ErrorCode {
             ErrorCode::BypassDetected => 15,
             ErrorCode::StorageReadFailed => 16,
             ErrorCode::RateLimited => 17,
+            ErrorCode::SignerUnavailable => 18,
         }
     }
 
@@ -107,6 +111,7 @@ impl ErrorCode {
             ErrorCode::BypassDetected => "INT-015",
             ErrorCode::StorageReadFailed => "INT-016",
             ErrorCode::RateLimited => "INT-017",
+            ErrorCode::SignerUnavailable => "INT-018",
         }
     }
 
@@ -130,6 +135,7 @@ impl ErrorCode {
             ErrorCode::BypassDetected => "BYPASS_DETECTED",
             ErrorCode::StorageReadFailed => "STORAGE_READ_FAILED",
             ErrorCode::RateLimited => "RATE_LIMITED",
+            ErrorCode::SignerUnavailable => "SIGNER_UNAVAILABLE",
         }
     }
 
@@ -173,9 +179,10 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The spec §24 table (plus INT-016 from RFC 0003 and INT-017 from RFC 0007), verbatim. Changing an existing row means
+    /// The spec §24 table (plus INT-016 from RFC 0003, INT-017 from RFC 0007 and INT-018 from
+    /// RFC 0009), verbatim. Changing an existing row means
     /// breaking a public contract; new codes are appended.
-    const SPEC_TABLE: [(&str, &str); 17] = [
+    const SPEC_TABLE: [(&str, &str); 18] = [
         ("INT-001", "INVALID_CONSTRAINT"),
         ("INT-002", "CONSTRAINT_NOT_FOUND"),
         ("INT-003", "DUPLICATE_PRIMARY_KEY"),
@@ -193,6 +200,7 @@ mod tests {
         ("INT-015", "BYPASS_DETECTED"),
         ("INT-016", "STORAGE_READ_FAILED"),
         ("INT-017", "RATE_LIMITED"),
+        ("INT-018", "SIGNER_UNAVAILABLE"),
     ];
 
     #[test]
@@ -218,7 +226,7 @@ mod tests {
             assert_eq!(ErrorCode::from_code(c.code()), Ok(c));
             assert_eq!(ErrorCode::from_name(c.name()), Ok(c));
         }
-        assert_eq!(ErrorCode::from_code("INT-018"), Err(UnknownErrorCode));
+        assert_eq!(ErrorCode::from_code("INT-019"), Err(UnknownErrorCode));
         assert_eq!(ErrorCode::from_code("int-001"), Err(UnknownErrorCode));
         assert_eq!(ErrorCode::from_name("FOREIGN_KEY"), Err(UnknownErrorCode));
     }

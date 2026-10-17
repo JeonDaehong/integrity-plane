@@ -47,6 +47,33 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --locked -p integrity-bench -- --parent-rows 20000 --appends 2 --append-rows 1000 --writers 2 --hot-commits 2
 
+  # Signing keys outside the Plane (RFC 0009): a real Vault dev server and SoftHSM2.
+  signers:
+    runs-on: ubuntu-latest
+    services:
+      vault:
+        image: hashicorp/vault:1.18
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: oip-ci-root
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        ports:
+          - 8200:8200
+    env:
+      INTEGRITY_TEST_VAULT_ADDR: http://127.0.0.1:8200
+      INTEGRITY_TEST_VAULT_TOKEN: oip-ci-root
+      INTEGRITY_TEST_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: SoftHSM2 with a private token directory
+        run: |
+          sudo apt-get update && sudo apt-get install -y softhsm2
+          mkdir -p "$RUNNER_TEMP/softhsm/tokens"
+          printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$RUNNER_TEMP/softhsm/tokens" > "$RUNNER_TEMP/softhsm/softhsm2.conf"
+          echo "SOFTHSM2_CONF=$RUNNER_TEMP/softhsm/softhsm2.conf" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p integrity-server --test signers -- --nocapture
+
   msrv:
     runs-on: ubuntu-latest
     steps:

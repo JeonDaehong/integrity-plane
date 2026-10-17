@@ -56,6 +56,26 @@ retention = "24h"
 # [signing]
 # key_file = "/var/lib/integrity/signing.key"
 # require = false                 # true: verify treats unsigned snapshots as a broken chain
+#
+# Or keep the key outside the Plane (RFC 0009); commits are refused (INT-018, 409) while it cannot
+# sign. A HashiCorp Vault Transit key of type ed25519:
+# [signing]
+# backend = "vault-transit"
+# [signing.vault]
+# address = "https://vault.example:8200"
+# mount = "transit"
+# key = "integrity-plane"
+# key_version = 1                 # default: the latest version at start
+# token_file = "/run/secrets/vault-token"   # default: the VAULT_TOKEN environment variable
+#
+# An Ed25519 key pair in a PKCS#11 token (an HSM):
+# [signing]
+# backend = "pkcs11"
+# [signing.pkcs11]
+# module = "/usr/lib/softhsm/libsofthsm2.so"
+# token_label = "integrity"
+# key_label = "cert-signing"      # CKA_LABEL of the private and the public key
+# pin_file = "/run/secrets/hsm-pin"         # default: the INTEGRITY_PKCS11_PIN environment variable
 
 [errors]
 # Keep key values out of violation reports and the audit log (keys can be personal data).

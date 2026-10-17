@@ -120,9 +120,12 @@ it forwarded. A compromised catalog can publish arbitrary snapshots; without cer
 public, so an attacker who controls the catalog can also compute certificates that `verify`
 accepts, including for data the Plane never validated. With `[signing]` enabled (RFC 0005) every
 certificate is also signed with an Ed25519 key only the Plane holds: verifiers that pin the Plane's
-public key (`integrity verify --trusted-key … --require-signatures`) reject such forgeries. Protect
-the key file like the rest of the control store; without signing, a certificate proves consistency
-of the chain, not who produced it.
+public key (`integrity verify --trusted-key … --require-signatures`) reject such forgeries. A key
+file must be protected like the rest of the control store: anyone who reads it (a backup, a disk
+snapshot) can sign. With Vault Transit or a PKCS#11 token (RFC 0009) the private key never reaches
+the Plane; whoever can use the key through Vault's policy or the token's PIN can still sign, so
+those credentials need the same care, and the backend's own audit log shows every signature.
+Without signing, a certificate proves consistency of the chain, not who produced it.
 
 ## Key values and PII
 

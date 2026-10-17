@@ -33,6 +33,10 @@ getrandom.workspace = true
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# Signing keys in PKCS#11 tokens (RFC 0009). Apache-2.0; loads the token's library at run time.
+cryptoki = "0.12"
+# Vault Transit requests and answers (RFC 0009). MIT OR Apache-2.0; already in the tree.
+base64 = "0.23"
 
 [lints]
 workspace = true

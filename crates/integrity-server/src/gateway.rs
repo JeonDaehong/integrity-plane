@@ -332,7 +332,7 @@ pub struct Gateway {
     /// Bytes of keys a scan (per table) or a commit validation keeps in memory.
     pub(crate) scan_memory: usize,
     /// Certificate signer (RFC 0005), if signing is enabled.
-    pub(crate) signer: Option<integrity_core::CertSigner>,
+    pub(crate) signer: Option<crate::signing::Signer>,
     /// `verify` requires signatures.
     pub(crate) require_signatures: bool,
     /// Held shared by every commit request, exclusively by constraint changes and rebuilds
@@ -601,13 +601,9 @@ impl Gateway {
         ))
     }
 
-    /// Signs certificates with `signer` (RFC 0005) and records its public key in the registry;
-    /// `require` makes `verify` treat unsigned snapshots as a broken chain.
-    pub fn with_signer(
-        mut self,
-        signer: Option<integrity_core::CertSigner>,
-        require: bool,
-    ) -> Self {
+    /// Signs certificates with `signer` (RFC 0005, RFC 0009) and records its public key in the
+    /// registry; `require` makes `verify` treat unsigned snapshots as a broken chain.
+    pub fn with_signer(mut self, signer: Option<crate::signing::Signer>, require: bool) -> Self {
         if let Some(s) = &signer {
             let id = s.key_id().to_owned();
             let public = integrity_core::signature::public_key_hex(&s.public_key());
@@ -1522,11 +1518,22 @@ impl Gateway {
                 )
             })?;
             if let Some(signer) = &self.signer {
+                // Never forwarded unsigned while signing is configured (RFC 0009).
+                let signature = signer.sign(&cert).await.map_err(|e| {
+                    self.metrics.signer_failures.fetch_add(1, Ordering::Relaxed);
+                    abort(
+                        ApiError::new(
+                            ErrorCode::SignerUnavailable,
+                            format!("the certificate could not be signed: {e}"),
+                        ),
+                        TxnState::Aborted,
+                    )
+                })?;
                 integrity_iceberg::inject_signature(
                     &mut request,
                     &plan.step,
                     signer.key_id(),
-                    &signer.sign(&cert),
+                    &signature,
                 )
                 .map_err(|e| {
                     abort(

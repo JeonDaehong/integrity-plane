@@ -147,7 +147,10 @@ with `INTEGRITY__SECTION__KEY` environment overrides.
 
 With `[signing]`, every certificate is also signed (Ed25519, RFC 0005; summary fields
 `integrity.cert-signature` and `integrity.cert-key-id`), public keys are published at
-`GET /v1/integrity/keys`, and `verify` reports a signature status per snapshot.
+`GET /v1/integrity/keys`, and `verify` reports a signature status per snapshot. The key is a file,
+a Vault Transit key or a PKCS#11 token (`signing.rs`, RFC 0009); a backend's signature is checked
+against its public key before it is used, and a commit that cannot be signed is refused before it
+is forwarded (INT-018).
 
 Also served: `GET /v1/integrity/transactions/{id}` (the log's records, decision and structured error),
 `GET /v1/integrity/domains/{table}` (`Healthy`, `Degraded` with reasons, or `RecoveryRequired`),

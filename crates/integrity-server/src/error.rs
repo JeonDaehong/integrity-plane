@@ -54,7 +54,8 @@ impl ApiError {
         match self.code {
             ErrorCode::StaleBaseSnapshot
             | ErrorCode::RecoveryRequired
-            | ErrorCode::StorageReadFailed => StatusCode::CONFLICT,
+            | ErrorCode::StorageReadFailed
+            | ErrorCode::SignerUnavailable => StatusCode::CONFLICT,
             ErrorCode::IndexDegraded | ErrorCode::BypassDetected => StatusCode::LOCKED,
             ErrorCode::ConstraintNotFound => StatusCode::NOT_FOUND,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -123,6 +124,7 @@ mod tests {
             ErrorCode::StaleBaseSnapshot,
             ErrorCode::RecoveryRequired,
             ErrorCode::StorageReadFailed,
+            ErrorCode::SignerUnavailable,
         ] {
             assert_eq!(s(code), 409, "{code}");
         }

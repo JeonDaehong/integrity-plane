@@ -103,6 +103,113 @@ pub fn empty_table(uuid: &str) -> Value {
     })
 }
 
+// ---------- fake Vault Transit (RFC 0009) ----------
+
+/// The token the fake Vault accepts.
+pub const VAULT_TOKEN: &str = "s.fake-vault-token";
+
+/// How the fake Vault answers sign requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultMode {
+    Sign,
+    /// 503, as a sealed Vault does.
+    Sealed,
+    /// A well-formed signature of another certificate.
+    Lie,
+}
+
+/// A Transit engine at `transit/` with one key named `oip`, of `key_type`, whose versions are
+/// Ed25519 seeds (version 1 first).
+pub struct FakeVault {
+    pub key_type: &'static str,
+    pub versions: Vec<[u8; 32]>,
+    pub mode: VaultMode,
+    /// The `key_version` of every sign request.
+    pub signed_with: Vec<u64>,
+}
+
+pub type SharedVault = Arc<Mutex<FakeVault>>;
+
+pub async fn vault(State(s): State<SharedVault>, req: Request) -> Response {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    let token = req.headers().get("x-vault-token").cloned();
+    let path = req.uri().path().to_owned();
+    let method = req.method().clone();
+    let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    if token.as_ref().and_then(|t| t.to_str().ok()) != Some(VAULT_TOKEN) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"errors": ["permission denied"]})),
+        )
+            .into_response();
+    }
+    let mut v = s.lock().unwrap();
+    let versions = v.versions.clone();
+    let signer = move |version: u64| {
+        integrity_core::CertSigner::from_seed(&versions[usize::try_from(version - 1).unwrap()])
+    };
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/v1/transit/keys/oip") => {
+            let keys: serde_json::Map<String, Value> = (1..=v.versions.len() as u64)
+                .map(|n| {
+                    let public = STANDARD.encode(signer(n).public_key());
+                    (
+                        n.to_string(),
+                        json!({"public_key": public, "name": "ed25519"}),
+                    )
+                })
+                .collect();
+            axum::Json(json!({"data": {
+                "type": v.key_type, "latest_version": v.versions.len(), "keys": keys
+            }}))
+            .into_response()
+        }
+        ("POST", "/v1/transit/sign/oip") => {
+            if v.mode == VaultMode::Sealed {
+                return (StatusCode::SERVICE_UNAVAILABLE, "sealed").into_response();
+            }
+            let req: Value = serde_json::from_slice(&body).unwrap();
+            let version = req["key_version"].as_u64().unwrap();
+            v.signed_with.push(version);
+            let input = STANDARD.decode(req["input"].as_str().unwrap()).unwrap();
+            let (tag, cert) = input.split_at(input.len() - 32);
+            assert_eq!(tag, b"oip-cert-sig-v1");
+            let mut cert = integrity_core::Digest(cert.try_into().unwrap());
+            if v.mode == VaultMode::Lie {
+                cert.0[0] ^= 1;
+            }
+            let hex = signer(version).sign(&cert);
+            let bytes: Vec<u8> = (0..64)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                .collect();
+            let signature = format!("vault:v{version}:{}", STANDARD.encode(bytes));
+            axum::Json(json!({"data": {"signature": signature, "key_version": version}}))
+                .into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Serves a fake Vault; returns its address and state.
+pub async fn serve_vault(versions: Vec<[u8; 32]>) -> (String, SharedVault) {
+    let state: SharedVault = Arc::new(Mutex::new(FakeVault {
+        key_type: "ed25519",
+        versions,
+        mode: VaultMode::Sign,
+        signed_with: Vec::new(),
+    }));
+    let app = axum::Router::new()
+        .fallback(vault)
+        .with_state(Arc::clone(&state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
 // ---------- files and the clients' view of them ----------
 
 pub struct Dir(pub PathBuf);

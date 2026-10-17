@@ -15,3 +15,4 @@ File name: `NNNN-short-title.md`. Use [`template.md`](template.md).
 | [0006](0006-chunked-deltas-and-log-retention.md) | Chunked staged deltas and txn log retention | Accepted |
 | [0007](0007-request-limits.md) | Request limits (adds INT-017) | Accepted |
 | [0008](0008-index-heads.md) | Index heads: `main` must be what the indexes reflect | Accepted |
+| [0009](0009-external-signers.md) | Signing keys in Vault Transit or PKCS#11 (adds INT-018) | Accepted |
