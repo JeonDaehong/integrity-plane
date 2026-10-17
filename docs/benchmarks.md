@@ -325,6 +325,19 @@ a 1 M-row one (ADR 0025). In a run with 3 200 committed single-row commits to on
 transaction log reached 4 GiB: terminal records keep the catalog's response, which carries the
 table's whole metadata, for `[txn_log] retention`.
 
+### Compressed terminal records (RFC 0010)
+
+Same instance type, the same run (`--parent-rows 1000000 --appends 3 --append-rows 1000000
+--writers 16 --hot-commits 200`: 3 200 commits to one table), before (54d82a0) and after (89bd1c5)
+compressing terminal records with zstd, one after the other on one instance.
+
+| | Before | After |
+|---|---|---|
+| Transaction log after the run | 4 096 MiB | 523 MiB |
+| One writer, sequential single-row FK appends | 308 commits/s (p50 3.2 ms) | 307 commits/s (p50 3.2 ms) |
+| 16 writers on one table, end to end p50 / p99 | 136.0 ms / 229.0 ms | 136.7 ms / 221.1 ms |
+| Child append of 1 M rows, validation p50 | 1.88 s | 1.93 s |
+
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 
 | Scenario | Time | Data | Notes |
