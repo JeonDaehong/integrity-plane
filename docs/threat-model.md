@@ -37,6 +37,9 @@ A writer that reaches the upstream catalog directly can commit anything.
   back to the chain start and names the first snapshot that is missing a certificate or whose
   certificate does not match. It catches a writer that copies a valid-looking certificate into its
   own snapshot, which the commit-time check alone does not.
+- **Not detected:** a second Plane with its own control store in front of the same tables, or a
+  control store restored from an older copy; certified snapshots committed elsewhere pass the
+  commit-time check (see [`recovery.md`](recovery.md#single-node-and-power-loss)).
 
 ### Tampering with data files after publication
 

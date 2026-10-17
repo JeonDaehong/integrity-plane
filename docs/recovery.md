@@ -111,4 +111,50 @@ data (no commit runs during a rebuild). Running the rebuild again is safe either
 
 "Delete index ⇒ rebuild ⇒ identical verdicts" (spec §27) is `a_lost_index_store_is_refused_until_rebuilt_with_identical_verdicts`
 in `tests/admin.rs`.
-- Not tested: power loss (a process kill keeps the OS page cache).
+
+## Single node and power loss
+
+The Plane is one process with one control store (`registry.redb`, `txn.redb`, `indexes.redb`, the
+signing key and scratch space). There is no replication and no failover in 0.1 (spec §27); high
+availability is planned for 0.3.
+
+**One process per control store.** Each `.redb` file is locked by the process that opens it; a
+second process on the same control store exits at start (`Database already open. Cannot acquire
+lock.`).
+
+**While the Plane is down** clients configured with the Plane as their catalog can neither
+commit nor load tables through it; nothing is accepted unchecked. Readers may use the upstream
+catalog directly, which only writers must not. To move the Plane to another host,
+stop it, copy the whole control store, and start it there: unfinished transactions are resolved at
+start as above.
+
+**Not detected, therefore not supported:**
+
+- *Two Planes with separate control stores in front of the same tables.* The commit-time bypass
+  check accepts any parent snapshot that carries a certificate; it does not check that the
+  certificate was issued by this Plane's indexes. Each Plane would miss the other's keys and could
+  accept duplicates or dangling references.
+- *Restoring an older copy of the control store* (backup, VM or disk snapshot) while commits went
+  through after the copy was taken. The restored files agree with each other, so the checks in
+  [Lost control-store files](#lost-control-store-files) pass, but the indexes miss the later
+  commits, whose snapshots carry certificates. After restoring, rebuild every domain
+  (`POST /v1/integrity/indexes/{id}/rebuild`) before letting writers back in.
+
+Recording the snapshot each table's indexes were last applied for, and refusing a parent that is
+not it, would turn both into `BYPASS_DETECTED`; it is not implemented yet.
+
+**Power loss.** Only process kills are tested (`tests/crash.rs`); a kill keeps the operating
+system's page cache, so it does not show what reaches the disk. What the Plane relies on:
+
+- Every write to `registry.redb`, `txn.redb` and `indexes.redb` is a redb transaction with
+  two-phase commit and redb's default durability, which flushes it to disk (fsync) before the
+  commit returns. The transaction log's ordering rules above therefore hold across power loss as
+  long as the disk honours flushes. Disks or virtual disks that acknowledge a flush before the data
+  is stable (write caches without power-loss protection, some network filesystems) void this.
+- Sort runs and spilled keys in the scratch directories are never flushed; they are deleted at
+  start and nothing reads them after a restart.
+- A newly generated signing key file is flushed, but its directory is not; if power fails just
+  after the first start with `[signing]`, the key may be gone, a new one is generated, and
+  certificates signed before are no longer verifiable with the published key.
+- On start the index store is fully checksum-verified; a torn or corrupted file is refused as
+  `Corrupt` and its domains must be rebuilt, never trusted (see [Index store](#index-store)).

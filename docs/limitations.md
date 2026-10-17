@@ -59,7 +59,11 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Operations
 
-- Single node. The control store is local files; there is no replication.
+- Single node. The control store is local files; there is no replication or failover, and while
+  the Plane is down writers cannot commit to enforced tables (fail closed). A second process on
+  the same control store refuses to start. A second Plane with its own control store in front of
+  the same tables is not detected and is unsafe, and so is restoring an older copy of the control
+  store without rebuilding ([`recovery.md`](recovery.md#single-node-and-power-loss)).
 - The transaction log keeps finished transactions for `[txn_log] retention` (default 24 h), then
   deletes them; idempotency keys are honoured for that long. The audit log and the per-transaction
   error reports in `registry.redb` are never pruned.
@@ -85,4 +89,5 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   live position delete file (each once, 16 at a time; ADR 0020), so their cost grows with the
   number of manifests and live delete files. On S3 a merge-on-read delete of one row in a 100-file
   table takes about 0.5 s, 0.65 s with 50 accumulated delete files (`docs/benchmarks.md`).
-- Not tested: power loss (only process kills), Linux and Windows only.
+- Not tested: power loss (only process kills; what the Plane relies on is in
+  [`recovery.md`](recovery.md#single-node-and-power-loss)). Linux and Windows only.
