@@ -131,5 +131,8 @@ runs Planes with chaos against a catalog for an hour. Results of 2026-10-17:
 | Apache Polaris 1.7.0 | ✅ | ❌ both committed in 29 of 30 rounds | ✅ | no |
 | Iceberg REST fixture 1.10.1 | ✅ | ❌ both committed in 30 of 30 rounds; acknowledged changes lost | ✅ | no |
 
+Reported upstream: [apache/iceberg#18552](https://github.com/apache/iceberg/issues/18552),
+[apache/polaris#5807](https://github.com/apache/polaris/issues/5807).
+
 With the other catalogs, run one Plane per domain (the default `fence = "none"`). The Plane
 answers 409 when a catalog acknowledges a transaction whose snapshot is not on `main`.
