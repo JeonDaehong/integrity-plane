@@ -3,6 +3,11 @@
 Commit-time PRIMARY KEY / UNIQUE / NOT NULL / FOREIGN KEY enforcement for Apache Iceberg tables,
 independent of the writing engine, with verifiable integrity certificates.
 
+![PyIceberg writing through the Plane: a duplicate key, a dangling reference and a delete of a
+referenced row are refused before they reach the catalog](demo/demo.gif)
+
+<sub>`demo/demo.py` against `deploy/docker-compose.yml`, recorded with `demo/record.sh`.</sub>
+
 > **Status: pre-alpha (0.0.2), not production-ready.** Do not use this for data you care about.
 > Only what is listed below is implemented, and only within the limits stated in the linked docs.
 

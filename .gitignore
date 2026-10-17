@@ -2,3 +2,4 @@
 **/*.rs.bk
 /compat/iceberg-rust/target
 __pycache__/
+demo/demo.cast
