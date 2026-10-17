@@ -70,6 +70,11 @@ What is not supported, or only partly: [`docs/limitations.md`](docs/limitations.
 [`docs/benchmarks.md`](docs/benchmarks.md). Threats and mitigations:
 [`docs/threat-model.md`](docs/threat-model.md).
 
+## Deploying
+
+[`docs/adoption.md`](docs/adoption.md): running the Plane, pointing writers at it, keeping writers
+from going around it, registering constraints and operating it.
+
 ## Design
 
 - Specification: [`integrity_plane_design.md`](integrity_plane_design.md)

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Releases publish a container image to `ghcr.io/jeondaehong/integrity-plane` (linux/amd64,
+  linux/arm64) and binaries for Linux, macOS and Windows. The image now runs as an unprivileged
+  user (uid 10001): a control-store volume created by an earlier image needs
+  `chown -R 10001:10001` once. `integrity-server` and `integrity` answer `--version`.
+- `docs/adoption.md`: a first deployment step by step, including keeping writers from reaching
+  the upstream catalog directly.
 - Terminal records in the transaction log are compressed with zstd (RFC 0010). They keep the
   response given, for an accepted commit the table's whole metadata, for `[txn_log] retention`;
   in a benchmark of 3 200 commits to one table the log shrank from 4 096 MiB to 523 MiB, with
