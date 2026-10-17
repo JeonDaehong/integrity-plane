@@ -297,6 +297,34 @@ Same instance, commit fe42956, files on the instance's disk as in the sections a
 Single-row commits gain most from answering before the index write: each of them paid a durable
 index transaction before its answer.
 
+### Large tables and appends, version E (local NVMe)
+
+Same instance type (m6id.4xlarge, Seoul, files on the instance's NVMe), commit e0600ea: index heads
+(RFC 0008), external signers (RFC 0009, not enabled here), bounded commit decisions (ADR 0025),
+decoding only changed rows (ADR 0023), both sides at once (ADR 0024). Peak resident memory of each
+`integrity-bench` run, including the benchmark generating its own files.
+
+| Scenario | Version C | Version E |
+|---|---|---|
+| Onboarding of 100 M keys | 129 s | 130 s |
+| Onboarding of 200 M keys | 248 s | 253 s |
+| Copy-on-write delete of 1 row, 1 M-row file (100 M-row table) | 0.50 s | 0.38–0.41 s |
+| Compaction of 10 files, 10 M rows | 7.0 s | 4.8 s |
+| Merge-on-read delete of 1 row, 100-file table, first / 50th | 74 ms / 73 ms | 9.4 ms / 9.3 ms |
+| Merge-on-read delete of 1 % of 100 M rows, spread over every file | | 5.1 s |
+| Copy-on-write delete of 1 row, 10 M-row file (200 M-row table) | 5.1–6.4 s | 4.4 s |
+| Compaction of 10 files, **100 M rows** | 70 s | **45 s** |
+| Append of 1 M rows (PK + FK into 1 M parent keys), validation / end to end | 1.5 s / 2.8 s | 1.9 s / 3.9 s |
+| Append of **20 M rows** (PK + FK), validation / end to end | | 22.9 s / 28.9 s (874 000 keys/s) |
+| One writer, sequential single-row FK appends | 306 commits/s (p50 3.3 ms) | 295–309 commits/s (p50 3.2–3.4 ms) |
+| Peak memory | 1.5 GB (100 M run); 4.8 GB in the 200 M run | 1.6 GB (100 M run); 2.4 GB (20 M-row append run); 4.9 GB in the 200 M run, the benchmark generating its 100 M-row file |
+
+The index head check (RFC 0008) adds one read of the index store per table of the domain to every
+commit; single-row commits show no difference. The 20 M-row append stays within the same memory as
+a 1 M-row one (ADR 0025). In a run with 3 200 committed single-row commits to one table, the
+transaction log reached 4 GiB: terminal records keep the catalog's response, which carries the
+table's whole metadata, for `[txn_log] retention`.
+
 ### 1 000 M rows, after (peak memory of the whole run 5.0 GB)
 
 | Scenario | Time | Data | Notes |
