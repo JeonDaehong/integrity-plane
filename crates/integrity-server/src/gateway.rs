@@ -149,6 +149,16 @@ pub enum Route {
     Proxy,
 }
 
+/// True if forwarding `path` could reach another resource than the one it routes as: the upstream
+/// URL is parsed per WHATWG, which resolves `.`/`..` segments (also as `%2e`) and reads `\` as `/`.
+pub fn ambiguous_path(path: &str) -> bool {
+    path.contains('\\')
+        || path.split('/').any(|seg| {
+            let seg = seg.to_ascii_lowercase().replace("%2e", ".");
+            seg == "." || seg == ".."
+        })
+}
+
 /// Classifies a request.
 pub fn route(method: &Method, path: &str) -> Route {
     let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
@@ -787,6 +797,13 @@ impl Gateway {
         peer: Option<IpAddr>,
     ) -> Response {
         let path = path_and_query.split('?').next().unwrap_or("");
+        if ambiguous_path(path) {
+            return ApiError::new(
+                ErrorCode::UnsupportedCommitOperation,
+                "request path with `.` or `..` segments or `\\`",
+            )
+            .into_response();
+        }
         let route = route(&method, path);
         if let Route::Commit(table) = &route
             && let Ok(mut counts) = self.commit_requests.lock()
@@ -2008,6 +2025,29 @@ mod tests {
             "load"
         );
         assert_eq!(route(&post, "/v1/tables/rename"), Route::Proxy);
+    }
+
+    #[test]
+    fn ambiguous_paths() {
+        for p in [
+            "/v1/namespaces/db/tables/orders/../orders",
+            "/v1/namespaces/db/tables/x/%2e%2e/orders",
+            "/v1/namespaces/db/tables/x/.%2E/orders",
+            "/v1/namespaces/db/tables/orders/.",
+            "/v1/./namespaces/db/tables/orders",
+            "/v1/namespaces/db/tables/x\\..\\orders",
+        ] {
+            assert!(ambiguous_path(p), "{p}");
+        }
+        for p in [
+            "/v1/namespaces/db/tables/orders",
+            "/v1/namespaces/db/tables/a.b",
+            "/v1/namespaces/db/tables/...",
+            "/v1/namespaces/db/tables/%2e%2e%2e",
+            "/v1/namespaces/db/tables/orders/",
+        ] {
+            assert!(!ambiguous_path(p), "{p}");
+        }
     }
 
     #[test]
