@@ -281,6 +281,28 @@ impl Harness {
         (status, r.json().await.unwrap_or(Value::Null))
     }
 
+    /// Sends `path` exactly as given: HTTP clients (reqwest included) remove dot segments first.
+    async fn post_raw(&self, path: &str, body: &Value) -> u16 {
+        use std::io::{Read, Write};
+        let addr = self.gateway.trim_start_matches("http://").to_owned();
+        let body = serde_json::to_vec(body).unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        tokio::task::spawn_blocking(move || {
+            let mut s = std::net::TcpStream::connect(&addr).unwrap();
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(&body).unwrap();
+            let mut answer = String::new();
+            s.read_to_string(&mut answer).unwrap();
+            answer.split(' ').nth(1).unwrap().parse().unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
     fn upstream_commits(&self) -> usize {
         self.upstream.lock().unwrap().commits.len()
     }
@@ -459,6 +481,35 @@ async fn violations_are_rejected_without_reaching_upstream() {
     );
 
     // The table is unchanged: the next real commit still applies.
+    let (status, body) = h.post(TABLE_PATH, &request(&commits[1], &commits[2])).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Upstream resolves dot segments (reqwest does); a path that routes as anything but the table it reaches upstream must not be forwarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_segments_cannot_route_around_validation() {
+    let commits = main_commits();
+    let mut extra = MemoryIo::new();
+    let bad = relisting_commit(&commits[1], &mut extra);
+    let h = harness(extra).await;
+    let (status, _) = h.post(TABLE_PATH, &request(&commits[0], &commits[1])).await;
+    assert_eq!(status, 200);
+    let forwarded = h.upstream_commits();
+
+    for path in [
+        format!("{TABLE_PATH}/../orders"),
+        format!("{TABLE_PATH}/%2e%2e/orders"),
+        format!("{TABLE_PATH}/%2E./orders"),
+        format!("{TABLE_PATH}/./"),
+        format!("{TABLE_PATH}\\..\\orders"),
+        "/v1/namespaces/db/tables/x/../orders".to_owned(),
+        "/v1/transactions/commit/x/..".to_owned(),
+    ] {
+        let status = h.post_raw(&path, &bad).await;
+        assert_eq!(status, 400, "{path}");
+        assert_eq!(h.upstream_commits(), forwarded, "{path} reached upstream");
+    }
+
     let (status, body) = h.post(TABLE_PATH, &request(&commits[1], &commits[2])).await;
     assert_eq!(status, 200, "{body}");
 }
