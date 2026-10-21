@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**Security:**
+- Request paths with `.` or `..` segments (also as `%2e`) or a `\` are refused (400,
+  `UNSUPPORTED_COMMIT_OPERATION`). The gateway routed on the raw path but the forwarded URL resolved
+  them, so a commit to a constrained table could reach the catalog without validation (#5).
+
 ## 0.1.0 — 2026-10-17
 
 Third pre-release. **Pre-alpha, not production-ready**: see

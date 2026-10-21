@@ -3,6 +3,12 @@
 Commit-time PRIMARY KEY / UNIQUE / NOT NULL / FOREIGN KEY enforcement for Apache Iceberg tables,
 independent of the writing engine, with verifiable integrity certificates.
 
+A commit never rescans the table. The Plane keeps its own index of each constrained table's keys
+(keys and counts, no row locations) and checks a commit by reading only the key columns of the
+files it adds or removes and probing that index. The index records which snapshot of each table it
+reflects; a durable log and bypass detection keep the two in step
+([RFC 0008](docs/rfc/0008-index-heads.md), [`docs/recovery.md`](docs/recovery.md)).
+
 ![PyIceberg writing through the Plane: a duplicate key, a dangling reference and a delete of a
 referenced row are refused before they reach the catalog](demo/demo.gif)
 
@@ -40,7 +46,7 @@ Each commit to a constrained table is validated before it is forwarded, and the 
 the rows the commit adds, removes or rewrites. Measured with Spark on Amazon S3: a statement
 changing a few rows or a hundred thousand rows takes about a second more, but inserting 1 M rows
 takes 4.6 s instead of 0.7 s, an initial load of 30 M rows 38 s instead of 6 s, and compacting
-33 M rows 77 s instead of 33 s ([`docs/benchmarks.md`](docs/benchmarks.md)). Large batch loads are therefore better done before
+33 M rows 59 s instead of 33 s ([`docs/benchmarks.md`](docs/benchmarks.md)). Large batch loads are therefore better done before
 the constraints are registered (onboarding scans existing data at about 700 000 keys/s) or into
 tables that do not need them.
 
