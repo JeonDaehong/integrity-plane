@@ -1,0 +1,25 @@
+# Weekly dependency updates. Security advisories (cargo deny in CI) are raised as soon as they
+# appear; these keep the lockfiles, pinned actions and base images from drifting meanwhile.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories: ["/", "/fuzz"]
+    schedule:
+      interval: weekly
+    groups:
+      cargo-patch-and-minor:
+        update-types: [patch, minor]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
