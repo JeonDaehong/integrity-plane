@@ -120,9 +120,24 @@ pub struct PositionDeletes {
     pub changed: BTreeSet<String>,
     /// Data files live in both snapshots, by path.
     pub kept: BTreeMap<String, DataFile>,
+    /// Paths of the data files the commit adds: only position delete files the commit adds may
+    /// name them (ADR 0028).
+    pub added: BTreeSet<String>,
+    /// Either snapshot has equality delete files: then the commit may change the deleted
+    /// positions of added data files only (ADR 0028).
+    pub equality: bool,
 }
 
-type Live = BTreeMap<String, (DataFile, Option<i64>)>;
+/// A live content file with its explicit sequence number (`None`: inherited) and its data
+/// sequence number (explicit, or the manifest's).
+#[derive(Debug, Clone)]
+struct LiveFile {
+    file: DataFile,
+    explicit: Option<i64>,
+    sequence: Option<i64>,
+}
+
+type Live = BTreeMap<String, LiveFile>;
 
 fn manifests(io: &impl FileIo, list: Option<&str>) -> Result<Vec<ManifestFile>, InspectError> {
     match list {
@@ -142,12 +157,12 @@ fn read_manifests<'a>(
     Ok(paths.into_iter().zip(entries).collect())
 }
 
-/// Live files of `manifests` (whose entries are in `read`), keyed by path, with their explicit
-/// sequence numbers; a path live twice is invalid.
+/// Live files of `manifests` (whose entries are in `read`), keyed by path, with their sequence
+/// numbers; a path live twice is invalid.
 fn live_files(
     read: &HashMap<&str, Vec<ManifestEntry>>,
     manifests: &[&ManifestFile],
-) -> Result<BTreeMap<String, (DataFile, Option<i64>)>, InspectError> {
+) -> Result<Live, InspectError> {
     let mut out = BTreeMap::new();
     for m in manifests {
         let entries = read
@@ -168,10 +183,12 @@ fn live_files(
                 ))));
             }
             let path = entry.file.path.clone();
-            if out
-                .insert(path.clone(), (entry.file.clone(), entry.sequence_number))
-                .is_some()
-            {
+            let live = LiveFile {
+                file: entry.file.clone(),
+                explicit: entry.sequence_number,
+                sequence: entry.sequence_number.or(m.sequence_number),
+            };
+            if out.insert(path.clone(), live).is_some() {
                 return Err(unsupported(format!("file listed twice: {path}")));
             }
         }
@@ -181,9 +198,10 @@ fn live_files(
 
 /// Diffs the new snapshot's manifest list against its parent's (spec §15 data-level rows).
 ///
-/// Delete files (ADR 0008, 0009): added equality deletes are returned (one field set, inherited
-/// sequence number); added position deletes, removed delete files, and data files removed while
-/// delete files exist are unsupported.
+/// Delete files (ADR 0008, 0009, 0017, 0028): added equality deletes are returned (one field set,
+/// inherited sequence number) and position deletes are described for [`commit_rows`]. Removed
+/// equality delete files, data files removed or added with an explicit sequence number while
+/// equality delete files exist, and files whose data sequence number changes are unsupported.
 pub fn diff_snapshots(
     io: &impl FileIo,
     parent_list: Option<&str>,
@@ -230,21 +248,29 @@ pub fn diff_snapshots(
 
     let before = live_files(&read, &dropped)?;
     let after = live_files(&read, &introduced)?;
-    let unchanged =
-        |path: &str, file: &DataFile, other: &Live| other.get(path).is_some_and(|(f, _)| f == file);
+    let unchanged = |path: &str, file: &DataFile, other: &Live| {
+        other.get(path).is_some_and(|l| l.file == *file)
+    };
 
     let mut changes = FileChanges::default();
     let mut position_changed = BTreeSet::new();
-    for (path, (file, sequence_number)) in &after {
+    let mut explicit_data = None;
+    for (path, live) in &after {
+        let file = &live.file;
         if unchanged(path, file, &before) {
             continue;
         }
         match file.content {
-            FileContent::Data => changes.added.push(file.clone()),
+            FileContent::Data => {
+                if live.explicit.is_some() && explicit_data.is_none() {
+                    explicit_data = Some(path.clone());
+                }
+                changes.added.push(file.clone());
+            }
             FileContent::EqualityDeletes => {
                 // A new equality delete must apply to exactly the rows that existed before this
                 // commit, which an inherited sequence number guarantees (ADR 0009).
-                if sequence_number.is_some() {
+                if live.explicit.is_some() {
                     return Err(unsupported(
                         "equality delete file with an explicit sequence number",
                     ));
@@ -256,7 +282,8 @@ pub fn diff_snapshots(
             }
         }
     }
-    for (path, (file, _)) in &before {
+    for (path, live) in &before {
+        let file = &live.file;
         if unchanged(path, file, &after) {
             continue;
         }
@@ -279,22 +306,43 @@ pub fn diff_snapshots(
     } else {
         (Live::new(), Live::new())
     };
+    // Which delete files apply to a file depends on its data sequence number: a file live in both
+    // snapshots must keep it (ADR 0028).
+    if let Some(path) = new_all.iter().find_map(|(path, l)| {
+        parent_all
+            .get(path)
+            .filter(|p| p.file == l.file && p.sequence != l.sequence)
+            .map(|_| path)
+    }) {
+        return Err(unsupported(format!(
+            "{path} changes its data sequence number"
+        )));
+    }
     let of = |live: &Live, content: FileContent| -> Vec<DataFile> {
         live.values()
-            .filter(|(f, _)| f.content == content)
-            .map(|(f, _)| f.clone())
+            .filter(|l| l.file.content == content)
+            .map(|l| l.file.clone())
             .collect()
     };
     let positions_before = of(&parent_all, FileContent::PositionDeletes);
     let positions_after = of(&new_all, FileContent::PositionDeletes);
     let equality_live = !of(&parent_all, FileContent::EqualityDeletes).is_empty()
         || !of(&new_all, FileContent::EqualityDeletes).is_empty();
-    if !positions_before.is_empty() || !positions_after.is_empty() {
-        if equality_live {
+    if equality_live {
+        if !changes.removed.is_empty() {
             return Err(unsupported(
-                "position and equality deletes in the same table",
+                "commit removes data files from a table with equality delete files",
             ));
         }
+        // An older sequence number would expose the file's rows to equality deletes, which the
+        // Plane does not apply to added rows (ADR 0028).
+        if let Some(path) = explicit_data {
+            return Err(unsupported(format!(
+                "data file {path} with an explicit sequence number in a table with equality deletes"
+            )));
+        }
+    }
+    if !positions_before.is_empty() || !positions_after.is_empty() {
         if let Some(f) = positions_before
             .iter()
             .chain(&positions_after)
@@ -307,22 +355,19 @@ pub fn diff_snapshots(
         }
         let kept = new_all
             .iter()
-            .filter(|(path, (f, _))| {
-                f.content == FileContent::Data && unchanged(path, f, &parent_all)
+            .filter(|(path, l)| {
+                l.file.content == FileContent::Data && unchanged(path, &l.file, &parent_all)
             })
-            .map(|(path, (f, _))| (path.clone(), f.clone()))
+            .map(|(path, l)| (path.clone(), l.file.clone()))
             .collect();
         changes.positions = Some(PositionDeletes {
             before: positions_before,
             after: positions_after,
             changed: position_changed,
             kept,
+            added: changes.added.iter().map(|f| f.path.clone()).collect(),
+            equality: equality_live,
         });
-    } else if (equality_live || !changes.equality_deletes.is_empty()) && !changes.removed.is_empty()
-    {
-        return Err(unsupported(
-            "commit removes data files from a table with equality delete files",
-        ));
     }
     let mut field_sets = changes.equality_deletes.iter().map(|f| {
         let mut ids = f.equality_ids.clone().unwrap_or_default();
@@ -796,6 +841,21 @@ fn deleted_positions(
     let read = concurrently(&distinct, |d| position_deletes(io, d))?;
     let by_file: HashMap<&str, BTreeMap<String, BTreeSet<i64>>> =
         distinct.iter().map(|d| d.path.as_str()).zip(read).collect();
+    // A delete file older than the commit does not apply to the data files it adds: their
+    // sequence number is higher (ADR 0028).
+    for d in pd.after.iter().filter(|d| !pd.changed.contains(&d.path)) {
+        if let Some(path) = by_file
+            .get(d.path.as_str())
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .find(|p| pd.added.contains(*p))
+        {
+            return Err(unsupported(format!(
+                "{} names {path}, which this commit adds",
+                d.path
+            )));
+        }
+    }
     let side = |files: &[DataFile]| {
         let mut out = Deleted::new();
         for d in files {
@@ -805,7 +865,20 @@ fn deleted_positions(
         }
         out
     };
-    Ok((side(&pd.before), side(&pd.after)))
+    let (before, after) = (side(&pd.before), side(&pd.after));
+    // With equality deletes, a kept file's rows may already be deleted by one; only the positions
+    // of added data files may change (ADR 0028).
+    if pd.equality
+        && let Some(path) = pd
+            .kept
+            .keys()
+            .find(|p| before.get(p.as_str()) != after.get(p.as_str()))
+    {
+        return Err(unsupported(format!(
+            "position deletes change rows of {path} in a table with equality delete files"
+        )));
+    }
+    Ok((before, after))
 }
 
 /// Deleted positions per data file path.

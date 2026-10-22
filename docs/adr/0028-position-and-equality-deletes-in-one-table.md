@@ -1,6 +1,6 @@
 # 0028. Position and equality deletes in one table (Flink upsert)
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-22
 - Amends: ADR 0009 (equality deletes), ADR 0017 (position deletes)
 
@@ -48,8 +48,15 @@ supported when, in addition to ADR 0009's conditions:
    sequence number is refused: with an older number, equality deletes of this or earlier commits
    would hide some of its rows, which the Plane counts as added.
 
-Rule 2 holds for every table, also without equality deletes: it closes the same mismatch for
-position deletes alone. Rule 3 holds for every commit to a table with live equality delete files,
+4. **Kept files keep their data sequence number.** In a table with delete files, a file live in
+   both snapshots (data or delete file) whose data sequence number differs between them (its
+   explicit number, or the one its manifest list entry gives inherited entries) is refused. A
+   manifest rewrite that raised a data file's number above a position delete's would make Iceberg
+   stop applying that delete, and the hidden row would come back without the Plane seeing a change.
+
+Rules 2 and 4 hold for every table, also without equality deletes: they close the same kind of
+mismatch for position deletes alone. To check rule 4 the manifest list's `sequence_number` is now
+read. Rule 3 holds for every commit to a table with live equality delete files,
 including today's ADR 0009 commits without position deletes. Today such a commit is accepted and
 its hidden rows counted as added: the index then holds keys that are not in the table, so a later
 foreign key can be accepted against a parent row nobody can read. Normal writers never set explicit
@@ -89,6 +96,8 @@ positions on one and on several added files; and the Flink compatibility scenari
   the path of a new data file; no known writer reuses data file paths.
 - Rule 3 refuses commits accepted today that set explicit sequence numbers on new data files in a
   table with equality deletes; no known writer does.
+- Rule 4 refuses manifest rewrites that change a kept file's sequence number; Iceberg's own
+  `rewrite_manifests` keeps them.
 
 ## Alternatives considered
 

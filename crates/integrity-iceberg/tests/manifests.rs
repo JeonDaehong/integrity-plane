@@ -28,6 +28,15 @@ const LIST_SCHEMA: &str = r#"{"type": "record", "name": "manifest_file", "fields
     {"name": "added_snapshot_id", "type": "long"}
 ]}"#;
 
+const LIST_SEQ_SCHEMA: &str = r#"{"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string"},
+    {"name": "manifest_length", "type": "long"},
+    {"name": "partition_spec_id", "type": "int"},
+    {"name": "content", "type": "int"},
+    {"name": "sequence_number", "type": "long"},
+    {"name": "added_snapshot_id", "type": "long"}
+]}"#;
+
 const ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", "fields": [
     {"name": "status", "type": "int"},
     {"name": "snapshot_id", "type": ["null", "long"]},
@@ -246,6 +255,24 @@ impl Table {
             })
             .collect();
         self.io.insert(path, Self::avro(LIST_SCHEMA, records));
+    }
+
+    /// A v2 manifest list: `(manifest, content, sequence number its added entries inherit)`.
+    fn list_seq(&mut self, path: &str, manifests: &[(&str, i32, i64)]) {
+        let records = manifests
+            .iter()
+            .map(|&(m, content, seq)| {
+                vec![
+                    ("manifest_path", Avro::String(m.into())),
+                    ("manifest_length", Avro::Long(1)),
+                    ("partition_spec_id", Avro::Int(0)),
+                    ("content", Avro::Int(content)),
+                    ("sequence_number", Avro::Long(seq)),
+                    ("added_snapshot_id", Avro::Long(1)),
+                ]
+            })
+            .collect();
+        self.io.insert(path, Self::avro(LIST_SEQ_SCHEMA, records));
     }
 
     /// A Parquet data file `(id long #1, region string #2)`.
@@ -591,19 +618,6 @@ fn unprovable_position_deletes_are_unsupported() {
     t.list("dv-list.avro", &[("m1.avro", 0), ("dv.avro", 1)]);
     assert!(unsupported(t.diff(Some("parent.avro"), "dv-list.avro")).contains("deletion vector"));
 
-    // Position and equality deletes in one table.
-    let mut t = parent_with_position_delete();
-    t.id_deletes("eq.parquet", &[3]);
-    t.manifest("d2.avro", &[(1, 2, "eq.parquet", "PARQUET", 1)]);
-    t.list(
-        "mixed.avro",
-        &[("m1.avro", 0), ("d1.avro", 1), ("d2.avro", 1)],
-    );
-    assert!(
-        unsupported(t.diff(Some("parent-pos.avro"), "mixed.avro"))
-            .contains("position and equality deletes")
-    );
-
     // A position beyond the end of the file.
     let mut t = parent();
     t.positions("pos.parquet", &[("b.parquet", 5)]);
@@ -677,6 +691,257 @@ fn unsafe_equality_deletes_are_unsupported() {
     t.manifest("m2.avro", &[(1, 0, "a.parquet", "PARQUET", 2)]);
     t.list("cow.avro", &[("m2.avro", 0), ("d3.avro", 1)]);
     assert!(unsupported(t.diff(Some("parent.avro"), "cow.avro")).contains("delete files"));
+}
+
+// ---------- position and equality deletes in one table (ADR 0028) ----------
+
+fn ids(batch: &integrity_core::RowBatch) -> Vec<Vec<Datum>> {
+    batch.rows().to_vec()
+}
+
+fn id(i: i64) -> Vec<Datum> {
+    vec![Datum::Value(KeyValue::Integer(i))]
+}
+
+/// Flink upserts `(4, eu)` then `(4, us)` in one checkpoint: data file f.parquet with both rows,
+/// an equality delete of key 4 (for older rows) and a position delete of f.parquet row 0 (the row
+/// it wrote a moment ago). List flink-1.avro.
+fn flink_upsert_twice() -> Table {
+    let mut t = parent();
+    t.data("f.parquet", &[(4, "eu"), (4, "us")]);
+    t.id_deletes("eq-f.parquet", &[4]);
+    t.positions("pos-f.parquet", &[("f.parquet", 0)]);
+    t.manifest("m2.avro", &[(1, 0, "f.parquet", "PARQUET", 2)]);
+    t.manifest(
+        "d1.avro",
+        &[
+            (1, 2, "eq-f.parquet", "PARQUET", 1),
+            (1, 1, "pos-f.parquet", "PARQUET", 1),
+        ],
+    );
+    t.list(
+        "flink-1.avro",
+        &[("m1.avro", 0), ("m2.avro", 0), ("d1.avro", 1)],
+    );
+    t
+}
+
+#[test]
+fn a_key_upserted_twice_in_one_commit_adds_its_last_row() {
+    let t = flink_upsert_twice();
+    let changes = t.diff(Some("parent.avro"), "flink-1.avro").unwrap();
+    assert_eq!(paths(&changes.added), ["f.parquet"]);
+    assert_eq!(paths(&changes.equality_deletes), ["eq-f.parquet"]);
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(ids(&rows.added), [row(4, "us")]);
+    assert!(rows.removed.is_empty());
+    assert_eq!(ids(&rows.equality_deletes.unwrap()), [id(4)]);
+}
+
+#[test]
+fn later_upserts_to_a_table_with_both_kinds_of_deletes() {
+    // The next checkpoint upserts the existing key 1 twice.
+    let mut t = flink_upsert_twice();
+    t.data("g.parquet", &[(1, "x"), (1, "y")]);
+    t.id_deletes("eq-g.parquet", &[1]);
+    t.positions("pos-g.parquet", &[("g.parquet", 0)]);
+    t.manifest("m3.avro", &[(1, 0, "g.parquet", "PARQUET", 2)]);
+    t.manifest(
+        "d2.avro",
+        &[
+            (1, 2, "eq-g.parquet", "PARQUET", 1),
+            (1, 1, "pos-g.parquet", "PARQUET", 1),
+        ],
+    );
+    t.list(
+        "flink-2.avro",
+        &[
+            ("m1.avro", 0),
+            ("m2.avro", 0),
+            ("d1.avro", 1),
+            ("m3.avro", 0),
+            ("d2.avro", 1),
+        ],
+    );
+    let changes = t.diff(Some("flink-1.avro"), "flink-2.avro").unwrap();
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(ids(&rows.added), [row(1, "y")]);
+    assert!(rows.removed.is_empty());
+    assert_eq!(ids(&rows.equality_deletes.unwrap()), [id(1)]);
+
+    // A checkpoint with only new keys and no equality deletes reads the same way.
+    t.data("h.parquet", &[(7, "eu")]);
+    t.manifest("m4.avro", &[(1, 0, "h.parquet", "PARQUET", 1)]);
+    t.list(
+        "flink-3.avro",
+        &[
+            ("m1.avro", 0),
+            ("m2.avro", 0),
+            ("d1.avro", 1),
+            ("m4.avro", 0),
+        ],
+    );
+    let changes = t.diff(Some("flink-1.avro"), "flink-3.avro").unwrap();
+    let columns = [
+        (FieldId(1), LogicalType::Long),
+        (FieldId(2), LogicalType::String),
+    ];
+    let mut added = Vec::new();
+    for_each_commit_batch(&t.io, &changes, &columns, |side, batch| {
+        assert_eq!(side, Side::Added);
+        added.extend(batch.rows().to_vec());
+        Ok::<_, InspectError>(())
+    })
+    .unwrap();
+    assert_eq!(added, [row(7, "eu")]);
+}
+
+#[test]
+fn equality_deletes_in_a_table_with_position_deletes() {
+    // The position delete of a.parquet row 1 stays as it is; key 3 is deleted by equality.
+    let mut t = parent_with_position_delete();
+    t.id_deletes("eq.parquet", &[3]);
+    t.manifest("d2.avro", &[(1, 2, "eq.parquet", "PARQUET", 1)]);
+    t.list(
+        "mixed.avro",
+        &[("m1.avro", 0), ("d1.avro", 1), ("d2.avro", 1)],
+    );
+    let rows = t
+        .rows(&t.diff(Some("parent-pos.avro"), "mixed.avro").unwrap())
+        .unwrap();
+    assert!(rows.added.is_empty() && rows.removed.is_empty());
+    assert_eq!(ids(&rows.equality_deletes.unwrap()), [id(3)]);
+}
+
+#[test]
+fn positions_of_existing_rows_cannot_change_next_to_equality_deletes() {
+    // A row of a.parquet may already be deleted by an equality delete: deleting its position
+    // could remove it twice.
+    let mut t = flink_upsert_twice();
+    t.positions("pos-a.parquet", &[("a.parquet", 0)]);
+    t.manifest("d2.avro", &[(1, 1, "pos-a.parquet", "PARQUET", 1)]);
+    t.list(
+        "new.avro",
+        &[
+            ("m1.avro", 0),
+            ("m2.avro", 0),
+            ("d1.avro", 1),
+            ("d2.avro", 1),
+        ],
+    );
+    let changes = t.diff(Some("flink-1.avro"), "new.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("change rows of a.parquet"));
+
+    // Undoing a position delete of f.parquet (an existing file now) is refused the same way.
+    t.manifest("d3.avro", &[(1, 2, "eq-f.parquet", "PARQUET", 1)]);
+    t.list(
+        "undo.avro",
+        &[("m1.avro", 0), ("m2.avro", 0), ("d3.avro", 1)],
+    );
+    let changes = t.diff(Some("flink-1.avro"), "undo.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("change rows of f.parquet"));
+}
+
+#[test]
+fn an_older_delete_file_cannot_name_a_new_data_file() {
+    // pos-n.parquet, live before the commit, names n.parquet, which the commit adds. Iceberg
+    // does not apply it to the new file (lower sequence number); it must not be counted.
+    for with_equality in [false, true] {
+        let mut t = parent();
+        t.positions("pos-n.parquet", &[("n.parquet", 0)]);
+        t.id_deletes("eq.parquet", &[9]);
+        let deletes: &[Entry] = if with_equality {
+            &[
+                (1, 1, "pos-n.parquet", "PARQUET", 1),
+                (1, 2, "eq.parquet", "PARQUET", 1),
+            ]
+        } else {
+            &[(1, 1, "pos-n.parquet", "PARQUET", 1)]
+        };
+        t.manifest("d1.avro", deletes);
+        t.list("before.avro", &[("m1.avro", 0), ("d1.avro", 1)]);
+        t.data("n.parquet", &[(5, "eu")]);
+        t.manifest("m2.avro", &[(1, 0, "n.parquet", "PARQUET", 1)]);
+        t.list(
+            "after.avro",
+            &[("m1.avro", 0), ("d1.avro", 1), ("m2.avro", 0)],
+        );
+        let changes = t.diff(Some("before.avro"), "after.avro").unwrap();
+        assert!(
+            unsupported(t.rows(&changes)).contains("names n.parquet"),
+            "with equality deletes: {with_equality}"
+        );
+    }
+}
+
+#[test]
+fn new_data_files_inherit_their_sequence_number_next_to_equality_deletes() {
+    // An older explicit sequence number would put the new rows under the equality deletes.
+    let mut t = flink_upsert_twice();
+    t.data("old.parquet", &[(8, "eu")]);
+    t.manifest_seq("m3.avro", &[((1, 0, "old.parquet", "PARQUET", 1), Some(1))]);
+    t.list(
+        "new.avro",
+        &[
+            ("m1.avro", 0),
+            ("m2.avro", 0),
+            ("d1.avro", 1),
+            ("m3.avro", 0),
+        ],
+    );
+    assert!(
+        unsupported(t.diff(Some("flink-1.avro"), "new.avro")).contains("explicit sequence number")
+    );
+
+    // Without equality deletes it does not matter (compaction sets one).
+    let mut t = parent();
+    t.manifest_seq("m3.avro", &[((1, 0, "old.parquet", "PARQUET", 1), Some(1))]);
+    t.data("old.parquet", &[(8, "eu")]);
+    t.list("new.avro", &[("m1.avro", 0), ("m3.avro", 0)]);
+    assert_eq!(
+        paths(&t.diff(Some("parent.avro"), "new.avro").unwrap().added),
+        ["old.parquet"]
+    );
+}
+
+#[test]
+fn kept_files_keep_their_data_sequence_number() {
+    // a.parquet and b.parquet inherit 1 from m1; pos1.parquet inherits 2.
+    let mut t = parent_with_position_delete();
+    t.list_seq("v2-parent.avro", &[("m1.avro", 0, 1), ("d1.avro", 1, 2)]);
+    // A manifest rewrite that keeps the numbers is fine.
+    t.manifest_seq(
+        "m9.avro",
+        &[
+            ((0, 0, "a.parquet", "PARQUET", 2), Some(1)),
+            ((0, 0, "b.parquet", "PARQUET", 1), Some(1)),
+        ],
+    );
+    t.list_seq("rewritten.avro", &[("m9.avro", 0, 3), ("d1.avro", 1, 2)]);
+    let changes = t.diff(Some("v2-parent.avro"), "rewritten.avro").unwrap();
+    let rows = t.rows(&changes).unwrap();
+    assert!(rows.added.is_empty() && rows.removed.is_empty());
+
+    // Raising a.parquet's above the position delete's would bring row 1 back unseen.
+    t.manifest_seq(
+        "m10.avro",
+        &[
+            ((0, 0, "a.parquet", "PARQUET", 2), Some(3)),
+            ((0, 0, "b.parquet", "PARQUET", 1), Some(1)),
+        ],
+    );
+    t.list_seq("raised.avro", &[("m10.avro", 0, 3), ("d1.avro", 1, 2)]);
+    assert!(
+        unsupported(t.diff(Some("v2-parent.avro"), "raised.avro"))
+            .contains("a.parquet changes its data sequence number")
+    );
+
+    // So would re-listing the delete manifest with another number.
+    t.list_seq("relisted.avro", &[("m1.avro", 0, 1), ("d1.avro", 1, 0)]);
+    assert!(
+        unsupported(t.diff(Some("v2-parent.avro"), "relisted.avro"))
+            .contains("pos1.parquet changes its data sequence number")
+    );
 }
 
 #[test]

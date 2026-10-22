@@ -17,7 +17,9 @@
 | Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017) | Yes |
 | Compaction of a merge-on-read table (applying, rewriting or dropping position delete files) | Supported if live rows are unchanged | Yes (ADR 0017) |
 | Deletion vectors (v3, Puffin) | Supported, as position deletes (ADR 0018) | Yes |
-| Position and equality deletes in one table | Rejected | Rejected |
+| Position and equality deletes in one table (Flink upsert repeating a key in one checkpoint) | Supported when the commit changes the deleted positions of its own new data files only | Yes (ADR 0028) |
+| Position deletes changing rows of existing data files in a table with equality deletes; added data files with explicit sequence numbers there | Rejected | Rejected (ADR 0028) |
+| A position delete file from an earlier snapshot naming a data file the commit adds; a file whose data sequence number changes | Rejected | Rejected (ADR 0028) |
 | Removing equality delete files; removing data files while equality delete files exist | Rejected | Rejected (ADR 0008) |
 | Schema change touching a constrained field | Rejected unless `int→long`, decimal precision widening (and `float→double` for NOT NULL columns) | Phase 6 |
 | Schema/property changes not touching constrained fields | Pass-through | Phase 6 |

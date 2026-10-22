@@ -14,11 +14,12 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 ## Commits
 
 - Anything outside the capability matrix in [`compatibility.md`](compatibility.md) is refused with
-  `UNSUPPORTED_COMMIT_OPERATION`, including position and equality deletes in the same table, removing equality delete files, rollbacks of `main` to an existing snapshot,
+  `UNSUPPORTED_COMMIT_OPERATION`, including removing equality delete files, rollbacks of `main` to an existing snapshot,
   non-Parquet data files and key columns nested in structs.
-- Flink upsert tables: a checkpoint that writes the same key twice produces position and equality
-  deletes in one commit and is refused, so Flink CDC jobs that update a key more than once between
-  checkpoints cannot write through the Plane yet ([`compatibility.md`](compatibility.md#trino-and-flink-checked-by-hand-not-in-ci)).
+- Flink upsert tables (ADR 0009, ADR 0028): the upsert key must be the table's only PK/UNIQUE
+  constraint and no FK may be declared on the table. They cannot be compacted through the Plane
+  (data files cannot be removed while equality delete files exist), and every commit reads all
+  live position delete files, whose number grows with each checkpoint that repeats a key.
 - On tables with position deletes, each commit reads all manifests of both snapshots and every live
   position delete file.
 - Files outside a table's location and `write.*.path` properties (imported with `add_files`,

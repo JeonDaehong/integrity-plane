@@ -26,6 +26,8 @@ pub struct ManifestFile {
     pub content: ManifestContent,
     /// Snapshot that wrote the manifest (client-declared; never trusted for classification).
     pub added_snapshot_id: i64,
+    /// Sequence number that the manifest's added entries inherit (v2+; `None` in v1).
+    pub sequence_number: Option<i64>,
 }
 
 /// Manifest entry status.
@@ -167,6 +169,7 @@ pub fn read_manifest_list(bytes: &Bytes) -> Result<Vec<ManifestFile>, ManifestEr
                 path: string(r, "manifest_path")?,
                 content,
                 added_snapshot_id: required_int(r, "added_snapshot_id")?,
+                sequence_number: int(r, "sequence_number")?,
             })
         })
         .collect()

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Added:**
+- Flink upsert jobs that change a key twice between checkpoints: tables with both position and
+  equality delete files are accepted when a commit changes the deleted positions of its own new
+  data files only (ADR 0028).
+
+**Fixed (integrity):** three commit shapes whose rows Iceberg reads differently from the Plane
+are refused (ADR 0028). Ordinary writers do not produce them; a crafted commit could have made the
+index count rows that readers cannot see, or hide rows that readers see:
+- a new data file with an explicit sequence number in a table with equality delete files;
+- a position delete file from an earlier snapshot naming a data file the commit adds;
+- a file live in both snapshots whose data sequence number changes.
+
 **Security:**
 - Request paths with `.` or `..` segments (also as `%2e`) or a `\` are refused (400,
   `UNSUPPORTED_COMMIT_OPERATION`). The gateway routed on the raw path but the forwarded URL resolved
