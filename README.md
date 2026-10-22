@@ -3,11 +3,8 @@
 Commit-time PRIMARY KEY / UNIQUE / NOT NULL / FOREIGN KEY enforcement for Apache Iceberg tables,
 independent of the writing engine, with verifiable integrity certificates.
 
-A commit never rescans the table. The Plane keeps its own index of each constrained table's keys
-(keys and counts, no row locations) and checks a commit by reading only the key columns of the
-files it adds or removes and probing that index. The index records which snapshot of each table it
-reflects; a durable log and bypass detection keep the two in step
-([RFC 0008](docs/rfc/0008-index-heads.md), [`docs/recovery.md`](docs/recovery.md)).
+A commit never rescans the table: it is checked against the Plane's own key index ([How it
+works](#how-it-works)).
 
 ![PyIceberg writing through the Plane: a duplicate key, a dangling reference and a delete of a
 referenced row are refused before they reach the catalog](demo/demo.gif)
@@ -16,6 +13,62 @@ referenced row are refused before they reach the catalog](demo/demo.gif)
 
 > **Status: pre-alpha (0.1.0), not production-ready.** Do not use this for data you care about.
 > Only what is listed below is implemented, and only within the limits stated in the linked docs.
+
+## How it works
+
+```mermaid
+flowchart LR
+    W["Writers<br/>Spark, Trino, Flink, PyIceberg"] -->|commits| P["Integrity Plane"]
+    P -->|"validated commits<br/>+ certificate"| C["Upstream REST catalog"]
+    P <--> X[("Control store<br/>key index + transaction log")]
+    P -.->|"key columns only,<br/>ranged reads"| S[("Object storage<br/>Parquet files")]
+    R["Readers"] -->|table metadata| C
+    R -->|data| S
+```
+
+Writers use the Plane as their REST catalog; readers keep using the catalog directly. Tables
+without constraints are forwarded unchanged.
+
+The Plane keeps its own index of each constrained table's keys: keys and counts, never row
+locations. A commit is checked by reading only the key columns of the files it adds or removes
+and probing that index, so the cost follows the size of the change, not the table. The table is
+scanned once, when a constraint is registered on a table that already has data.
+
+```mermaid
+sequenceDiagram
+    participant W as Writer
+    participant P as Integrity Plane
+    participant S as Object storage
+    participant C as Upstream catalog
+    W->>P: commit (new snapshot)
+    P->>C: load the tables of the FK domain
+    Note over P: main still at the snapshot the index reflects?<br/>Moved without a certificate: BYPASS_DETECTED
+    P->>S: read key columns of added / removed files
+    Note over P: count keys in the commit, probe the index
+    alt constraint violated
+        P-->>W: 400 with the integrity code (nothing forwarded)
+    else valid
+        Note over P: log the exact index writes (durable)
+        P->>C: forward the commit, certificate in the snapshot summary
+        C-->>P: 200
+        P-->>W: 200
+        Note over P: apply index writes + record the new snapshot,<br/>one atomic transaction
+    end
+```
+
+Keeping the index consistent with the table's snapshots:
+
+- **Every index update records which `main` snapshot of each table it reflects**, in the same
+  transaction as the key changes ([RFC 0008](docs/rfc/0008-index-heads.md)).
+- **Crashes:** the index writes are logged durably before the commit is forwarded. After a crash
+  the Plane looks up whether the snapshot reached `main` and applies or discards them
+  ([`docs/recovery.md`](docs/recovery.md)).
+- **Commits around the Plane:** if `main` has moved past the recorded snapshot, the Plane follows
+  snapshots it can re-validate (certified by a Plane, [RFC 0011](docs/rfc/0011-catch-up.md)); any
+  other change refuses the commit with `BYPASS_DETECTED` and locks the domain until it is rebuilt.
+- **Evidence:** each accepted snapshot carries a certificate, a hash chain over its key changes,
+  which `integrity verify` recomputes from the data files
+  ([RFC 0002](docs/rfc/0002-certificate-format-v1.md)).
 
 ## When to use it, and when not
 
