@@ -110,20 +110,17 @@ clients use S3 (SeaweedFS's S3 gateway; MinIO no longer publishes container imag
 
 ### Trino and Flink (checked by hand, not in CI)
 
-Run once on 2026-10-21 against `deploy/docker-compose.yml` (S3, REST fixture 1.10.1, the Plane at
-`da2c2f8`); not part of CI yet (#9).
+Run on 2026-10-21 and again on 2026-10-22 against `deploy/docker-compose.yml` (S3, REST fixture
+1.10.1, the Plane at `b74f468`); not part of CI yet (#9).
 
 | Client | Version | Result |
 |---|---|---|
 | Trino (Iceberg connector, REST catalog, native S3) | 470 | All 20 scenarios as expected: `INSERT`, merge-on-read `UPDATE` / `DELETE` / `MERGE`, `optimize`, `expire_snapshots`; INT-003 (within a statement, against the table, `UPDATE` of a key, `MERGE`, `INSERT … SELECT`), INT-007, INT-005, INT-006; one commit attempt per violation; `verify` OK |
-| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted; INT-003, INT-007, INT-005 rejected after one attempt. **An upsert batch that writes the same key twice is refused** (INT-012: Flink writes position and equality deletes in one commit, see the capability matrix), and `verify` reports snapshots with equality deletes `UNVERIFIABLE` |
+| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028; refused before `b74f468`); INT-003, INT-007, INT-005 rejected after one attempt. `verify` reports snapshots with equality deletes `UNVERIFIABLE` |
 
 Both engines report a rejection as `BadRequestException: Malformed request: INT-… ` (their wording
 for HTTP 400); the integrity code and message follow. Trino commits table statistics in a second
 commit after each write, which the Plane forwards.
-
-Flink upsert / CDC jobs that update a key more than once between checkpoints therefore cannot write
-through the Plane yet.
 
 ## File locations (RFC 0013)
 
