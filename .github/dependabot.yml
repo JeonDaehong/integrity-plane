@@ -18,6 +18,9 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    # Its refs name Rust toolchains (`@stable`, `@1.90` for the MSRV job), not action versions.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
 
   - package-ecosystem: docker
     directory: "/"
