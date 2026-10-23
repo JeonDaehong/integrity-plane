@@ -28,6 +28,26 @@ const LIST_SCHEMA: &str = r#"{"type": "record", "name": "manifest_file", "fields
     {"name": "added_snapshot_id", "type": "long"}
 ]}"#;
 
+/// Manifest entries with a partition tuple `(region)`.
+const PART_ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "snapshot_id", "type": ["null", "long"]},
+    {"name": "sequence_number", "type": ["null", "long"]},
+    {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
+        {"name": "content", "type": "int"},
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": [
+            {"name": "region", "type": ["null", "string"]}
+        ]}},
+        {"name": "record_count", "type": "long"},
+        {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}]},
+        {"name": "referenced_data_file", "type": ["null", "string"], "default": null},
+        {"name": "content_offset", "type": ["null", "long"], "default": null},
+        {"name": "content_size_in_bytes", "type": ["null", "long"], "default": null}
+    ]}}
+]}"#;
+
 const LIST_SEQ_SCHEMA: &str = r#"{"type": "record", "name": "manifest_file", "fields": [
     {"name": "manifest_path", "type": "string"},
     {"name": "manifest_length", "type": "long"},
@@ -56,6 +76,15 @@ const ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", "fiel
 /// `(status, content, path, format, record_count)` with status 0 existing, 1 added, 2 deleted;
 /// content 0 data, 1 position deletes, 2 equality deletes.
 type Entry = (i32, i32, &'static str, &'static str, i64);
+
+/// A Parquet entry of a table partitioned by `region`: `(entry, explicit sequence number, region,
+/// referenced data file)`.
+type PartEntry = (
+    Entry,
+    Option<i64>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
 
 struct Table {
     io: MemoryIo,
@@ -257,15 +286,81 @@ impl Table {
         self.io.insert(path, Self::avro(LIST_SCHEMA, records));
     }
 
+    /// A manifest of a table partitioned by `region`.
+    fn part_manifest(&mut self, path: &str, entries: &[PartEntry]) {
+        let opt_string = |v: Option<&str>| match v {
+            Some(s) => Avro::Union(1, Box::new(Avro::String(s.into()))),
+            None => Avro::Union(0, Box::new(Avro::Null)),
+        };
+        let records = entries
+            .iter()
+            .map(
+                |&((status, content, file, format, count), seq, region, target)| {
+                    vec![
+                        ("status", Avro::Int(status)),
+                        ("snapshot_id", Avro::Union(1, Box::new(Avro::Long(1)))),
+                        (
+                            "sequence_number",
+                            match seq {
+                                Some(n) => Avro::Union(1, Box::new(Avro::Long(n))),
+                                None => Avro::Union(0, Box::new(Avro::Null)),
+                            },
+                        ),
+                        (
+                            "data_file",
+                            Avro::Record(vec![
+                                ("content".into(), Avro::Int(content)),
+                                ("file_path".into(), Avro::String(file.into())),
+                                ("file_format".into(), Avro::String(format.into())),
+                                (
+                                    "partition".into(),
+                                    Avro::Record(vec![("region".into(), opt_string(region))]),
+                                ),
+                                ("record_count".into(), Avro::Long(count)),
+                                (
+                                    "equality_ids".into(),
+                                    if content == 2 {
+                                        Avro::Union(1, Box::new(Avro::Array(vec![Avro::Int(1)])))
+                                    } else {
+                                        Avro::Union(0, Box::new(Avro::Null))
+                                    },
+                                ),
+                                ("referenced_data_file".into(), opt_string(target)),
+                                (
+                                    "content_offset".into(),
+                                    Avro::Union(0, Box::new(Avro::Null)),
+                                ),
+                                (
+                                    "content_size_in_bytes".into(),
+                                    Avro::Union(0, Box::new(Avro::Null)),
+                                ),
+                            ]),
+                        ),
+                    ]
+                },
+            )
+            .collect();
+        self.io.insert(path, Self::avro(PART_ENTRY_SCHEMA, records));
+    }
+
     /// A v2 manifest list: `(manifest, content, sequence number its added entries inherit)`.
     fn list_seq(&mut self, path: &str, manifests: &[(&str, i32, i64)]) {
+        let with_spec: Vec<_> = manifests
+            .iter()
+            .map(|&(m, c, seq)| (m, c, seq, 0))
+            .collect();
+        self.list_spec(path, &with_spec);
+    }
+
+    /// A v2 manifest list: `(manifest, content, sequence number, partition spec id)`.
+    fn list_spec(&mut self, path: &str, manifests: &[(&str, i32, i64, i32)]) {
         let records = manifests
             .iter()
-            .map(|&(m, content, seq)| {
+            .map(|&(m, content, seq, spec)| {
                 vec![
                     ("manifest_path", Avro::String(m.into())),
                     ("manifest_length", Avro::Long(1)),
-                    ("partition_spec_id", Avro::Int(0)),
+                    ("partition_spec_id", Avro::Int(spec)),
                     ("content", Avro::Int(content)),
                     ("sequence_number", Avro::Long(seq)),
                     ("added_snapshot_id", Avro::Long(1)),
@@ -941,6 +1036,135 @@ fn kept_files_keep_their_data_sequence_number() {
     assert!(
         unsupported(t.diff(Some("v2-parent.avro"), "relisted.avro"))
             .contains("pos1.parquet changes its data sequence number")
+    );
+}
+
+// ---------- deletes apply as Iceberg readers apply them (ADR 0030) ----------
+
+/// a.parquet `[(1, eu), (2, us)]` in partition eu and b.parquet `[(3, eu)]` in partition us, data
+/// sequence number 5 (list pparent.avro).
+fn partitioned_parent() -> Table {
+    let mut t = parent();
+    t.part_manifest(
+        "m1p.avro",
+        &[
+            ((1, 0, "a.parquet", "PARQUET", 2), None, Some("eu"), None),
+            ((1, 0, "b.parquet", "PARQUET", 1), None, Some("us"), None),
+        ],
+    );
+    t.list_seq("pparent.avro", &[("m1p.avro", 0, 5)]);
+    t
+}
+
+/// A position delete of a.parquet row 1 (`(2, us)`) in partition `region`, its manifest listed
+/// in `list` at sequence number `seq` with partition spec `spec`.
+fn with_position_delete(t: &mut Table, list: &str, region: &'static str, seq: i64, spec: i32) {
+    t.positions("pos-a.parquet", &[("a.parquet", 1)]);
+    t.part_manifest(
+        "d1p.avro",
+        &[(
+            (1, 1, "pos-a.parquet", "PARQUET", 1),
+            None,
+            Some(region),
+            None,
+        )],
+    );
+    t.list_spec(list, &[("m1p.avro", 0, 5, 0), ("d1p.avro", 1, seq, spec)]);
+}
+
+#[test]
+fn position_deletes_apply_within_their_partition_spec_and_sequence_number() {
+    let removed = |t: &Table, list: &str| {
+        sorted(
+            &t.rows(&t.diff(Some("pparent.avro"), list).unwrap())
+                .unwrap()
+                .removed,
+        )
+    };
+    let mut t = partitioned_parent();
+    with_position_delete(&mut t, "right.avro", "eu", 6, 0);
+    assert_eq!(removed(&t, "right.avro"), [row(2, "us")]);
+    // The same sequence number still applies (rows written in the same commit).
+    with_position_delete(&mut t, "equal.avro", "eu", 5, 0);
+    assert_eq!(removed(&t, "equal.avro"), [row(2, "us")]);
+
+    // Readers do not apply these; neither does the Plane.
+    for (list, region, seq, spec) in [
+        ("other-partition.avro", "us", 6, 0),
+        ("other-spec.avro", "eu", 6, 1),
+        ("older.avro", "eu", 4, 0),
+    ] {
+        let mut t = partitioned_parent();
+        with_position_delete(&mut t, list, region, seq, spec);
+        assert!(removed(&t, list).is_empty(), "{list}");
+    }
+}
+
+#[test]
+fn a_referenced_data_file_limits_a_position_delete_file() {
+    let mut t = partitioned_parent();
+    t.positions("pos-a.parquet", &[("a.parquet", 1)]);
+    t.part_manifest(
+        "d1p.avro",
+        &[(
+            (1, 1, "pos-a.parquet", "PARQUET", 1),
+            None,
+            Some("eu"),
+            Some("b.parquet"),
+        )],
+    );
+    t.list_seq("new.avro", &[("m1p.avro", 0, 5), ("d1p.avro", 1, 6)]);
+    let rows = t
+        .rows(&t.diff(Some("pparent.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert!(rows.removed.is_empty() && rows.added.is_empty());
+}
+
+#[test]
+fn a_deletion_vector_replaces_position_delete_files_of_its_data_file() {
+    // pos1.parquet deletes a.parquet row 1; a vector for a.parquet that marks only row 0 is what
+    // readers apply from now on: row 0 goes, row 1 comes back.
+    let mut t = parent_with_position_delete();
+    let (offset, size) = t.dv("dv.puffin", &[0]);
+    t.dv_manifest("d2.avro", &[(1, "dv.puffin", "a.parquet", offset, size, 1)]);
+    t.list(
+        "new.avro",
+        &[("m1.avro", 0), ("d1.avro", 1), ("d2.avro", 1)],
+    );
+    let rows = t
+        .rows(&t.diff(Some("parent-pos.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(sorted(&rows.removed), [row(1, "eu")]);
+    assert_eq!(sorted(&rows.added), [row(2, "us")]);
+
+    // Two live vectors for one data file are invalid.
+    let (o2, s2) = t.dv("dv2.puffin", &[1]);
+    t.dv_manifest(
+        "d3.avro",
+        &[
+            (1, "dv.puffin", "a.parquet", offset, size, 1),
+            (1, "dv2.puffin", "a.parquet", o2, s2, 1),
+        ],
+    );
+    t.list("two.avro", &[("m1.avro", 0), ("d3.avro", 1)]);
+    let changes = t.diff(Some("parent.avro"), "two.avro").unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("more than one deletion vector"));
+}
+
+#[test]
+fn partitioned_equality_deletes_are_unsupported() {
+    // A partitioned equality delete reaches only its partition's files; the Plane cannot tell
+    // which rows that leaves without reading them.
+    let mut t = partitioned_parent();
+    t.id_deletes("eq.parquet", &[1]);
+    t.part_manifest(
+        "d1p.avro",
+        &[((1, 2, "eq.parquet", "PARQUET", 1), None, Some("eu"), None)],
+    );
+    t.list_seq("new.avro", &[("m1p.avro", 0, 5), ("d1p.avro", 1, 6)]);
+    assert!(
+        unsupported(t.diff(Some("pparent.avro"), "new.avro"))
+            .contains("partitioned equality delete")
     );
 }
 

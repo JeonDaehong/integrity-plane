@@ -31,7 +31,9 @@ PREPARED → VALIDATED → COMMITTING → COMMITTED
   the commit still holds its domain queue and the shared constraint lock (ADR 0022); a 4xx ⇒
   `ABORTED`; a 5xx or no answer ⇒ resolved as below. If applying or logging fails, the domain refuses
   commits until recovery or a rebuild, as after a crash.
-- Terminal records store the response, returned again for a repeated `Idempotency-Key`, and
+- Terminal records store the response, returned again for a repeated `Idempotency-Key` whatever
+  the request carrying it (the REST specification requires clients to use a new key for every
+  other operation), and
   when it was given, compressed with zstd (RFC 0010; records written before are read as they
   are). The terminal record and the deletion of the transaction's staged deltas are
   one durable write: only unresolved transactions keep staged deltas.

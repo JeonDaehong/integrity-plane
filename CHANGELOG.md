@@ -14,6 +14,16 @@ index count rows that readers cannot see, or hide rows that readers see:
 - a position delete file from an earlier snapshot naming a data file the commit adds;
 - a file live in both snapshots whose data sequence number changes.
 
+**Fixed (integrity):** delete files are applied as Iceberg readers apply them (ADR 0030): position
+deletes and deletion vectors only within their partition spec and tuple, at or above the data
+file's sequence number, only to a `referenced_data_file` when set, and a deletion vector replaces
+the position delete files of its data file. Partitioned equality delete files are refused: the
+Plane treated them as global, so after partition evolution a Flink upsert could leave a duplicate
+that readers see. Flink upsert tables must be unpartitioned for now.
+
+**Fixed:** registering a constraint on a column with a v3 `initial-default` is refused: older
+files read as the default to readers but as NULL to key extraction.
+
 **Security:**
 - Commits are matched to constraints by table UUID, not by the name in the path (ADR 0029).
   Lakekeeper resolves names ignoring case, so a commit to `DB/ORDERS` reached `db.orders` without

@@ -16,8 +16,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Anything outside the capability matrix in [`compatibility.md`](compatibility.md) is refused with
   `UNSUPPORTED_COMMIT_OPERATION`, including removing equality delete files, rollbacks of `main` to an existing snapshot,
   non-Parquet data files and key columns nested in structs.
-- Flink upsert tables (ADR 0009, ADR 0028): the upsert key must be the table's only PK/UNIQUE
-  constraint and no FK may be declared on the table. They cannot be compacted through the Plane
+- Flink upsert tables (ADR 0009, ADR 0028, ADR 0030): the upsert key must be the table's only
+  PK/UNIQUE constraint, no FK may be declared on the table, and the table must be unpartitioned
+  (partitioned equality deletes are refused). They cannot be compacted through the Plane
   (data files cannot be removed while equality delete files exist), and every commit reads all
   live position delete files, whose number grows with each checkpoint that repeats a key.
 - On tables with position deletes, each commit reads all manifests of both snapshots and every live
@@ -41,7 +42,15 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Constraints, onboarding and rebuild
 
-- Constraints are on top-level columns only; NOT NULL on one column.
+- Constraints are on top-level columns only; NOT NULL on one column. Columns with a v3
+  `initial-default` cannot be constrained (refused at registration): files written before the
+  column existed would read as NULL to the Plane and as the default to readers.
+- Tables are named `ns1.ns2.table`, so a namespace level or table name containing `.` is
+  ambiguous: such tables cannot be constrained reliably (a commit that resolves to another table
+  than the registered one is refused, never forwarded unchecked).
+- Constraints name tables without the catalog prefix (warehouse): a table of the same name in
+  another warehouse is a different table (another UUID), and its commits are refused as long as a
+  constraint names that name.
 - Registering, dropping and rebuilding pause commits in all domains while they run.
 - Tables with equality delete files cannot be onboarded or rebuilt; compact them first. Position
   deletes are applied; their deleted positions are held in memory during the scan (a few bytes

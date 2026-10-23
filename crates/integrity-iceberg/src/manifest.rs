@@ -28,6 +28,8 @@ pub struct ManifestFile {
     pub added_snapshot_id: i64,
     /// Sequence number that the manifest's added entries inherit (v2+; `None` in v1).
     pub sequence_number: Option<i64>,
+    /// Partition spec the manifest's files were written with.
+    pub partition_spec_id: Option<i64>,
 }
 
 /// Manifest entry status.
@@ -78,6 +80,9 @@ pub struct DataFile {
     pub content_offset: Option<i64>,
     /// v3 deletion vector: size of its blob.
     pub content_size_in_bytes: Option<i64>,
+    /// The partition tuple, as a canonical string for equality checks (delete scope, ADR 0030);
+    /// `None` when unpartitioned (no fields) or absent.
+    pub partition: Option<String>,
 }
 
 /// A manifest entry.
@@ -170,6 +175,7 @@ pub fn read_manifest_list(bytes: &Bytes) -> Result<Vec<ManifestFile>, ManifestEr
                 content,
                 added_snapshot_id: required_int(r, "added_snapshot_id")?,
                 sequence_number: int(r, "sequence_number")?,
+                partition_spec_id: int(r, "partition_spec_id")?,
             })
         })
         .collect()
@@ -225,6 +231,12 @@ pub fn read_manifest(bytes: &Bytes) -> Result<Vec<ManifestEntry>, ManifestError>
                     },
                     content_offset: int(df, "content_offset")?,
                     content_size_in_bytes: int(df, "content_size_in_bytes")?,
+                    partition: match get(df, "partition") {
+                        None => None,
+                        Some(Value::Record(fields)) if fields.is_empty() => None,
+                        Some(Value::Record(fields)) => Some(format!("{fields:?}")),
+                        Some(other) => return Err(err(format!("partition {other:?}"))),
+                    },
                 },
             })
         })

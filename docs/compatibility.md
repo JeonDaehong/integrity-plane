@@ -12,11 +12,11 @@
 | `replace` (compaction, manifest rewrite) | Supported only if projected rows are unchanged | Phase 6 |
 | `delete` dropping whole files | Supported | Phase 6 |
 | Several new snapshots on `main` in one commit | Supported; each validated in order | Phase 6 (classification, diff) |
-| Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) | Phase 6 |
-| Equality deletes on other fields, with explicit sequence numbers, or mixed with data-file removal | Rejected | Phase 6 |
-| Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017) | Yes |
+| Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) and the delete file is unpartitioned (global, ADR 0030) | Phase 6 |
+| Equality deletes on other fields, with explicit sequence numbers, mixed with data-file removal, or partitioned | Rejected | Phase 6, ADR 0030 |
+| Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017), applied as readers apply them: same partition spec and tuple, sequence number, `referenced_data_file` (ADR 0030) | Yes |
 | Compaction of a merge-on-read table (applying, rewriting or dropping position delete files) | Supported if live rows are unchanged | Yes (ADR 0017) |
-| Deletion vectors (v3, Puffin) | Supported, as position deletes (ADR 0018) | Yes |
+| Deletion vectors (v3, Puffin) | Supported, as position deletes (ADR 0018); a vector replaces the position delete files of its data file, two vectors for one file are rejected (ADR 0030) | Yes |
 | Position and equality deletes in one table (Flink upsert repeating a key in one checkpoint) | Supported when the commit changes the deleted positions of its own new data files only | Yes (ADR 0028) |
 | Position deletes changing rows of existing data files in a table with equality deletes; added data files with explicit sequence numbers there | Rejected | Rejected (ADR 0028) |
 | A position delete file from an earlier snapshot naming a data file the commit adds; a file whose data sequence number changes | Rejected | Rejected (ADR 0028) |
@@ -101,6 +101,11 @@ runs the full scenario through the gateway, merge-on-read included, and format v
 the current snapshot of a table, without its parent, so `verify` cannot recompute certificates there
 and reports them `UNVERIFIABLE` (never a break); commit-time validation and bypass detection are
 unaffected.
+
+Lakekeeper resolves table names ignoring case (`SPARK.CUSTOMER` is `spark.customer`). Commits are
+matched to constraints by table UUID (ADR 0029): checked by hand on 2026-10-23 with PyIceberg 0.12
+through the Plane, a duplicate appended through four spellings of the name was refused each time
+and a valid append through `SPARK.CUSTOMER` was validated.
 
 For every client each violation reaches the gateway exactly once (no retry storm), the statement
 fails with the integrity code in its message, and every snapshot on `main` carries a certificate.

@@ -168,6 +168,17 @@ async fn env_named(
             empty_table(uuid),
         );
     }
+    // A v3 column added later with an initial-default (old files read as 0).
+    let mut defaulted = empty_table("33333333-3333-3333-3333-333333333333");
+    defaulted["schemas"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": 3, "name": "code", "required": false, "type": "long", "initial-default": 0}));
+    shared
+        .lock()
+        .unwrap()
+        .tables
+        .insert("/v1/namespaces/db/tables/defaulted".into(), defaulted);
     let up = serve(
         Router::new()
             .fallback(upstream)
@@ -507,6 +518,11 @@ async fn invalid_registrations_are_refused() {
         ),
         (
             json!({"table": "db.customer", "name": "x", "type": "NOT_NULL", "columns": ["id"], "nulls": "DISTINCT"}),
+            400,
+            "INT-001",
+        ),
+        (
+            json!({"table": "db.defaulted", "name": "x", "type": "UNIQUE", "columns": ["code"]}),
             400,
             "INT-001",
         ),

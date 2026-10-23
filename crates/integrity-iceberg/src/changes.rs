@@ -126,15 +126,43 @@ pub struct PositionDeletes {
     /// Either snapshot has equality delete files: then the commit may change the deleted
     /// positions of added data files only (ADR 0028).
     pub equality: bool,
+    /// Where each live file of the parent snapshot sits, by path: a delete applies to a data file
+    /// as Iceberg readers apply it (ADR 0030).
+    pub scope_before: BTreeMap<String, Scope>,
+    /// The same for the new snapshot.
+    pub scope_after: BTreeMap<String, Scope>,
 }
 
-/// A live content file with its explicit sequence number (`None`: inherited) and its data
-/// sequence number (explicit, or the manifest's).
+/// What decides whether a delete file applies to a data file (Iceberg "Scan Planning"): partition
+/// spec, partition tuple and data sequence number. `None` where the metadata does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    /// Partition spec id of the file's manifest.
+    pub spec: Option<i64>,
+    /// Partition tuple ([`DataFile::partition`]).
+    pub partition: Option<String>,
+    /// Data sequence number.
+    pub sequence: Option<i64>,
+}
+
+/// A live content file with its explicit sequence number (`None`: inherited), its data sequence
+/// number (explicit, or the manifest's) and its manifest's partition spec.
 #[derive(Debug, Clone)]
 struct LiveFile {
     file: DataFile,
     explicit: Option<i64>,
     sequence: Option<i64>,
+    spec: Option<i64>,
+}
+
+impl LiveFile {
+    fn scope(&self) -> Scope {
+        Scope {
+            spec: self.spec,
+            partition: self.file.partition.clone(),
+            sequence: self.sequence,
+        }
+    }
 }
 
 type Live = BTreeMap<String, LiveFile>;
@@ -187,6 +215,7 @@ fn live_files(
                 file: entry.file.clone(),
                 explicit: entry.sequence_number,
                 sequence: entry.sequence_number.or(m.sequence_number),
+                spec: m.partition_spec_id,
             };
             if out.insert(path.clone(), live).is_some() {
                 return Err(unsupported(format!("file listed twice: {path}")));
@@ -367,7 +396,28 @@ pub fn diff_snapshots(
             kept,
             added: changes.added.iter().map(|f| f.path.clone()).collect(),
             equality: equality_live,
+            scope_before: parent_all
+                .iter()
+                .map(|(p, l)| (p.clone(), l.scope()))
+                .collect(),
+            scope_after: new_all
+                .iter()
+                .map(|(p, l)| (p.clone(), l.scope()))
+                .collect(),
         });
+    }
+    // A partitioned equality delete reaches only data files of its partition; the Plane removes
+    // keys from the index as if it reached every file, which it can prove only for a global one
+    // (an unpartitioned spec) (ADR 0030).
+    if let Some(f) = changes
+        .equality_deletes
+        .iter()
+        .find(|f| f.partition.is_some())
+    {
+        return Err(unsupported(format!(
+            "partitioned equality delete file {}",
+            f.path
+        )));
     }
     let mut field_sets = changes.equality_deletes.iter().map(|f| {
         let mut ids = f.equality_ids.clone().unwrap_or_default();
@@ -856,16 +906,51 @@ fn deleted_positions(
             )));
         }
     }
-    let side = |files: &[DataFile]| {
+    // As Iceberg readers apply deletes (ADR 0030): to a live data file of the same partition spec
+    // and tuple, at or below the delete's data sequence number, only to its
+    // `referenced_data_file` when one is set; where a deletion vector applies, it replaces every
+    // position delete file.
+    let side = |files: &[DataFile], scope: &BTreeMap<String, Scope>| {
+        let applies = |d: &DataFile, path: &str| {
+            let (Some(data), Some(delete)) = (scope.get(path), scope.get(&d.path)) else {
+                return false;
+            };
+            let known = |a: Option<i64>, b: Option<i64>, ok: fn(i64, i64) -> bool| match (a, b) {
+                (Some(a), Some(b)) => ok(a, b),
+                _ => true,
+            };
+            d.referenced_data_file.as_deref().is_none_or(|r| r == path)
+                && known(data.spec, delete.spec, |a, b| a == b)
+                && data.partition == delete.partition
+                && known(data.sequence, delete.sequence, |a, b| a <= b)
+        };
         let mut out = Deleted::new();
+        let mut vectors: HashMap<&str, &BTreeSet<i64>> = HashMap::new();
         for d in files {
             for (path, positions) in by_file.get(d.path.as_str()).into_iter().flatten() {
-                out.entry(path.clone()).or_default().extend(positions);
+                if !applies(d, path) {
+                    continue;
+                }
+                if is_deletion_vector(d) {
+                    if vectors.insert(path.as_str(), positions).is_some() {
+                        return Err(unsupported(format!(
+                            "more than one deletion vector for {path}"
+                        )));
+                    }
+                } else {
+                    out.entry(path.clone()).or_default().extend(positions);
+                }
             }
         }
-        out
+        for (path, positions) in vectors {
+            out.insert(path.to_owned(), positions.clone());
+        }
+        Ok(out)
     };
-    let (before, after) = (side(&pd.before), side(&pd.after));
+    let (before, after) = (
+        side(&pd.before, &pd.scope_before)?,
+        side(&pd.after, &pd.scope_after)?,
+    );
     // With equality deletes, a kept file's rows may already be deleted by one; only the positions
     // of added data files may change (ADR 0028).
     if pd.equality

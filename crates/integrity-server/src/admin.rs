@@ -255,6 +255,13 @@ impl Gateway {
                     .find(|f| f.name == *name)
                     .ok_or_else(|| invalid(format!("{} has no column {name}", req.table)))?,
             };
+            if field.initial_default.is_some() {
+                // Old files read as the default to readers and as NULL to key extraction.
+                return Err(invalid(format!(
+                    "column {} has an initial-default, which constraints do not support",
+                    field.name
+                )));
+            }
             columns.push(field.id);
             column_names.push(field.name.clone());
         }

@@ -73,6 +73,14 @@ pub fn bind(
     for c in configs.iter().filter(|c| c.table == identifier) {
         for &f in &c.columns {
             match schema.lookup(FieldId(f)) {
+                // Files written before the column existed read as its v3 initial-default, which
+                // key extraction does not apply (it reads NULL).
+                FieldLookup::TopLevel(field) if field.initial_default.is_some() => {
+                    return Err(misconfigured(format!(
+                        "constraint {} names field {f}, which has an initial-default",
+                        c.name
+                    )));
+                }
                 FieldLookup::TopLevel(field) => {
                     columns.insert(FieldId(f), logical_type(&field.field_type));
                 }
