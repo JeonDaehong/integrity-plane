@@ -30,7 +30,7 @@ redb.workspace = true
 blake3.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # Signing keys in PKCS#11 tokens (RFC 0009). Apache-2.0; loads the token's library at run time.
