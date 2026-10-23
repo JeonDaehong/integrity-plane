@@ -1312,7 +1312,7 @@ dependencies = [
  "blake3",
  "bytes",
  "cryptoki",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "integrity-core",
  "integrity-iceberg",
  "integrity-index",
