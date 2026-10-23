@@ -33,6 +33,7 @@ Use [`template.md`](template.md). Superseded ADRs stay in place with their statu
 | [0026](0026-authenticated-actors.md) | Authenticated actors: named integrity API tokens | Accepted |
 | [0027](0027-closed-integrity-api.md) | The integrity API is closed unless opened explicitly | Accepted |
 | [0028](0028-position-and-equality-deletes-in-one-table.md) | Position and equality deletes in one table (Flink upsert) | Accepted |
+| [0029](0029-commits-are-matched-by-table-uuid.md) | Commits are matched to constraints by table UUID, not by name | Accepted |
 
 The decisions spec §31 requires for 0.1 are all recorded: Iceberg first (0012), proxy gateway (0010),
 indexes as derived state (0013), counts instead of locators (0014), serial domain queues (0015) and

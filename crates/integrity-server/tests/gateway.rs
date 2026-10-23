@@ -25,6 +25,7 @@ use integrity_server::{Gateway, router};
 use serde_json::{Value, json};
 
 const TABLE_PATH: &str = "/v1/namespaces/db/tables/orders";
+const FREE_UUID: &str = "0a0b0c0d-0000-4000-8000-000000000001";
 
 fn fixture_dir() -> String {
     format!(
@@ -82,6 +83,8 @@ fn main_commits() -> Vec<Value> {
 struct Upstream {
     tables: BTreeMap<String, Value>,
     commits: Vec<(String, Value)>,
+    /// Resolve table paths ignoring case, as Lakekeeper does.
+    fold_case: bool,
 }
 
 type Shared = Arc<Mutex<Upstream>>;
@@ -93,6 +96,11 @@ async fn upstream_handler(State(s): State<Shared>, req: Request) -> Response {
         .await
         .unwrap();
     let mut up = s.lock().unwrap();
+    let path = if up.fold_case {
+        path.to_lowercase()
+    } else {
+        path
+    };
     if path == "/v1/config" {
         return axum::Json(json!({
             "defaults": {"uri": "http://upstream:8181"},
@@ -113,6 +121,9 @@ async fn upstream_handler(State(s): State<Shared>, req: Request) -> Response {
             up.commits.push((path.clone(), req.clone()));
             let mut meta = meta;
             for r in req["requirements"].as_array().unwrap() {
+                if r["type"] == "assert-table-uuid" && r["uuid"] != meta["table-uuid"] {
+                    return (StatusCode::CONFLICT, axum::Json(json!({"error": {"message": "uuid", "type": "CommitFailedException", "code": 409}}))).into_response();
+                }
                 if r["type"] == "assert-ref-snapshot-id" && r["ref"] == "main" {
                     let current = meta["refs"]["main"]["snapshot-id"].clone();
                     if current != r["snapshot-id"] {
@@ -213,8 +224,11 @@ async fn harness(extra: MemoryIo) -> Harness {
     {
         let mut up = upstream.lock().unwrap();
         up.tables.insert(TABLE_PATH.into(), commits[0].clone());
+        // Another table with the same history, under its own UUID.
+        let mut free = commits[0].clone();
+        free["table-uuid"] = json!(FREE_UUID);
         up.tables
-            .insert("/v1/namespaces/db/tables/free".into(), commits[0].clone());
+            .insert("/v1/namespaces/db/tables/free".into(), free);
     }
     let up_addr = serve(
         Router::new()
@@ -514,6 +528,48 @@ async fn dot_segments_cannot_route_around_validation() {
     assert_eq!(status, 200, "{body}");
 }
 
+/// A catalog that ignores case resolves `DB/ORDERS` to `db.orders`: the commit is validated as
+/// `db.orders`, whatever its path says (ADR 0029).
+#[tokio::test(flavor = "multi_thread")]
+async fn names_the_catalog_resolves_to_a_constrained_table_are_validated() {
+    let commits = main_commits();
+    let mut extra = MemoryIo::new();
+    let bad = relisting_commit(&commits[1], &mut extra);
+    let h = harness(extra).await;
+    h.upstream.lock().unwrap().fold_case = true;
+    const UPPER: &str = "/v1/namespaces/DB/tables/ORDERS";
+
+    // Never anchored yet: the Plane asks the catalog for db.orders' UUID.
+    let (status, body) = h.post(UPPER, &request(&commits[0], &commits[1])).await;
+    assert_eq!(status, 200, "{body}");
+    {
+        let up = h.upstream.lock().unwrap();
+        let (_, forwarded) = up.commits.last().unwrap();
+        assert!(
+            !forwarded["updates"][0]["snapshot"]["summary"]["integrity.cert"].is_null(),
+            "validated and certified as db.orders"
+        );
+    }
+
+    let forwarded = h.upstream_commits();
+    for path in [UPPER, "/v1/namespaces/Db/tables/Orders"] {
+        let (status, body) = h.post(path, &bad).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("DUPLICATE_PRIMARY_KEY"),
+            "{body}"
+        );
+        assert_eq!(h.upstream_commits(), forwarded, "{path} reached upstream");
+    }
+
+    // Anchored now; the next valid commit through either spelling is validated too.
+    let (status, body) = h.post(UPPER, &request(&commits[1], &commits[2])).await;
+    assert_eq!(status, 200, "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_base_and_unsupported_endpoints() {
     let h = harness(MemoryIo::new()).await;
@@ -565,6 +621,14 @@ async fn unconstrained_tables_and_config_are_proxied() {
         let up = h.upstream.lock().unwrap();
         let (_, forwarded) = up.commits.last().unwrap();
         assert!(forwarded["updates"][0]["snapshot"]["summary"]["integrity.cert"].is_null());
+        // Pinned to the table the Plane identified (ADR 0029).
+        assert!(
+            forwarded["requirements"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"type": "assert-table-uuid", "uuid": FREE_UUID})),
+            "{forwarded}"
+        );
     }
 
     let config: Value = h

@@ -26,8 +26,10 @@ flowchart LR
     R -->|data| S
 ```
 
-Writers use the Plane as their REST catalog; readers keep using the catalog directly. Tables
-without constraints are forwarded unchanged.
+Writers use the Plane as their REST catalog; readers keep using the catalog directly. Commits to
+tables without constraints are forwarded after one table load: the Plane checks by table UUID that
+the name does not resolve to a constrained table (some catalogs ignore case,
+[ADR 0029](docs/adr/0029-commits-are-matched-by-table-uuid.md)).
 
 The Plane keeps its own index of each constrained table's keys: keys and counts, never row
 locations. A commit is checked by reading only the key columns of the files it adds or removes
@@ -94,7 +96,8 @@ Not worth it when:
   foreign keys, are validated one at a time (about 25–80 commits/s, `docs/benchmarks.md`);
 - the table regularly takes very large commits and their latency matters (see the cost below).
 
-Cost: reads do not go through the Plane, and tables without constraints are forwarded unchanged.
+Cost: reads do not go through the Plane, and commits to tables without constraints cost one more
+catalog request.
 Each commit to a constrained table is validated before it is forwarded, and the cost grows with
 the rows the commit adds, removes or rewrites. Measured with Spark on Amazon S3: a statement
 changing a few rows or a hundred thousand rows takes about a second more, but inserting 1 M rows

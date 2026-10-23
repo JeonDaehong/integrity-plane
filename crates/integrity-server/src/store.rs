@@ -3,7 +3,7 @@
 //! The registry is one small document (constraints, per-table constraint set versions, certificate
 //! chain anchors) rewritten atomically with a BLAKE3 checksum; the audit log is append-only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -140,6 +140,16 @@ impl RegistryDoc {
         self.constraints.values().any(|c| {
             c.table == identifier || c.references.as_ref().is_some_and(|r| r.table == identifier)
         })
+    }
+
+    /// Every table a constraint governs or references.
+    pub fn constrained_tables(&self) -> BTreeSet<String> {
+        self.constraints
+            .values()
+            .flat_map(|c| {
+                std::iter::once(c.table.clone()).chain(c.references.iter().map(|r| r.table.clone()))
+            })
+            .collect()
     }
 
     /// Bumps a table's version and records the constraint set of the new version.

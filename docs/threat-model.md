@@ -28,6 +28,10 @@ A writer that reaches the upstream catalog directly can commit anything.
 
 - **Deployment requirement:** writers must not be able to reach the upstream catalog (network
   policy, credentials scoped to the Plane). This is the primary control.
+- **Other spellings of a name:** a commit through the Plane to a path that does not name a
+  constrained table is matched by the UUID of the table the catalog resolves it to (ADR 0029):
+  Lakekeeper, for one, ignores case, so `DB/ORDERS` is `db.orders`. Requests with `.`/`..`
+  segments or `\` are refused before routing.
 - **Detection at commit time:** before validating, the Plane checks every table of the domain:
   `main` must be the snapshot its indexes reflect, which the index store records with every index
   change (RFC 0008), or descend from it through certified snapshots that validate again and

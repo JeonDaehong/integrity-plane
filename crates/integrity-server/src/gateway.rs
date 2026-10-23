@@ -159,6 +159,20 @@ pub fn ambiguous_path(path: &str) -> bool {
         })
 }
 
+/// `body` (a commit request) with a requirement that the table's UUID is `uuid`, so the catalog
+/// commits it only to the table the Plane identified (ADR 0029). `None` if it is not a JSON object
+/// with a requirements array (or none).
+fn assert_table_uuid(body: &Bytes, uuid: &str) -> Option<Bytes> {
+    let mut request: Value = serde_json::from_slice(body).ok()?;
+    let requirements = request
+        .as_object_mut()?
+        .entry("requirements")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()?;
+    requirements.push(serde_json::json!({"type": "assert-table-uuid", "uuid": uuid}));
+    serde_json::to_vec(&request).ok().map(Bytes::from)
+}
+
 /// Classifies a request.
 pub fn route(method: &Method, path: &str) -> Route {
     let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
@@ -387,6 +401,16 @@ pub struct Gateway {
 
 pub(crate) enum Loaded {
     Table(Box<TableMetadata>, Value),
+    Missing,
+}
+
+/// The table a commit lands on (ADR 0029).
+enum Identified {
+    /// A constrained table, under its registered name.
+    Constrained(TablePath),
+    /// Another table, with its UUID.
+    Other(String),
+    /// No table at the commit's path.
     Missing,
 }
 
@@ -822,6 +846,24 @@ impl Gateway {
                 // ADR 0022).
                 let shared = Arc::clone(&self.admin).read_owned().await;
                 let doc = self.registry.snapshot();
+                // Catalogs resolve names their own way (Lakekeeper ignores case): the table is the
+                // one the catalog lands on, known by its UUID (ADR 0029).
+                let table = if doc.is_constrained(&table.identifier()) || doc.constraints.is_empty()
+                {
+                    table
+                } else {
+                    match self.identify(&table, &doc, &headers).await {
+                        Err(e) => return e.into_response(),
+                        Ok(Identified::Constrained(registered)) => registered,
+                        Ok(Identified::Other(uuid)) => {
+                            let body = assert_table_uuid(&body, &uuid).unwrap_or(body);
+                            return self.proxy(method, path_and_query, &headers, body).await;
+                        }
+                        Ok(Identified::Missing) => {
+                            return self.proxy(method, path_and_query, &headers, body).await;
+                        }
+                    }
+                };
                 let identifier = table.identifier();
                 if !doc.is_constrained(&identifier) {
                     self.proxy(method, path_and_query, &headers, body).await
@@ -1012,6 +1054,44 @@ impl Gateway {
                 )
             })?;
         Ok(Loaded::Table(Box::new(meta), body))
+    }
+
+    /// The table a commit to `table`, which names no constrained table, lands on: a constrained
+    /// table if its UUID is one of theirs (ADR 0029).
+    async fn identify(
+        &self,
+        table: &TablePath,
+        doc: &RegistryDoc,
+        headers: &HeaderMap,
+    ) -> Result<Identified, ApiError> {
+        let uuid_at = |path: &TablePath| format!("{}?snapshots=refs", path.path());
+        let meta = match self.load(&uuid_at(table), headers).await? {
+            Loaded::Missing => return Ok(Identified::Missing),
+            Loaded::Table(meta, _) => meta,
+        };
+        let uuid = meta.table_uuid.to_lowercase();
+        for identifier in doc.constrained_tables() {
+            let Some(registered) = TablePath::of(&table.base, &identifier) else {
+                continue;
+            };
+            let theirs = match doc.anchors.get(&identifier) {
+                Some(anchor) => anchor.table_uuid.clone(),
+                None => match self.store.head(&identifier).map_err(|e| {
+                    ApiError::new(ErrorCode::IndexDegraded, format!("index store: {e}"))
+                })? {
+                    Some(head) => head.table_uuid,
+                    // Never anchored: ask the catalog.
+                    None => match self.load(&uuid_at(&registered), headers).await? {
+                        Loaded::Table(m, _) => m.table_uuid.to_lowercase(),
+                        Loaded::Missing => continue,
+                    },
+                },
+            };
+            if theirs == uuid {
+                return Ok(Identified::Constrained(registered));
+            }
+        }
+        Ok(Identified::Other(meta.table_uuid.clone()))
     }
 
     fn index_kind(&self, id: ConstraintId) -> Option<IndexKind> {

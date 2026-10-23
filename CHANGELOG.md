@@ -15,6 +15,10 @@ index count rows that readers cannot see, or hide rows that readers see:
 - a file live in both snapshots whose data sequence number changes.
 
 **Security:**
+- Commits are matched to constraints by table UUID, not by the name in the path (ADR 0029).
+  Lakekeeper resolves names ignoring case, so a commit to `DB/ORDERS` reached `db.orders` without
+  validation. Commits to tables without constraints now cost one table load and carry an added
+  `assert-table-uuid` requirement.
 - Request paths with `.` or `..` segments (also as `%2e`) or a `\` are refused (400,
   `UNSUPPORTED_COMMIT_OPERATION`). The gateway routed on the raw path but the forwarded URL resolved
   them, so a commit to a constrained table could reach the catalog without validation (#5).

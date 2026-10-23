@@ -108,8 +108,11 @@ forwarded. Every step is recorded in the transaction log (RFC 0004, `docs/recove
 applied only after the upstream commit succeeds (after the client is answered, still inside the
 domain's queue: [ADR 0022](adr/0022-answer-before-the-index-write.md)), a crash at any point is
 resolved on restart, and a repeated `Idempotency-Key` gets the recorded answer. Decisions use the status mapping of
-[RFC 0003](rfc/0003-http-status-mapping.md). Everything else, including table creation and loads, is
-forwarded unchanged; `/v1/config` is stripped of `uri` overrides and idempotency support.
+[RFC 0003](rfc/0003-http-status-mapping.md). A commit to a table without constraints is matched by
+UUID first (ADR 0029): the table is loaded, a UUID belonging to a constrained table is validated as
+that table, any other is forwarded with an `assert-table-uuid` requirement added. Everything else,
+including table creation and loads, is forwarded unchanged; `/v1/config` is stripped of `uri`
+overrides and idempotency support.
 
 ## Registry, onboarding and rebuild (spec §19, §20, §23)
 

@@ -467,7 +467,7 @@ What this shows:
 | Path | Extra cost | Why |
 |---|---|---|
 | Reading tables | about 0.1 ms per table load; nothing on data | engines read data files from storage directly; the Plane only relays the metadata request |
-| Commits to tables without constraints | about 0.2–0.6 ms | forwarded unchanged |
+| Commits to tables without constraints | about 0.2–0.6 ms plus one table load from the catalog (ADR 0029, not yet re-measured) | forwarded after matching the table's UUID |
 | Commits to constrained tables | about 5–10 ms, plus about 5 µs per changed key | validation, transaction log, index update |
 | Storage reads for validation | the key column chunks of the files a commit adds or removes (1.6 % of a 10 MB file with 1 KB rows) | footer and projected column chunks are read with ranged requests |
 
