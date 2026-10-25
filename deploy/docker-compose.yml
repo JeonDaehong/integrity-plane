@@ -1,7 +1,8 @@
 # Local demo stack (spec §27 DoD 1): S3-compatible object storage, the Iceberg reference REST
 # catalog, and the Plane.
 #
-#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml up -d           # the published Plane image
+#   docker compose -f deploy/docker-compose.yml up -d --build   # the Plane built from this checkout
 #
 # Writers use http://127.0.0.1:8181 as their REST catalog and http://127.0.0.1:9000 as the S3
 # endpoint (path-style, region us-east-1, credentials admin/password). The upstream catalog is published on
@@ -51,6 +52,7 @@ services:
     ports: ["8182:8181"]
 
   plane:
+    image: ghcr.io/jeondaehong/integrity-plane:0.1.0
     build:
       context: ..
     container_name: integrity-plane

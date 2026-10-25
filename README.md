@@ -3,6 +3,10 @@
 Commit-time PRIMARY KEY / UNIQUE / NOT NULL / FOREIGN KEY enforcement for Apache Iceberg tables,
 independent of the writing engine, with verifiable integrity certificates.
 
+Iceberg enforces no keys: two jobs that each MERGE from the same snapshot can both insert key 42,
+and nothing checks references between tables. The Plane sits between writers and the REST catalog
+and refuses such commits before they reach it.
+
 A commit never rescans the table: it is checked against the Plane's own key index ([How it
 works](#how-it-works)).
 
@@ -13,6 +17,22 @@ referenced row are refused before they reach the catalog](demo/demo.gif)
 
 > **Status: pre-alpha (0.1.0), not production-ready.** Do not use this for data you care about.
 > Only what is listed below is implemented, and only within the limits stated in the linked docs.
+
+## Quickstart
+
+Needs Docker and Python 3.10+; nothing to build. Starts S3 storage, the Iceberg reference REST
+catalog and the Plane, then runs the demo above:
+
+```sh
+git clone https://github.com/JeonDaehong/integrity-plane && cd integrity-plane
+docker compose -f deploy/docker-compose.yml up -d
+pip install "pyiceberg[pyarrow]==0.12.0"
+python demo/demo.py "docker exec integrity-plane integrity"
+```
+
+Point any Iceberg client at `http://127.0.0.1:8181` as its REST catalog (S3 endpoint
+`http://127.0.0.1:9000`, path-style, credentials `admin`/`password`) to try your own commits.
+`docker compose -f deploy/docker-compose.yml down -v` removes everything.
 
 ## How it works
 
@@ -158,8 +178,8 @@ cargo build --release -p integrity-server -p integrity-cli
 ./target/release/integrity verify db.customer
 ```
 
-Or the whole stack (S3 storage, Iceberg REST catalog, Plane):
-`docker compose -f deploy/docker-compose.yml up -d --build`.
+Or the whole stack (S3 storage, Iceberg REST catalog, Plane) with the Plane built from this
+checkout: `docker compose -f deploy/docker-compose.yml up -d --build`.
 
 `compat/demo_test.py` runs the full demo of the specification (Appendix A) with Spark in CI, against
 both a local warehouse and the compose stack.
