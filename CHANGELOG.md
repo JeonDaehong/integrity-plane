@@ -1,11 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-10-25
+
+Fourth pre-release. **Pre-alpha, not production-ready.** Integrity and security fixes from an
+internal audit; upgrading from 0.1.0 is recommended.
+
+**Upgrading from 0.1.0:** replace the binary or image; the transaction log, index stores and
+configuration are unchanged. Behaviour that changes:
+- While any constraint is registered, commits to tables without constraints cost one more catalog
+  request and carry an added `assert-table-uuid` requirement (ADR 0029).
+- Partitioned tables with equality delete files are refused (ADR 0030): Flink upsert tables must
+  be unpartitioned.
+- Constraints on columns with an `initial-default` are refused at registration.
 
 **Added:**
 - Flink upsert jobs that change a key twice between checkpoints: tables with both position and
   equality delete files are accepted when a commit changes the deleted positions of its own new
   data files only (ADR 0028).
+- A Quickstart in the README: the compose stack with the published image and `demo/demo.py`,
+  nothing to build; CI runs it as written.
 
 **Fixed (integrity):** three commit shapes whose rows Iceberg reads differently from the Plane
 are refused (ADR 0028). Ordinary writers do not produce them; a crafted commit could have made the
