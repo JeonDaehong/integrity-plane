@@ -52,7 +52,7 @@ services:
     ports: ["8182:8181"]
 
   plane:
-    image: ghcr.io/jeondaehong/integrity-plane:0.1.0
+    image: ghcr.io/jeondaehong/integrity-plane:0.1.1
     build:
       context: ..
     container_name: integrity-plane

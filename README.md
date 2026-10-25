@@ -15,7 +15,7 @@ referenced row are refused before they reach the catalog](demo/demo.gif)
 
 <sub>`demo/demo.py` against `deploy/docker-compose.yml`, recorded with `demo/record.sh`.</sub>
 
-> **Status: pre-alpha (0.1.0), not production-ready.** Do not use this for data you care about.
+> **Status: pre-alpha (0.1.1), not production-ready.** Do not use this for data you care about.
 > Only what is listed below is implemented, and only within the limits stated in the linked docs.
 
 ## Quickstart

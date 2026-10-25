@@ -626,7 +626,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "integrity-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-iceberg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "integrity-core",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-txn"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "integrity-core",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "integrity-types"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "itoa"
