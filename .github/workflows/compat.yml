@@ -119,6 +119,24 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker-compose.yml logs --tail 300 || true
 
+  # README Quickstart, exactly as written: the published image, PyIceberg, demo/demo.py.
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Quickstart
+        run: |
+          docker compose -f deploy/docker-compose.yml up -d
+          pip install "pyiceberg[pyarrow]==0.12.0"
+          python demo/demo.py "docker exec integrity-plane integrity"
+      - name: Logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml logs --tail 300 || true
+
   # Apache Polaris as the upstream catalog: OAuth2 for clients and for the Plane itself, and a
   # catalog prefix. PyIceberg and Spark run the same scenarios as against the reference catalog.
   polaris:
