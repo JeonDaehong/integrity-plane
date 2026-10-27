@@ -5,10 +5,10 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 
 ## Out of scope for 0.1 (by design)
 
-- CHECK constraints, branch-gated publication, picking up constraints from engine DDL: planned
-  for 0.2. Certificates can be signed (RFC 0005). Merge-on-read position deletes and v3 deletion
-  vectors are supported (ADR 0017, ADR 0018).
-- Multi-table atomic commits from clients (`/transactions/commit` is refused): 0.3.
+- CHECK constraints, branch-gated publication, picking up constraints from engine DDL: after 1.0
+  ([`roadmap.md`](roadmap.md)). Certificates can be signed (RFC 0005). Merge-on-read position
+  deletes and v3 deletion vectors are supported (ADR 0017, ADR 0018).
+- Multi-table atomic commits from clients (`/transactions/commit` is refused): after 1.0.
 - Other table formats than Iceberg (ADR 0012); `ON DELETE CASCADE`; per-key locking (ADR 0015).
 
 ## Commits
