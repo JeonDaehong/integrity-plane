@@ -291,9 +291,9 @@ const ED25519_NAME: &[u8] = b"\x13\x0cedwards25519";
 
 /// Signs with an Ed25519 key in a PKCS#11 token (RFC 0009), over one logged-in session.
 pub struct Pkcs11Signer {
-    // Dropped after the session: finalizes the library.
-    session: Mutex<Session>,
-    _context: Pkcs11,
+    // Taken (closed) in `drop`, before the library is finalized.
+    session: Mutex<Option<Session>>,
+    context: Pkcs11,
     key: ObjectHandle,
     public: [u8; 32],
     id: String,
@@ -309,12 +309,35 @@ impl Pkcs11Signer {
     /// Loads the module, logs in to the token labelled `token_label` and finds the Ed25519 key
     /// pair labelled `key_label`. Blocking.
     pub fn open(config: &Pkcs11Config, pin: String) -> Result<Self, String> {
-        let p11 = |e: cryptoki::error::Error| format!("PKCS#11: {e}");
         let context =
             Pkcs11::new(&config.module).map_err(|e| format!("{}: {e}", config.module.display()))?;
         context
             .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .map_err(p11)?;
+            .map_err(|e| format!("PKCS#11: {e}"))?;
+        // cryptoki does not finalize the library when a context is dropped: a failed open must,
+        // or the next C_Initialize in this process fails.
+        match Self::log_in(&context, config, pin) {
+            Ok((session, key, public)) => Ok(Self {
+                session: Mutex::new(Some(session)),
+                context,
+                key,
+                public,
+                id: integrity_core::signature::key_id(&public),
+            }),
+            Err(e) => {
+                let _ = context.finalize();
+                Err(e)
+            }
+        }
+    }
+
+    /// Logs in to the token and finds the key pair: the session, the private key, the public key.
+    fn log_in(
+        context: &Pkcs11,
+        config: &Pkcs11Config,
+        pin: String,
+    ) -> Result<(Session, ObjectHandle, [u8; 32]), String> {
+        let p11 = |e: cryptoki::error::Error| format!("PKCS#11: {e}");
         let mut slot = None;
         for s in context.get_slots_with_token().map_err(p11)? {
             if context.get_token_info(s).map_err(p11)?.label().trim_end() == config.token_label {
@@ -386,13 +409,7 @@ impl Pkcs11Signer {
                 config.key_label
             ));
         }
-        Ok(Self {
-            session: Mutex::new(session),
-            _context: context,
-            key,
-            public,
-            id: integrity_core::signature::key_id(&public),
-        })
+        Ok((session, key, public))
     }
 
     fn sign(&self, cert: &Digest) -> Result<String, String> {
@@ -401,6 +418,8 @@ impl Pkcs11Signer {
             .lock()
             .map_err(|_| "PKCS#11 session lock poisoned".to_owned())?;
         let signature = session
+            .as_ref()
+            .ok_or("PKCS#11 session closed")?
             .sign(
                 &Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Pure)),
                 self.key,
@@ -411,6 +430,17 @@ impl Pkcs11Signer {
             return Err("PKCS#11 returned a signature that is not 64 bytes".into());
         }
         Ok(hex(&signature))
+    }
+}
+
+impl Drop for Pkcs11Signer {
+    fn drop(&mut self) {
+        let session = match self.session.get_mut() {
+            Ok(s) => s.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        drop(session);
+        let _ = self.context.clone().finalize();
     }
 }
 
