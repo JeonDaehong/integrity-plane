@@ -1,0 +1,39 @@
+# Trino and Flink next to the demo stack (#9):
+#
+#   compat/engines/fetch_flink_jars.sh
+#   docker compose -f deploy/docker-compose.yml -f compat/engines/docker-compose.yml up -d --build
+#   python compat/engines/trino_test.py && python compat/engines/flink_test.py
+#
+# Both engines use the Plane (http://plane:8181) as their REST catalog and the S3 gateway directly.
+# Relative paths resolve against deploy/, the directory of the first compose file.
+
+services:
+  trino:
+    image: trinodb/trino:470
+    container_name: trino
+    depends_on: [plane]
+    volumes:
+      - ../compat/engines/trino/gw.properties:/etc/trino/catalog/gw.properties:ro
+
+  flink-jobmanager:
+    image: flink:1.20.3-scala_2.12-java17
+    container_name: flink-jobmanager
+    command: jobmanager
+    depends_on: [plane]
+    environment: &flink-env
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+    volumes: &flink-volumes
+      - ../compat/engines/flink/jars:/opt/flink/lib/iceberg:ro
+      - ../compat/engines/flink/init.sql:/opt/flink/init.sql:ro
+
+  flink-taskmanager:
+    image: flink:1.20.3-scala_2.12-java17
+    container_name: flink-taskmanager
+    command: taskmanager
+    depends_on: [flink-jobmanager]
+    environment: *flink-env
+    volumes: *flink-volumes

@@ -3,3 +3,4 @@
 /compat/iceberg-rust/target
 __pycache__/
 demo/demo.cast
+/compat/engines/flink/jars
