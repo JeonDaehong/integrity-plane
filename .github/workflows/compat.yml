@@ -58,9 +58,9 @@ jobs:
       # The catalog runs as root in its container and creates the table directories, so the
       # clients write data files as root too.
       - name: PyIceberg
-        run: sudo -E env "PATH=$PATH" python compat/pyiceberg_test.py
+        run: sudo env "PATH=$PATH" python compat/pyiceberg_test.py
       - name: Spark
-        run: sudo -E env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/spark_test.py
+        run: sudo env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/spark_test.py
       - name: verify the merge-on-read table
         run: |
           cargo build --release --locked -p integrity-cli
@@ -75,7 +75,7 @@ jobs:
             ./target/release/integrity verify "$t" --require-signatures
           done
       - name: Appendix A demo
-        run: sudo -E env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/demo_test.py
+        run: sudo env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" "INTEGRITY__HA__FENCE=$INTEGRITY__HA__FENCE" python compat/demo_test.py
       - name: Logs
         if: always()
         run: |
@@ -165,10 +165,11 @@ jobs:
           java-version: "17"
       - name: Install clients
         run: pip install "pyiceberg[pyarrow]==0.12.0" "pyspark==3.5.6"
+      # sudo keeps no environment of its own accord: pass what the scripts read.
       - name: PyIceberg
-        run: sudo -E env "PATH=$PATH" python compat/pyiceberg_test.py
+        run: sudo env "PATH=$PATH" "CATALOG_PROPS=$CATALOG_PROPS" python compat/pyiceberg_test.py
       - name: Spark
-        run: sudo -E env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" python compat/spark_test.py
+        run: sudo env "PATH=$PATH" "JAVA_HOME=$JAVA_HOME" "CATALOG_PROPS=$CATALOG_PROPS" python compat/spark_test.py
       - name: verify through the Plane's own credentials
         run: |
           ./target/release/integrity verify pyiceberg.customer
