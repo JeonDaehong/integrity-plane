@@ -201,6 +201,9 @@ fn softhsm_token(module: &str, label: &str, key: &str, pin: &str) {
             ],
         )
         .unwrap();
+    // cryptoki does not finalize on drop; the signer initializes the module again.
+    drop(session);
+    p11.finalize().unwrap();
 }
 
 #[test]
@@ -216,8 +219,14 @@ fn pkcs11_signs_with_a_key_that_stays_in_the_token() {
         key_label: key.into(),
         pin_file: None,
     };
-    assert!(Pkcs11Signer::open(&config("cert-signing"), "9999".into()).is_err());
-    assert!(Pkcs11Signer::open(&config("other"), "1234".into()).is_err());
+    // Each failed open finalizes the module, so the next one fails for its own reason.
+    let wrong_pin = Pkcs11Signer::open(&config("cert-signing"), "9999".into()).unwrap_err();
+    assert!(
+        wrong_pin.contains("PinIncorrect") || wrong_pin.contains("PIN"),
+        "{wrong_pin}"
+    );
+    let wrong_key = Pkcs11Signer::open(&config("other"), "1234".into()).unwrap_err();
+    assert!(wrong_key.contains("no Ed25519"), "{wrong_key}");
 
     let signer = Signer::Pkcs11(std::sync::Arc::new(
         Pkcs11Signer::open(&config("cert-signing"), "1234".into()).unwrap(),
