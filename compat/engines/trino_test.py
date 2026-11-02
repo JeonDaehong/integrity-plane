@@ -27,8 +27,12 @@ def main():
     key_constraints(NS)
 
     expect_ok(run, "INSERT INTO customer VALUES (1, 'alice'), (2, 'bob'), (4, 'dora')")
-    version = query("SELECT summary['integrity.cert-version'] FROM \"customer$snapshots\" "
-                    "ORDER BY committed_at DESC LIMIT 1")
+    snapshots = expect_ok(run, "SELECT snapshot_id, parent_id, operation, "
+                               "element_at(summary, 'integrity.cert-version') "
+                               "FROM \"customer$snapshots\" ORDER BY committed_at")
+    print(snapshots, flush=True)
+    version = query("SELECT element_at(summary, 'integrity.cert-version') "
+                    "FROM \"customer$snapshots\" ORDER BY committed_at DESC LIMIT 1")
     assert version == ["1"], version
     print("ok   insert certified", flush=True)
     expect_ok(run, "INSERT INTO orders VALUES (10, 1)")
@@ -60,7 +64,7 @@ def main():
     rows = query("SELECT customer_id, name FROM customer ORDER BY customer_id")
     assert rows == ["2", "Bob", "4", "Dora", "7", "gus"], rows
     uncertified = query("SELECT count(*) FROM \"customer$snapshots\" "
-                        "WHERE summary['integrity.cert'] IS NULL")
+                        "WHERE element_at(summary, 'integrity.cert') IS NULL")
     assert uncertified == ["0"], uncertified
     print("ok   rows as expected, every snapshot certified", flush=True)
 
