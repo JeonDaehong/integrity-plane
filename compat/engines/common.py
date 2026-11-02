@@ -19,6 +19,15 @@ def sh(*args, stdin=None):
     return out.returncode, (out.stdout or "") + (out.stderr or "")
 
 
+def trino_rows(ns, sql):
+    """A Trino query's result as a flat list of values (stdout only: the CLI warns on stderr)."""
+    out = subprocess.run(["docker", "exec", "trino", "trino", "--catalog", "gw", "--schema", ns,
+                          "--output-format", "TSV", "--execute", sql],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, f"{sql}: {out.stdout}{out.stderr}"
+    return out.stdout.split()
+
+
 def wait_until(what, check, seconds=180):
     deadline = time.time() + seconds
     while time.time() < deadline:

@@ -7,7 +7,8 @@ Each statement runs in its own SQL client session (init: compat/engines/flink/in
 read back through Trino, which shares the catalog.
 """
 
-from common import expect_ok, expect_rejection, integrity, key_constraints, sh, wait_until
+from common import (expect_ok, expect_rejection, integrity, key_constraints, sh, trino_rows,
+                    wait_until)
 
 NS = "flink"
 
@@ -25,10 +26,7 @@ def run(sql):
 
 
 def trino(sql):
-    code, out = sh("docker", "exec", "trino", "trino", "--catalog", "gw", "--schema", NS,
-                   "--output-format", "TSV", "--execute", sql)
-    assert code == 0, f"{sql}: {out}"
-    return out.split()
+    return trino_rows(NS, sql)
 
 
 def main():

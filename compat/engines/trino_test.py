@@ -5,7 +5,8 @@ Run from the repository root after
 Trino writes merge-on-read: DELETE, UPDATE and MERGE commit position delete files.
 """
 
-from common import expect_ok, expect_rejection, integrity, key_constraints, sh, wait_until
+from common import (expect_ok, expect_rejection, integrity, key_constraints, sh, trino_rows,
+                    wait_until)
 
 NS = "trino"
 
@@ -16,7 +17,7 @@ def run(sql):
 
 
 def query(sql):
-    return expect_ok(run, sql).split()
+    return trino_rows(NS, sql)
 
 
 def main():
@@ -27,10 +28,6 @@ def main():
     key_constraints(NS)
 
     expect_ok(run, "INSERT INTO customer VALUES (1, 'alice'), (2, 'bob'), (4, 'dora')")
-    snapshots = expect_ok(run, "SELECT snapshot_id, parent_id, operation, "
-                               "element_at(summary, 'integrity.cert-version') "
-                               "FROM \"customer$snapshots\" ORDER BY committed_at")
-    print(snapshots, flush=True)
     version = query("SELECT element_at(summary, 'integrity.cert-version') "
                     "FROM \"customer$snapshots\" ORDER BY committed_at DESC LIMIT 1")
     assert version == ["1"], version
@@ -63,8 +60,9 @@ def main():
     print("ok   optimize", flush=True)
     rows = query("SELECT customer_id, name FROM customer ORDER BY customer_id")
     assert rows == ["2", "Bob", "4", "Dora", "7", "gus"], rows
+    # The first snapshot is CREATE TABLE's empty one, from before the constraints were registered.
     uncertified = query("SELECT count(*) FROM \"customer$snapshots\" "
-                        "WHERE element_at(summary, 'integrity.cert') IS NULL")
+                        "WHERE parent_id IS NOT NULL AND element_at(summary, 'integrity.cert') IS NULL")
     assert uncertified == ["0"], uncertified
     print("ok   rows as expected, every snapshot certified", flush=True)
 
