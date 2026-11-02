@@ -137,6 +137,28 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker-compose.yml logs --tail 300 || true
 
+  # Trino 470 and Flink 1.20 (#9) on the compose stack, with the Plane built from this checkout.
+  engines:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Start the stack with Trino and Flink
+        run: |
+          compat/engines/fetch_flink_jars.sh
+          docker compose -f deploy/docker-compose.yml -f compat/engines/docker-compose.yml up -d --build
+          for i in $(seq 1 90); do curl -sf http://127.0.0.1:8181/v1/integrity/status && break; sleep 2; done
+      - name: Trino
+        run: python compat/engines/trino_test.py
+      - name: Flink
+        run: python compat/engines/flink_test.py
+      - name: Logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml -f compat/engines/docker-compose.yml logs --tail 300 || true
+
   # Apache Polaris as the upstream catalog: OAuth2 for clients and for the Plane itself, and a
   # catalog prefix. PyIceberg and Spark run the same scenarios as against the reference catalog.
   polaris:
