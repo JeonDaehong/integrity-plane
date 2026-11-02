@@ -113,15 +113,15 @@ Upstream: Iceberg REST fixture 1.10.1 with a filesystem warehouse. The CI job `c
 the Appendix A demo against `deploy/docker-compose.yml`, where the catalog, the Plane and the
 clients use S3 (SeaweedFS's S3 gateway; MinIO no longer publishes container images).
 
-### Trino and Flink (checked by hand, not in CI)
+### Trino and Flink (CI job `engines`)
 
-Run on 2026-10-21 and again on 2026-10-22 against `deploy/docker-compose.yml` (S3, REST fixture
-1.10.1, the Plane at `b74f468`); not part of CI yet (#9).
+Both run in containers next to `deploy/docker-compose.yml` (S3, REST fixture 1.10.1, the Plane
+built from the checkout; `compat/engines/`), with the Plane as their REST catalog.
 
 | Client | Version | Result |
 |---|---|---|
-| Trino (Iceberg connector, REST catalog, native S3) | 470 | All 20 scenarios as expected: `INSERT`, merge-on-read `UPDATE` / `DELETE` / `MERGE`, `optimize`, `expire_snapshots`; INT-003 (within a statement, against the table, `UPDATE` of a key, `MERGE`, `INSERT … SELECT`), INT-007, INT-005, INT-006; one commit attempt per violation; `verify` OK |
-| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028; refused before `b74f468`); INT-003, INT-007, INT-005 rejected after one attempt. `verify` reports snapshots with equality deletes `UNVERIFIABLE` |
+| Trino (Iceberg connector, REST catalog, native S3) | 470 | `INSERT`, merge-on-read `UPDATE` / `DELETE` / `MERGE`, `optimize`, `expire_snapshots` accepted; INT-003 (against the table, within a statement, `INSERT … SELECT`, `UPDATE` of a key, `MERGE`), INT-007, INT-005, INT-006 rejected after one attempt; every snapshot certified; `verify` OK |
+| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028); INT-003 (also in `INSERT OVERWRITE`), INT-007, INT-005 rejected after one attempt; `verify` OK on tables without equality deletes, which it reports `UNVERIFIABLE` |
 
 Both engines report a rejection as `BadRequestException: Malformed request: INT-… ` (their wording
 for HTTP 400); the integrity code and message follow. Trino commits table statistics in a second
