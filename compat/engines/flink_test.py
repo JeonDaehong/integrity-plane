@@ -77,6 +77,18 @@ def main():
     print("ok   upserts, including one key twice in a batch;", eq[0], "equality delete file(s)",
           flush=True)
 
+    # Compaction of the upsert table through the Plane (ADR 0031): Trino rewrites its data files
+    # with the equality deletes applied; readers see the same rows, and upserts go on.
+    before = trino("SELECT id, name FROM ucust ORDER BY id")
+    code, out = sh("docker", "exec", "trino", "trino", "--catalog", "gw", "--schema", NS,
+                   "--execute", "ALTER TABLE ucust EXECUTE optimize")
+    assert code == 0, out
+    assert trino("SELECT id, name FROM ucust ORDER BY id") == before
+    expect_ok(run, "INSERT INTO ucust VALUES (2, 'b2')")
+    rows = trino("SELECT id, name FROM ucust ORDER BY id")
+    assert rows[0::2] == ["1", "2", "3"] and rows[3] == "b2", rows
+    print("ok   optimize of the upsert table, then another upsert", flush=True)
+
     integrity("verify", f"{NS}.customer")
     integrity("verify", f"{NS}.orders")
     print("ok   verify", flush=True)

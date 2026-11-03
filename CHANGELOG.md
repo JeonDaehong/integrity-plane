@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Added:**
+- Tables with equality delete files (Flink upsert and CDC tables) can be compacted through the
+  Plane (ADR 0031): any commit that adds no equality deletes is read with the live ones applied as
+  Iceberg readers apply them (a row is hidden by a delete with a greater data sequence number on
+  the same key), so rewrites with inherited or starting sequence numbers, copy-on-write and
+  merge-on-read deletes, and removing dangling equality delete files are validated with exact
+  rows. Removing an equality delete file that still applies to a live data file is refused. The
+  keys of the deletes that apply are held within `limits.scan_memory`
+  (`VALIDATION_BUDGET_EXCEEDED` beyond it). Onboarding and rebuild read such tables the same way.
+
+**Changed:**
+- A data file whose explicit sequence number is above its snapshot's is refused: later equality
+  deletes would not reach its rows, which the index would no longer hold.
+
 **Security:**
 - Request paths with an encoded `/` or `\` (`%2F`, `%5C`, any case) or with a percent escape the
   Plane cannot decode (`%zz`, a trailing `%`) are refused (400, `UNSUPPORTED_COMMIT_OPERATION`),

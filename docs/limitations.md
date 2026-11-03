@@ -14,13 +14,16 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 ## Commits
 
 - Anything outside the capability matrix in [`compatibility.md`](compatibility.md) is refused with
-  `UNSUPPORTED_COMMIT_OPERATION`, including removing equality delete files, rollbacks of `main` to an existing snapshot,
+  `UNSUPPORTED_COMMIT_OPERATION`, including removing equality delete files that still apply, rollbacks of `main` to an existing snapshot,
   non-Parquet data files and key columns nested in structs.
 - Flink upsert tables (ADR 0009, ADR 0028, ADR 0030): the upsert key must be the table's only
   PK/UNIQUE constraint, no FK may be declared on the table, and the table must be unpartitioned
-  (partitioned equality deletes are refused). They cannot be compacted through the Plane
-  (data files cannot be removed while equality delete files exist), and every commit reads all
-  live position delete files, whose number grows with each checkpoint that repeats a key.
+  (partitioned equality deletes are refused). Commits that rewrite or delete from them
+  (compaction, copy-on-write and merge-on-read deletes, removing dangling equality deletes) read
+  the keys of every live equality delete file newer than the oldest data file they touch and hold
+  them in memory within `limits.scan_memory` (ADR 0031); beyond it they are refused with
+  `VALIDATION_BUDGET_EXCEEDED`. Every commit reads all live position delete files, whose number
+  grows with each checkpoint that repeats a key until the table is compacted.
 - On tables with position deletes, each commit reads all manifests of both snapshots and every live
   position delete file.
 - Files outside a table's location and `write.*.path` properties (imported with `add_files`,
@@ -33,8 +36,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Commit validation streams rows and sorts keys within `limits.scan_memory` (ADR 0019), and a
   commit of one snapshot is then decided, staged, logged and applied in chunks (ADR 0025), so large
   appends and rewrites need scratch disk instead of memory. A commit of several snapshots still
-  holds the keys it changes in memory after sorting them, and one with equality deletes is read
-  whole. `verify` streams each snapshot's rows the same way (one snapshot at a time, each within
+  holds the keys it changes in memory after sorting them, and one that adds equality deletes is
+  read whole. `verify` streams each snapshot's rows the same way (one snapshot at a time, each within
   `limits.scan_memory`, beside any commits validating at the same time).
 - One domain commits about 80 times per second with one writer on the benchmark machine, and about
   25 times per second when 16 writers race on one table (about a third of the same race without
@@ -55,9 +58,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   another warehouse is a different table (another UUID), and its commits are refused as long as a
   constraint names that name.
 - Registering, dropping and rebuilding pause commits in all domains while they run.
-- Tables with equality delete files cannot be onboarded or rebuilt; compact them first. Position
-  deletes are applied; their deleted positions are held in memory during the scan (a few bytes
-  each).
+- Position and equality deletes are applied as readers apply them; deleted positions are held in
+  memory during the scan (a few bytes each), and so are the keys of the table's live equality
+  delete files, which must fit in `limits.scan_memory` (ADR 0031).
 - Onboarding and rebuild run on one thread and read one table at a time; they need scratch disk
   space in the control store for sorted key runs and the new indexes (ADR 0011).
 - Foreign keys that form a cycle between different tables are refused (a self-reference is fine).
@@ -78,7 +81,8 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   one whose certificate was computed correctly for valid data: catching up accepts it, as a commit
   through the Plane would have been. With `[signing] require = true` only snapshots signed with
   this Plane's keys are followed.
-- `verify` cannot recompute snapshots with equality deletes (reported `UNVERIFIABLE`) or chains whose
+- `verify` cannot recompute snapshots that add equality deletes (Flink checkpoints; reported
+  `UNVERIFIABLE`: their key deltas depend on the index at the time) or chains whose
   snapshots have expired, and only verifies back to the latest anchor.
 
 ## Operations
