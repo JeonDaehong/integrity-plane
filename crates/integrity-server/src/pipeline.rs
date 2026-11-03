@@ -628,7 +628,8 @@ impl<'a> Streamed<'a> {
             .validator
             .commit_scan(self.table, self.snapshot)
             .map_err(invalid)?;
-        let deletes = CommitDeletes::read(io, changes).map_err(Failed::Inspect)?;
+        let deletes =
+            CommitDeletes::read(io, changes, self.columns, self.memory).map_err(Failed::Inspect)?;
         let keyed = scan.keyed();
         let replace = self.operation == Operation::Replace;
         let sorters_needed = 2 * keyed.len() + if replace { 2 } else { 0 };

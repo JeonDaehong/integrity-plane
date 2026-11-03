@@ -549,31 +549,38 @@ fn relisting_a_live_file_counts_as_adding_it_again() {
 
 #[test]
 fn equality_delete_files_limit_what_a_commit_may_remove() {
+    // a.parquet and b.parquet have data sequence number 1, eq.parquet (key 3) 2.
     let mut t = parent();
+    t.id_deletes("eq.parquet", &[3]);
     t.manifest("d2.avro", &[(1, 2, "eq.parquet", "PARQUET", 1)]);
-    t.list(
+    t.list_seq(
         "parent-with-deletes.avro",
-        &[("m1.avro", 0), ("d2.avro", 1)],
+        &[("m1.avro", 0, 1), ("d2.avro", 1, 2)],
     );
-    // Removing a data file while equality delete files exist.
-    t.manifest("m2.avro", &[(1, 0, "a.parquet", "PARQUET", 2)]);
-    t.list("drop-b.avro", &[("m2.avro", 0), ("d2.avro", 1)]);
+    // A commit adding equality deletes may not also remove a data file (ADR 0028).
+    t.id_deletes("eq2.parquet", &[1]);
+    t.manifest("d3.avro", &[(1, 2, "eq2.parquet", "PARQUET", 1)]);
+    t.manifest_seq("m2.avro", &[((0, 0, "a.parquet", "PARQUET", 2), Some(1))]);
+    t.list_seq(
+        "drop-b.avro",
+        &[("m2.avro", 0, 3), ("d2.avro", 1, 2), ("d3.avro", 1, 3)],
+    );
     assert!(
         unsupported(t.diff(Some("parent-with-deletes.avro"), "drop-b.avro"))
-            .contains("equality delete files")
+            .contains("adds equality delete files and removes data files")
     );
-    // Removing an equality delete file.
-    t.list("no-deletes.avro", &[("m1.avro", 0)]);
+    // Removing an equality delete file that still applies to a data file (ADR 0031).
+    t.list_seq("no-deletes.avro", &[("m1.avro", 0, 1)]);
     assert!(
         unsupported(t.diff(Some("parent-with-deletes.avro"), "no-deletes.avro"))
-            .contains("removes equality delete files")
+            .contains("eq.parquet, which still applies to a.parquet")
     );
     // Appending to a table with delete files is fine.
     t.data("c.parquet", &[(4, "eu")]);
     t.manifest("m3.avro", &[(1, 0, "c.parquet", "PARQUET", 1)]);
-    t.list(
+    t.list_seq(
         "append.avro",
-        &[("m1.avro", 0), ("d2.avro", 1), ("m3.avro", 0)],
+        &[("m1.avro", 0, 1), ("d2.avro", 1, 2), ("m3.avro", 0, 3)],
     );
     let changes = t
         .diff(Some("parent-with-deletes.avro"), "append.avro")
@@ -814,9 +821,11 @@ fn flink_upsert_twice() -> Table {
             (1, 1, "pos-f.parquet", "PARQUET", 1),
         ],
     );
-    t.list(
+    // Sequence numbers: a.parquet and b.parquet 1, the checkpoint 2.
+    t.list_seq("parent-v2.avro", &[("m1.avro", 0, 1)]);
+    t.list_seq(
         "flink-1.avro",
-        &[("m1.avro", 0), ("m2.avro", 0), ("d1.avro", 1)],
+        &[("m1.avro", 0, 1), ("m2.avro", 0, 2), ("d1.avro", 1, 2)],
     );
     t
 }
@@ -824,7 +833,7 @@ fn flink_upsert_twice() -> Table {
 #[test]
 fn a_key_upserted_twice_in_one_commit_adds_its_last_row() {
     let t = flink_upsert_twice();
-    let changes = t.diff(Some("parent.avro"), "flink-1.avro").unwrap();
+    let changes = t.diff(Some("parent-v2.avro"), "flink-1.avro").unwrap();
     assert_eq!(paths(&changes.added), ["f.parquet"]);
     assert_eq!(paths(&changes.equality_deletes), ["eq-f.parquet"]);
     let rows = t.rows(&changes).unwrap();
@@ -848,14 +857,14 @@ fn later_upserts_to_a_table_with_both_kinds_of_deletes() {
             (1, 1, "pos-g.parquet", "PARQUET", 1),
         ],
     );
-    t.list(
+    t.list_seq(
         "flink-2.avro",
         &[
-            ("m1.avro", 0),
-            ("m2.avro", 0),
-            ("d1.avro", 1),
-            ("m3.avro", 0),
-            ("d2.avro", 1),
+            ("m1.avro", 0, 1),
+            ("m2.avro", 0, 2),
+            ("d1.avro", 1, 2),
+            ("m3.avro", 0, 3),
+            ("d2.avro", 1, 3),
         ],
     );
     let changes = t.diff(Some("flink-1.avro"), "flink-2.avro").unwrap();
@@ -867,13 +876,13 @@ fn later_upserts_to_a_table_with_both_kinds_of_deletes() {
     // A checkpoint with only new keys and no equality deletes reads the same way.
     t.data("h.parquet", &[(7, "eu")]);
     t.manifest("m4.avro", &[(1, 0, "h.parquet", "PARQUET", 1)]);
-    t.list(
+    t.list_seq(
         "flink-3.avro",
         &[
-            ("m1.avro", 0),
-            ("m2.avro", 0),
-            ("d1.avro", 1),
-            ("m4.avro", 0),
+            ("m1.avro", 0, 1),
+            ("m2.avro", 0, 2),
+            ("d1.avro", 1, 2),
+            ("m4.avro", 0, 3),
         ],
     );
     let changes = t.diff(Some("flink-1.avro"), "flink-3.avro").unwrap();
@@ -909,32 +918,61 @@ fn equality_deletes_in_a_table_with_position_deletes() {
 }
 
 #[test]
-fn positions_of_existing_rows_cannot_change_next_to_equality_deletes() {
-    // A row of a.parquet may already be deleted by an equality delete: deleting its position
-    // could remove it twice.
+fn positions_of_existing_rows_change_next_to_equality_deletes() {
+    // ADR 0031: the rows of kept files are read with the equality deletes applied.
     let mut t = flink_upsert_twice();
+    // Deleting the position of a.parquet row 0, (1, eu).
     t.positions("pos-a.parquet", &[("a.parquet", 0)]);
     t.manifest("d2.avro", &[(1, 1, "pos-a.parquet", "PARQUET", 1)]);
-    t.list(
+    t.list_seq(
         "new.avro",
         &[
-            ("m1.avro", 0),
-            ("m2.avro", 0),
-            ("d1.avro", 1),
-            ("d2.avro", 1),
+            ("m1.avro", 0, 1),
+            ("m2.avro", 0, 2),
+            ("d1.avro", 1, 2),
+            ("d2.avro", 1, 3),
         ],
     );
-    let changes = t.diff(Some("flink-1.avro"), "new.avro").unwrap();
-    assert!(unsupported(t.rows(&changes)).contains("change rows of a.parquet"));
+    let rows = t
+        .rows(&t.diff(Some("flink-1.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(ids(&rows.removed), [row(1, "eu")]);
+    assert!(rows.added.is_empty() && rows.equality_deletes.is_none());
 
-    // Undoing a position delete of f.parquet (an existing file now) is refused the same way.
-    t.manifest("d3.avro", &[(1, 2, "eq-f.parquet", "PARQUET", 1)]);
-    t.list(
-        "undo.avro",
-        &[("m1.avro", 0), ("m2.avro", 0), ("d3.avro", 1)],
+    // Undoing the position delete of f.parquet row 0 brings (4, eu) back: eq-f.parquet has the
+    // same sequence number as f.parquet, so it does not apply.
+    t.manifest_seq(
+        "d3.avro",
+        &[((0, 2, "eq-f.parquet", "PARQUET", 1), Some(2))],
     );
-    let changes = t.diff(Some("flink-1.avro"), "undo.avro").unwrap();
-    assert!(unsupported(t.rows(&changes)).contains("change rows of f.parquet"));
+    t.list_seq(
+        "undo.avro",
+        &[("m1.avro", 0, 1), ("m2.avro", 0, 2), ("d3.avro", 1, 3)],
+    );
+    let rows = t
+        .rows(&t.diff(Some("flink-1.avro"), "undo.avro").unwrap())
+        .unwrap();
+    assert_eq!(ids(&rows.added), [row(4, "eu")]);
+    assert!(rows.removed.is_empty());
+
+    // A row an equality delete already hides is not removed again by deleting its position.
+    t.id_deletes("eq-1.parquet", &[1]);
+    t.manifest("d4.avro", &[(1, 2, "eq-1.parquet", "PARQUET", 1)]);
+    let hidden = [
+        ("m1.avro", 0, 1),
+        ("m2.avro", 0, 2),
+        ("d1.avro", 1, 2),
+        ("d4.avro", 1, 3),
+    ];
+    t.list_seq("hidden.avro", &hidden);
+    let mut both = hidden.to_vec();
+    both.push(("d2.avro", 1, 4));
+    t.list_seq("hidden-pos.avro", &both);
+    let changes = t.diff(Some("hidden.avro"), "hidden-pos.avro").unwrap();
+    let rows = t.rows(&changes).unwrap();
+    assert!(rows.added.is_empty() && rows.removed.is_empty());
+    let (s, c) = streamed_sides(&t, "hidden.avro", "hidden-pos.avro");
+    assert_eq!(s, c);
 }
 
 #[test]
@@ -970,22 +1008,42 @@ fn an_older_delete_file_cannot_name_a_new_data_file() {
 }
 
 #[test]
-fn new_data_files_inherit_their_sequence_number_next_to_equality_deletes() {
-    // An older explicit sequence number would put the new rows under the equality deletes.
+fn explicit_sequence_numbers_next_to_equality_deletes() {
+    // A file added with an older sequence number lies under the equality deletes (ADR 0031):
+    // (4, old) is hidden by eq-f.parquet (sequence number 2), (8, eu) is not.
     let mut t = flink_upsert_twice();
-    t.data("old.parquet", &[(8, "eu")]);
-    t.manifest_seq("m3.avro", &[((1, 0, "old.parquet", "PARQUET", 1), Some(1))]);
-    t.list(
-        "new.avro",
-        &[
-            ("m1.avro", 0),
-            ("m2.avro", 0),
-            ("d1.avro", 1),
-            ("m3.avro", 0),
-        ],
+    t.data("old.parquet", &[(4, "old"), (8, "eu")]);
+    t.manifest_seq("m3.avro", &[((1, 0, "old.parquet", "PARQUET", 2), Some(1))]);
+    let base = [("m1.avro", 0, 1), ("m2.avro", 0, 2), ("d1.avro", 1, 2)];
+    let with = |extra: &[(&'static str, i32, i64)]| {
+        let mut l = base.to_vec();
+        l.extend_from_slice(extra);
+        l
+    };
+    t.list_seq("new.avro", &with(&[("m3.avro", 0, 3)]));
+    let rows = t
+        .rows(&t.diff(Some("flink-1.avro"), "new.avro").unwrap())
+        .unwrap();
+    assert_eq!(ids(&rows.added), [row(8, "eu")]);
+    assert!(rows.removed.is_empty());
+
+    // Never above the snapshot's own: later deletes would not reach the file.
+    t.manifest_seq("m4.avro", &[((1, 0, "old.parquet", "PARQUET", 2), Some(9))]);
+    t.list_seq("future.avro", &with(&[("m4.avro", 0, 3)]));
+    assert!(
+        unsupported(t.diff(Some("flink-1.avro"), "future.avro")).contains("above its snapshot's")
+    );
+
+    // Nor in a commit that adds equality deletes (ADR 0028).
+    t.id_deletes("eq-o.parquet", &[9]);
+    t.manifest("d5.avro", &[(1, 2, "eq-o.parquet", "PARQUET", 1)]);
+    t.list_seq(
+        "with-eq.avro",
+        &with(&[("m3.avro", 0, 3), ("d5.avro", 1, 3)]),
     );
     assert!(
-        unsupported(t.diff(Some("flink-1.avro"), "new.avro")).contains("explicit sequence number")
+        unsupported(t.diff(Some("flink-1.avro"), "with-eq.avro"))
+            .contains("explicit sequence number")
     );
 
     // Without equality deletes it does not matter (compaction sets one).
@@ -1318,7 +1376,7 @@ fn streamed_and_collected(t: &Table, list: &str) -> (Rows, Rows) {
         (FieldId(2), LogicalType::String),
     ];
     let mut streamed = Vec::new();
-    let s = for_each_live_batch(&t.io, &changes, &columns, |b| {
+    let s = for_each_live_batch(&t.io, &changes, &columns, usize::MAX, |b| {
         streamed.extend(b.rows().iter().cloned());
         Ok::<_, InspectError>(())
     })
@@ -1376,9 +1434,13 @@ fn streaming_a_whole_table_reads_what_commit_rows_reads() {
 fn streaming_refuses_a_diff_against_a_parent() {
     let t = parent_with_position_delete();
     let changes = t.diff(Some("parent.avro"), "parent-pos.avro").unwrap();
-    let r = for_each_live_batch(&t.io, &changes, &[(FieldId(1), LogicalType::Long)], |_| {
-        Ok::<_, InspectError>(())
-    });
+    let r = for_each_live_batch(
+        &t.io,
+        &changes,
+        &[(FieldId(1), LogicalType::Long)],
+        usize::MAX,
+        |_| Ok::<_, InspectError>(()),
+    );
     assert!(unsupported(r).contains("whole-table"));
 }
 
@@ -1406,7 +1468,7 @@ fn streamed_sides(t: &Table, parent: &str, new: &str) -> (String, String) {
         Err(e) => e.to_string(),
     };
     // Each side read on its own (ADR 0024) gives the same rows in the same order, or fails too.
-    let per_side = CommitDeletes::read(&t.io, &changes).and_then(|deletes| {
+    let per_side = CommitDeletes::read(&t.io, &changes, &columns, usize::MAX).and_then(|deletes| {
         let mut sides = Vec::new();
         for side in [Side::Added, Side::Removed] {
             let mut rows = Vec::new();

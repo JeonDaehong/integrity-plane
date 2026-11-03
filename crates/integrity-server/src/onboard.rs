@@ -152,11 +152,6 @@ impl<'m> Prepared<'m> {
             .ok_or_else(|| unsupported(format!("{ident}: snapshot without manifest list")))?;
         let changes = diff_snapshots(io, None, &list)
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?;
-        if !changes.equality_deletes.is_empty() {
-            return Err(unsupported(format!(
-                "{ident} has equality delete files; compact it before onboarding"
-            )));
-        }
         let binding = &self.bindings[ident];
         let columns = validator
             .projection(&binding.table)
@@ -277,7 +272,7 @@ fn scan_into(
             .iter()
             .map(|(id, _)| (*id, KeySorter::new(store.scratch_dir(), share)))
             .collect();
-        let read = for_each_live_batch(io, &table.changes, &table.columns, |batch| {
+        let read = for_each_live_batch(io, &table.changes, &table.columns, memory, |batch| {
             scan.feed(&batch, |id, key| {
                 sorters
                     .get_mut(&id)
@@ -381,8 +376,10 @@ pub fn scan_in_memory(
         let Some(table) = prepared.table(&io, &validator, ident)? else {
             continue;
         };
-        let rows = commit_rows(&io, table.id, table.head, &table.changes, &table.columns)
+        let mut rows = commit_rows(&io, table.id, table.head, &table.changes, &table.columns)
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?;
+        // The whole table, read with its equality deletes applied (ADR 0031): no keys to delete.
+        rows.equality_deletes = None;
         match validator
             .validate_with_details(&rows, &indexes)
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?

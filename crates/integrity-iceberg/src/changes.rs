@@ -34,13 +34,15 @@ pub enum InspectError {
     Extract(ExtractError),
     /// The change is outside the 0.1 capability matrix.
     Unsupported(String),
+    /// What must be held in memory to read the change exceeds `limits.scan_memory`.
+    TooLarge(String),
 }
 
 impl InspectError {
     /// The integrity code.
     pub fn code(&self) -> ErrorCode {
         match self {
-            InspectError::Read(ReadError::BudgetExceeded { .. }) => {
+            InspectError::Read(ReadError::BudgetExceeded { .. }) | InspectError::TooLarge(_) => {
                 ErrorCode::ValidationBudgetExceeded
             }
             InspectError::Read(ReadError::Io(_)) => ErrorCode::StorageReadFailed,
@@ -58,7 +60,9 @@ impl fmt::Display for InspectError {
             InspectError::Read(e) => write!(f, "{e}"),
             InspectError::Manifest(e) => write!(f, "{e}"),
             InspectError::Extract(e) => write!(f, "{e}"),
-            InspectError::Unsupported(m) => write!(f, "{}: {m}", self.code()),
+            InspectError::Unsupported(m) | InspectError::TooLarge(m) => {
+                write!(f, "{}: {m}", self.code())
+            }
         }
     }
 }
@@ -123,9 +127,15 @@ pub struct PositionDeletes {
     /// Paths of the data files the commit adds: only position delete files the commit adds may
     /// name them (ADR 0028).
     pub added: BTreeSet<String>,
-    /// Either snapshot has equality delete files: then the commit may change the deleted
-    /// positions of added data files only (ADR 0028).
+    /// The commit adds equality delete files: then it may change the deleted positions of added
+    /// data files only (ADR 0028).
     pub equality: bool,
+    /// Live equality delete files of the parent snapshot, applied to the rows read on its side
+    /// (ADR 0031); empty for a commit that adds equality delete files, whose rows need none.
+    pub equality_before: Vec<DataFile>,
+    /// The same for the new snapshot; for a snapshot diffed against no parent, every live one, so
+    /// that the whole table reads as readers read it.
+    pub equality_after: Vec<DataFile>,
     /// Where each live file of the parent snapshot sits, by path: a delete applies to a data file
     /// as Iceberg readers apply it (ADR 0030).
     pub scope_before: BTreeMap<String, Scope>,
@@ -227,10 +237,12 @@ fn live_files(
 
 /// Diffs the new snapshot's manifest list against its parent's (spec §15 data-level rows).
 ///
-/// Delete files (ADR 0008, 0009, 0017, 0028): added equality deletes are returned (one field set,
-/// inherited sequence number) and position deletes are described for [`commit_rows`]. Removed
-/// equality delete files, data files removed or added with an explicit sequence number while
-/// equality delete files exist, and files whose data sequence number changes are unsupported.
+/// Delete files (ADR 0008, 0009, 0017, 0028, 0031): added equality deletes are returned (one field
+/// set, inherited sequence number) and position deletes are described for [`commit_rows`]. A
+/// commit that adds equality deletes may not remove data files, add them with an explicit sequence
+/// number or remove equality deletes. Any other commit to a table with equality deletes is read
+/// with them applied, and may remove an equality delete file only when it applies to no data file
+/// of the new snapshot. Files whose data sequence number changes are unsupported.
 pub fn diff_snapshots(
     io: &impl FileIo,
     parent_list: Option<&str>,
@@ -284,6 +296,7 @@ pub fn diff_snapshots(
     let mut changes = FileChanges::default();
     let mut position_changed = BTreeSet::new();
     let mut explicit_data = None;
+    let mut removed_equality = Vec::new();
     for (path, live) in &after {
         let file = &live.file;
         if unchanged(path, file, &before) {
@@ -321,9 +334,7 @@ pub fn diff_snapshots(
             FileContent::PositionDeletes => {
                 position_changed.insert(path.clone());
             }
-            FileContent::EqualityDeletes => {
-                return Err(unsupported("commit removes equality delete files"));
-            }
+            FileContent::EqualityDeletes => removed_equality.push((path.clone(), live.sequence)),
         }
     }
 
@@ -355,23 +366,93 @@ pub fn diff_snapshots(
     };
     let positions_before = of(&parent_all, FileContent::PositionDeletes);
     let positions_after = of(&new_all, FileContent::PositionDeletes);
-    let equality_live = !of(&parent_all, FileContent::EqualityDeletes).is_empty()
-        || !of(&new_all, FileContent::EqualityDeletes).is_empty();
-    if equality_live {
+    let equality_before = of(&parent_all, FileContent::EqualityDeletes);
+    let equality_after = of(&new_all, FileContent::EqualityDeletes);
+    let equality_live = !equality_before.is_empty() || !equality_after.is_empty();
+    let adds_equality = !changes.equality_deletes.is_empty();
+    // Without a parent there are no older rows, and every row read has the deletes applied.
+    if adds_equality && parent_list.is_some() {
+        // ADR 0009 and 0028: the commit's equality deletes go to the index as keys; nothing else
+        // may change the rows of older files.
         if !changes.removed.is_empty() {
             return Err(unsupported(
-                "commit removes data files from a table with equality delete files",
+                "commit adds equality delete files and removes data files",
+            ));
+        }
+        if !removed_equality.is_empty() {
+            return Err(unsupported(
+                "commit adds equality delete files and removes others",
             ));
         }
         // An older sequence number would expose the file's rows to equality deletes, which the
-        // Plane does not apply to added rows (ADR 0028).
+        // Plane does not apply to the rows of such a commit (ADR 0028).
         if let Some(path) = explicit_data {
             return Err(unsupported(format!(
-                "data file {path} with an explicit sequence number in a table with equality deletes"
+                "data file {path} with an explicit sequence number in a commit adding equality deletes"
             )));
         }
     }
-    if !positions_before.is_empty() || !positions_after.is_empty() {
+    // Later equality deletes must reach every row the index holds (ADR 0009): no data file may
+    // claim a sequence number above its snapshot's, which every manifest the snapshot introduces
+    // carries (ADR 0031).
+    let snapshot_sequence = introduced.iter().filter_map(|m| m.sequence_number).max();
+    if let Some((path, explicit)) = after
+        .iter()
+        .filter(|(_, l)| l.file.content == FileContent::Data)
+        .filter_map(|(p, l)| l.explicit.map(|e| (p, e)))
+        .find(|(_, e)| snapshot_sequence.is_some_and(|s| *e > s))
+    {
+        return Err(unsupported(format!(
+            "data file {path} claims sequence number {explicit}, above its snapshot's"
+        )));
+    }
+    // A removed equality delete must not bring rows back (ADR 0031): no data file of the new
+    // snapshot may be older than it.
+    for (path, sequence) in &removed_equality {
+        let Some(sequence) = sequence else {
+            return Err(unsupported(format!(
+                "removed equality delete file {path} without a data sequence number"
+            )));
+        };
+        if let Some(data) = new_all.iter().find(|(_, l)| {
+            l.file.content == FileContent::Data && l.sequence.is_none_or(|s| s < *sequence)
+        }) {
+            return Err(unsupported(format!(
+                "commit removes equality delete file {path}, which still applies to {}",
+                data.0
+            )));
+        }
+    }
+    // Rows are read with the equality deletes applied (ADR 0031) by every commit that does not
+    // add any, and for a whole table (no parent).
+    let apply_equality = equality_live && (!adds_equality || parent_list.is_none());
+    if apply_equality {
+        // Only global deletes on one field set are applied (ADR 0030, 0031).
+        if let Some(f) = equality_before
+            .iter()
+            .chain(&equality_after)
+            .find(|f| f.partition.is_some())
+        {
+            return Err(unsupported(format!(
+                "partitioned equality delete file {}",
+                f.path
+            )));
+        }
+        let ids = |f: &DataFile| {
+            let mut ids = f.equality_ids.clone().unwrap_or_default();
+            ids.sort_unstable();
+            ids
+        };
+        let mut sets = equality_before.iter().chain(&equality_after).map(ids);
+        if let Some(first) = sets.next()
+            && (first.is_empty() || sets.any(|s| s != first))
+        {
+            return Err(unsupported(
+                "equality delete files without, or with different, equality fields",
+            ));
+        }
+    }
+    if !positions_before.is_empty() || !positions_after.is_empty() || apply_equality {
         if let Some(f) = positions_before
             .iter()
             .chain(&positions_after)
@@ -395,7 +476,17 @@ pub fn diff_snapshots(
             changed: position_changed,
             kept,
             added: changes.added.iter().map(|f| f.path.clone()).collect(),
-            equality: equality_live,
+            equality: adds_equality,
+            equality_before: if apply_equality && parent_list.is_some() {
+                equality_before.clone()
+            } else {
+                Vec::new()
+            },
+            equality_after: if apply_equality {
+                equality_after.clone()
+            } else {
+                Vec::new()
+            },
             scope_before: parent_all
                 .iter()
                 .map(|(p, l)| (p.clone(), l.scope()))
@@ -431,7 +522,12 @@ pub fn diff_snapshots(
             "equality delete files without, or with different, equality fields",
         ));
     }
-    let kept_touched = changes.positions.iter().flat_map(|p| p.kept.values());
+    let kept_touched = changes.positions.iter().flat_map(|p| {
+        p.kept
+            .values()
+            .chain(&p.equality_before)
+            .chain(&p.equality_after)
+    });
     for f in changes
         .added
         .iter()
@@ -535,27 +631,42 @@ pub fn commit_rows(
         });
     };
 
-    // Position deletes (ADR 0017): deleted positions per data file, before and after.
-    let (before, after) = deleted_positions(io, pd)?;
+    // Position deletes (ADR 0017): deleted positions per data file, before and after; and the keys
+    // equality deletes hide (ADR 0031). Unbounded: these rows are all held anyway.
+    let deletes = CommitDeletes::read_any(io, changes, columns, usize::MAX)?;
+    let (before, after) = (&deletes.before, &deletes.after);
     let empty = BTreeSet::new();
-    let live =
-        |file: &DataFile, gone: &BTreeSet<i64>, batch: &mut RowBatch| -> Result<(), InspectError> {
-            let rows = file_rows(file)?;
-            check_positions(file, gone, rows.len())?;
-            for (pos, row) in rows.rows().iter().enumerate() {
-                if !gone.contains(&(pos as i64)) {
-                    push(batch, row)?;
-                }
+    let live = |file: &DataFile,
+                side: Side,
+                gone: &BTreeSet<i64>,
+                batch: &mut RowBatch|
+     -> Result<(), InspectError> {
+        let rows = file_rows(file)?;
+        check_positions(file, gone, rows.len())?;
+        for (pos, row) in rows.rows().iter().enumerate() {
+            if !gone.contains(&(pos as i64)) && !deletes.hides(row, side, &file.path) {
+                push(batch, row)?;
             }
-            Ok(())
-        };
+        }
+        Ok(())
+    };
     let mut added = new_batch();
     let mut removed = new_batch();
     for f in &changes.added {
-        live(f, after.get(&f.path).unwrap_or(&empty), &mut added)?;
+        live(
+            f,
+            Side::Added,
+            after.get(&f.path).unwrap_or(&empty),
+            &mut added,
+        )?;
     }
     for f in &changes.removed {
-        live(f, before.get(&f.path).unwrap_or(&empty), &mut removed)?;
+        live(
+            f,
+            Side::Removed,
+            before.get(&f.path).unwrap_or(&empty),
+            &mut removed,
+        )?;
     }
     // Kept data files whose deleted positions the commit changes.
     for (path, file) in &pd.kept {
@@ -568,10 +679,16 @@ pub fn commit_rows(
         check_positions(file, a, rows.len())?;
         check_positions(file, b, rows.len())?;
         for pos in a.difference(b) {
-            push(&mut removed, &rows.rows()[*pos as usize])?;
+            let row = &rows.rows()[*pos as usize];
+            if !deletes.hides(row, Side::Removed, path) {
+                push(&mut removed, row)?;
+            }
         }
         for pos in b.difference(a) {
-            push(&mut added, &rows.rows()[*pos as usize])?;
+            let row = &rows.rows()[*pos as usize];
+            if !deletes.hides(row, Side::Added, path) {
+                push(&mut added, row)?;
+            }
         }
     }
     Ok(CommitRows {
@@ -584,13 +701,16 @@ pub fn commit_rows(
 }
 
 /// Hands every live row of a whole table to `f`: the rows [`commit_rows`] would put in `added` for
-/// a snapshot diffed against no parent (`diff_snapshots(io, None, list)`), in the same order, a
-/// few thousand at a time. Unlike `commit_rows` it never holds the table: memory is one row group
-/// of key columns plus the table's deleted positions (onboarding and rebuild, ADR 0011).
+/// a snapshot diffed against no parent (`diff_snapshots(io, None, list)`), with its equality
+/// deletes applied (ADR 0031), in the same order, a few thousand at a time. Unlike `commit_rows`
+/// it never holds the table: memory is one row group of key columns, the table's deleted positions
+/// and the keys of its equality deletes, which must fit in `memory` bytes (onboarding and rebuild,
+/// ADR 0011).
 pub fn for_each_live_batch<E: From<InspectError>>(
     io: &impl FileIo,
     changes: &FileChanges,
     columns: &[(FieldId, LogicalType)],
+    memory: usize,
     mut f: impl FnMut(RowBatch) -> Result<(), E>,
 ) -> Result<(), E> {
     if !changes.removed.is_empty()
@@ -603,20 +723,22 @@ pub fn for_each_live_batch<E: From<InspectError>>(
             unsupported("a whole-table scan needs a snapshot diffed against no parent").into(),
         );
     }
-    for_each_commit_batch(io, changes, columns, |_, batch| f(batch))
+    let deletes = CommitDeletes::read_any(io, changes, columns, memory)?;
+    deletes.whole_files(io, changes, columns, Side::Added, &mut f)
 }
 
 /// Hands the rows [`commit_rows`] would read to `f`, side by side, a few thousand at a time and in
 /// the same order within each side, without holding them (ADR 0019): memory is one row group of
-/// key columns plus the deleted positions of both snapshots. Commits with equality deletes are
-/// refused here; they go through `commit_rows`.
+/// key columns plus the deleted positions of both snapshots and the keys of equality deletes that
+/// apply (unbounded here; the Plane reads sides with [`for_each_side_batch`]). Commits that add
+/// equality deletes are refused here; they go through `commit_rows`.
 pub fn for_each_commit_batch<E: From<InspectError>>(
     io: &impl FileIo,
     changes: &FileChanges,
     columns: &[(FieldId, LogicalType)],
     mut f: impl FnMut(Side, RowBatch) -> Result<(), E>,
 ) -> Result<(), E> {
-    let deletes = CommitDeletes::read(io, changes)?;
+    let deletes = CommitDeletes::read(io, changes, columns, usize::MAX)?;
     for side in [Side::Added, Side::Removed] {
         deletes.whole_files(io, changes, columns, side, |batch| f(side, batch))?;
     }
@@ -638,27 +760,78 @@ pub fn for_each_side_batch<E: From<InspectError>>(
 }
 
 /// The deleted positions of a commit's data files before and after it, from its position delete
-/// files (each read once).
+/// files (each read once), and the keys its equality deletes hide (ADR 0031).
 #[derive(Debug, Default)]
 pub struct CommitDeletes {
     before: Deleted,
     after: Deleted,
+    hidden: Option<Hidden>,
 }
 
 impl CommitDeletes {
-    /// Reads the position delete files of both snapshots. Commits with equality deletes are
+    /// Reads the delete files of both snapshots: the positions of position delete files, and the
+    /// keys of the equality delete files that can apply to a data file whose rows are read, held
+    /// in at most `memory` bytes (`TooLarge` otherwise). Commits that add equality deletes are
     /// refused: they go through `commit_rows`.
-    pub fn read(io: &impl FileIo, changes: &FileChanges) -> Result<Self, InspectError> {
+    pub fn read(
+        io: &impl FileIo,
+        changes: &FileChanges,
+        columns: &[(FieldId, LogicalType)],
+        memory: usize,
+    ) -> Result<Self, InspectError> {
         if !changes.equality_deletes.is_empty() {
             return Err(unsupported("equality deletes are read with commit_rows"));
         }
-        Ok(match &changes.positions {
-            None => Self::default(),
-            Some(pd) => {
-                let (before, after) = deleted_positions(io, pd)?;
-                Self { before, after }
-            }
+        Self::read_any(io, changes, columns, memory)
+    }
+
+    /// [`CommitDeletes::read`] for any diff.
+    fn read_any(
+        io: &impl FileIo,
+        changes: &FileChanges,
+        columns: &[(FieldId, LogicalType)],
+        memory: usize,
+    ) -> Result<Self, InspectError> {
+        let Some(pd) = &changes.positions else {
+            return Ok(Self::default());
+        };
+        let (before, after) = deleted_positions(io, pd)?;
+        let hidden = Hidden::read(io, changes, pd, (&before, &after), columns, memory)?;
+        Ok(Self {
+            before,
+            after,
+            hidden,
         })
+    }
+
+    /// Whether equality deletes hide `row` of the data file at `path`, on `side` of the commit.
+    fn hides(&self, row: &[Datum], side: Side, path: &str) -> bool {
+        self.hidden
+            .as_ref()
+            .is_some_and(|h| h.hides(row, side, path))
+    }
+
+    /// `batch` of the data file at `path` without the rows equality deletes hide on `side`.
+    fn visible<E>(
+        &self,
+        batch: RowBatch,
+        side: Side,
+        path: &str,
+        columns: &[(FieldId, LogicalType)],
+    ) -> Result<RowBatch, Failed<E>> {
+        let Some(hidden) = &self.hidden else {
+            return Ok(batch);
+        };
+        if !batch.rows().iter().any(|r| hidden.hides(r, side, path)) {
+            return Ok(batch);
+        }
+        let mut out = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
+        for row in batch.rows() {
+            if !hidden.hides(row, side, path) {
+                push(&mut out, row)?;
+            }
+        }
+        Ok(out)
     }
 
     /// Live rows of the data files the commit adds (`Side::Added`) or removes.
@@ -679,6 +852,7 @@ impl CommitDeletes {
             let gone = gone.get(&file.path).unwrap_or(&empty);
             stream_file(io, file, columns, &[gone], &mut |batch, start| {
                 let live = without(batch, start, gone, columns)?;
+                let live = self.visible(live, side, &file.path, columns)?;
                 if live.is_empty() {
                     Ok(())
                 } else {
@@ -724,12 +898,15 @@ impl CommitDeletes {
                 let mut removed = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
                 let mut added = RowBatch::new(columns.iter().map(|(c, _)| *c).collect());
                 for (row, &p) in batch.rows().iter().zip(at) {
-                    let side = if newly.contains(&(p as i64)) {
-                        &mut removed
+                    let (side, rows) = if newly.contains(&(p as i64)) {
+                        (Side::Removed, &mut removed)
                     } else {
-                        &mut added
+                        (Side::Added, &mut added)
                     };
-                    push(side, row)?;
+                    // A row equality deletes hide is not live on that side (ADR 0031).
+                    if !self.hides(row, side, path) {
+                        push(rows, row)?;
+                    }
                 }
                 if !removed.is_empty() {
                     f(Side::Removed, removed).map_err(Failed::Caller)?;
@@ -968,6 +1145,189 @@ fn deleted_positions(
 
 /// Deleted positions per data file path.
 type Deleted = HashMap<String, BTreeSet<i64>>;
+
+/// Equality delete files read at once: few enough that their rows are not all held together.
+const EQUALITY_FILES_AT_ONCE: usize = 16;
+
+/// The keys equality deletes hide (ADR 0031), as Iceberg readers apply them: a row of a data file
+/// with data sequence number `s` is hidden when its values on the delete's fields equal (NULL
+/// equals NULL) a row of a live equality delete file with a greater one. Only the delete files
+/// that can apply to a data file read are read; per key, the greatest sequence number deleting it
+/// in each snapshot is kept.
+#[derive(Debug)]
+struct Hidden {
+    /// Positions of the delete's fields among the projected columns.
+    at: Vec<usize>,
+    /// Per key, the greatest data sequence number of a delete holding it: in the parent snapshot,
+    /// in the new one.
+    keys: HashMap<Vec<Datum>, (Option<i64>, Option<i64>)>,
+    /// Data sequence numbers of the data files read: removed and kept ones, as in the parent.
+    before: HashMap<String, i64>,
+    /// The same for added and kept data files, as in the new snapshot.
+    after: HashMap<String, i64>,
+}
+
+impl Hidden {
+    fn read(
+        io: &impl FileIo,
+        changes: &FileChanges,
+        pd: &PositionDeletes,
+        (deleted_before, deleted_after): (&Deleted, &Deleted),
+        columns: &[(FieldId, LogicalType)],
+        memory: usize,
+    ) -> Result<Option<Self>, InspectError> {
+        if pd.equality_before.is_empty() && pd.equality_after.is_empty() {
+            return Ok(None);
+        }
+        let sequence = |scope: &BTreeMap<String, Scope>, path: &str| {
+            scope
+                .get(path)
+                .and_then(|s| s.sequence)
+                .ok_or_else(|| unsupported(format!("{path} has no data sequence number")))
+        };
+        // The data files whose rows are read on each side.
+        let kept: Vec<&str> = pd
+            .kept
+            .keys()
+            .filter(|p| deleted_before.get(*p) != deleted_after.get(*p))
+            .map(String::as_str)
+            .collect();
+        let mut before = HashMap::new();
+        for path in changes
+            .removed
+            .iter()
+            .map(|f| f.path.as_str())
+            .chain(kept.iter().copied())
+        {
+            before.insert(path.to_owned(), sequence(&pd.scope_before, path)?);
+        }
+        let mut after = HashMap::new();
+        for path in changes
+            .added
+            .iter()
+            .map(|f| f.path.as_str())
+            .chain(kept.iter().copied())
+        {
+            after.insert(path.to_owned(), sequence(&pd.scope_after, path)?);
+        }
+        // The delete files that can apply to one of them: newer than the oldest.
+        let oldest_before = before.values().min().copied();
+        let oldest_after = after.values().min().copied();
+        let mut files: BTreeMap<&str, (&DataFile, i64, bool, bool)> = BTreeMap::new();
+        for f in &pd.equality_before {
+            let s = sequence(&pd.scope_before, &f.path)?;
+            if oldest_before.is_some_and(|o| s > o) {
+                files.entry(&f.path).or_insert((f, s, false, false)).2 = true;
+            }
+        }
+        for f in &pd.equality_after {
+            let s = sequence(&pd.scope_after, &f.path)?;
+            if oldest_after.is_some_and(|o| s > o) {
+                files.entry(&f.path).or_insert((f, s, false, false)).3 = true;
+            }
+        }
+        let Some((first, ..)) = files.values().next() else {
+            return Ok(None);
+        };
+        // Every file has the same field set (`diff_snapshots`); each is read in this order.
+        let mut fields = first.equality_ids.clone().unwrap_or_default();
+        fields.sort_unstable();
+        let at: Vec<usize> = fields
+            .iter()
+            .map(|&id| {
+                columns
+                    .iter()
+                    .position(|(c, _)| *c == FieldId(id))
+                    .ok_or_else(|| {
+                        unsupported(format!("equality delete on unconstrained field {id}"))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        // Read with the data files' projection and types, so keys compare as data rows do.
+        let typed: Vec<(FieldId, LogicalType)> = at.iter().map(|&i| columns[i].clone()).collect();
+        let mut keys: HashMap<Vec<Datum>, (Option<i64>, Option<i64>)> = HashMap::new();
+        let mut used = 0usize;
+        let files: Vec<_> = files.into_values().collect();
+        for chunk in files.chunks(EQUALITY_FILES_AT_ONCE) {
+            let read = concurrently(chunk, |(f, ..)| -> Result<RowBatch, InspectError> {
+                let rows = extract_rows_from(io, &f.path, &typed)?;
+                if rows.len() as i64 != f.record_count {
+                    return Err(unsupported(format!(
+                        "{} has {} rows but its manifest says {}",
+                        f.path,
+                        rows.len(),
+                        f.record_count
+                    )));
+                }
+                Ok(rows)
+            })?;
+            for (&(_, s, in_before, in_after), rows) in chunk.iter().zip(read) {
+                for row in rows.rows() {
+                    if !keys.contains_key(row.as_slice()) {
+                        used = used.saturating_add(key_bytes(row));
+                        if used > memory {
+                            return Err(InspectError::TooLarge(format!(
+                                "the keys of the equality delete files that apply need more \
+                                 than {memory} bytes (limits.scan_memory)"
+                            )));
+                        }
+                        keys.insert(row.clone(), (None, None));
+                    }
+                    let Some(entry) = keys.get_mut(row.as_slice()) else {
+                        continue;
+                    };
+                    let newer = |m: &mut Option<i64>| *m = Some(m.map_or(s, |m| m.max(s)));
+                    if in_before {
+                        newer(&mut entry.0);
+                    }
+                    if in_after {
+                        newer(&mut entry.1);
+                    }
+                }
+            }
+        }
+        Ok(Some(Self {
+            at,
+            keys,
+            before,
+            after,
+        }))
+    }
+
+    /// Whether `row` (projected) of the data file at `path` is hidden on `side` of the commit.
+    fn hides(&self, row: &[Datum], side: Side, path: &str) -> bool {
+        let sequences = match side {
+            Side::Removed => &self.before,
+            Side::Added => &self.after,
+        };
+        let Some(&s) = sequences.get(path) else {
+            return false;
+        };
+        let key: Vec<Datum> = self.at.iter().map(|&i| row[i].clone()).collect();
+        let newest = match (self.keys.get(key.as_slice()), side) {
+            (Some(&(b, _)), Side::Removed) => b,
+            (Some(&(_, a)), Side::Added) => a,
+            (None, _) => None,
+        };
+        newest.is_some_and(|d| d > s)
+    }
+}
+
+/// Bytes one key of the delete map takes, roughly: its cells, their heap data and the map entry.
+fn key_bytes(row: &[Datum]) -> usize {
+    let heap: usize = row
+        .iter()
+        .map(|d| match d {
+            Datum::Value(integrity_core::KeyValue::String(s)) => s.len(),
+            Datum::Value(integrity_core::KeyValue::Binary(b)) => b.len(),
+            _ => 0,
+        })
+        .sum();
+    std::mem::size_of_val(row)
+        + heap
+        + std::mem::size_of::<(Vec<Datum>, (Option<i64>, Option<i64>))>()
+        + 16
+}
 
 /// Reads a position delete file or deletion vector: deleted positions per data file path.
 fn position_deletes(
