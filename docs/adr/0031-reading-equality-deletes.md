@@ -1,6 +1,6 @@
 # 0031. Reading equality deletes: compaction of Flink upsert tables
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-02
 - Amends: ADR 0008 (removing equality delete files), ADR 0009 (removing data files), ADR 0028
   (rule 1 and rule 3), ADR 0011 (onboarding and rebuild of tables with equality deletes)
@@ -47,6 +47,13 @@ a map from delete tuple to the **largest** sequence number deleting it. A row of
 sequence number `s` is hidden when its tuple maps to a number greater than `s`. The map is held in
 memory within `limits.scan_memory`; a commit whose deletes do not fit is refused with
 `VALIDATION_BUDGET_EXCEEDED` (fail closed; spilling the map to disk is a later change).
+
+Delete tuples and data rows are compared as encoded keys: both are read with the key extraction
+of data files (ADR 0006) against the table's current schema, so a delete file written before a
+type was widened (`int` → `long`) matches the rows it named, and a column of another key family
+is a type mismatch that refuses the commit. NULL equals NULL here, as in ADR 0009 and in Iceberg
+readers' delete sets, but unlike key comparison under the constraints: a delete tuple holding a
+NULL hides the rows with a NULL in the same place, whatever the constraint's NULL rules.
 
 ### Which commits use it
 
