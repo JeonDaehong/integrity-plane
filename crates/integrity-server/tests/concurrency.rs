@@ -123,13 +123,19 @@ impl Client {
     /// One append of `rows` on the table's current head, without retrying: its status and
     /// `Retry-After`.
     async fn append_once(&self, table: &str, rows: &[Row]) -> (u16, Option<String>) {
+        let body = self.append_body(table, rows).await;
+        self.post_commit(table, &body).await
+    }
+
+    /// The commit request of one append of `rows` on the table's current head.
+    async fn append_body(&self, table: &str, rows: &[Row]) -> serde_json::Value {
         let head = self.head(table).await;
         let mut manifests = head
             .map(|h| self.files.manifests_of.lock().unwrap()[&h].clone())
             .unwrap_or_default();
         manifests.push(self.files.manifest(rows));
         let (id, list) = self.files.list(&manifests);
-        let body = json!({
+        json!({
             "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": head}],
             "updates": [
                 {"action": "add-snapshot", "snapshot": {"snapshot-id": id, "parent-snapshot-id": head,
@@ -137,11 +143,15 @@ impl Client {
                     "summary": {"operation": "append"}}},
                 {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": id, "type": "branch"}
             ]
-        });
+        })
+    }
+
+    /// Sends a commit request: its status and `Retry-After`.
+    async fn post_commit(&self, table: &str, body: &serde_json::Value) -> (u16, Option<String>) {
         let r = self
             .http
             .post(format!("{}/v1/namespaces/db/tables/{table}", self.gateway))
-            .json(&body)
+            .json(body)
             .send()
             .await
             .unwrap();
@@ -659,14 +669,20 @@ async fn each_client_commits_at_its_rate() {
     )
     .await;
     let client = &env.client;
-    assert_eq!(client.append_once("a", &[(1, None)]).await, (200, None));
-    assert_eq!(
-        client.append_once("a", &[(2, None)]).await,
-        (429, Some("1".to_owned()))
+    // Both requests are built first and sent together, so that they reach the Plane well within
+    // one second of each other however long the admitted commit takes (slow CI runners).
+    let first = client.append_body("a", &[(1, None)]).await;
+    let second = client.append_body("a", &[(2, None)]).await;
+    let (r1, r2) = tokio::join!(
+        client.post_commit("a", &first),
+        client.post_commit("a", &second)
     );
+    let mut statuses = [r1, r2];
+    statuses.sort();
+    assert_eq!(statuses, [(200, None), (429, Some("1".to_owned()))]);
     // Tables without constraints are forwarded unchanged and not counted.
     assert_eq!(client.append_once("free", &[(1, None)]).await.0, 200);
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(client.append_once("a", &[(2, None)]).await, (200, None));
+    assert_eq!(client.append_once("a", &[(3, None)]).await, (200, None));
     assert_eq!(env.upstream.lock().unwrap().history.len(), 3);
 }
