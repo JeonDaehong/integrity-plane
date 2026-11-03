@@ -48,6 +48,9 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
 - Tables are named `ns1.ns2.table`, so a namespace level or table name containing `.` is
   ambiguous: such tables cannot be constrained reliably (a commit that resolves to another table
   than the registered one is refused, never forwarded unchecked).
+- Request paths with `.` or `..` segments, `\`, an encoded `/` or `\` (`%2F`, `%5C`) or a percent
+  escape that cannot be decoded are refused for every route, so namespaces and tables whose names
+  contain `/` or `\` cannot be used through the Plane, not even read.
 - Constraints name tables without the catalog prefix (warehouse): a table of the same name in
   another warehouse is a different table (another UUID), and its commits are refused as long as a
   constraint names that name.
