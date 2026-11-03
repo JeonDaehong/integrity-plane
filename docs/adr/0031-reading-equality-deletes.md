@@ -83,13 +83,23 @@ removing data files refused. Flink never removes files in the commit that adds i
 
 ADR 0028 rule 3 (no explicit sequence numbers on added data files) and rule 1 (only added data files
 change positions) no longer apply to the commits above, whose rows are exact. Rules 2 and 4 stay.
+An explicit sequence number may still not exceed the snapshot's own (the largest sequence number
+of the manifests the snapshot lists), in any commit: a later equality delete applies only to files
+older than it, so a file numbered above its snapshot would keep rows that the index, following
+ADR 0009, no longer holds.
 
 ### Onboarding, rebuild and verify
 
-They use the same live rows, so tables with equality delete files can be onboarded and rebuilt,
-and `verify` recomputes their snapshots instead of reporting them `UNVERIFIABLE`. Their memory
-bound is the same map: a table whose live equality deletes do not fit in `limits.scan_memory` is
-refused for onboarding and rebuild, and its snapshots stay `UNVERIFIABLE`.
+They use the same live rows, so tables with equality delete files can be onboarded and rebuilt
+(a snapshot diffed against no parent is read with every live equality delete applied), and
+`verify` recomputes the snapshots of such tables that add no equality deletes (compactions and the
+other commits above) instead of reporting them `UNVERIFIABLE`. Their memory bound is the same map:
+a table whose live equality deletes do not fit in `limits.scan_memory` is refused for onboarding
+and rebuild.
+
+Snapshots that add equality deletes (every Flink checkpoint) stay `UNVERIFIABLE`: their key delta
+names the keys the index held when they committed, which only a scan of the parent snapshot's
+live rows could recompute. That is a separate change.
 
 This is not a change to constraint semantics, key encoding, certificates, the transaction log or
 status mapping (no RFC): it derives the same `CommitRows` the validator already checks, for commits

@@ -13,14 +13,17 @@
 | `delete` dropping whole files | Supported | Phase 6 |
 | Several new snapshots on `main` in one commit | Supported; each validated in order | Phase 6 (classification, diff) |
 | Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) and the delete file is unpartitioned (global, ADR 0030) | Phase 6 |
-| Equality deletes on other fields, with explicit sequence numbers, mixed with data-file removal, or partitioned | Rejected | Phase 6, ADR 0030 |
+| Equality deletes on other fields, with explicit sequence numbers, partitioned, or in a commit that also removes data files or equality delete files | Rejected | Phase 6, ADR 0030 |
 | Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017), applied as readers apply them: same partition spec and tuple, sequence number, `referenced_data_file` (ADR 0030) | Yes |
 | Compaction of a merge-on-read table (applying, rewriting or dropping position delete files) | Supported if live rows are unchanged | Yes (ADR 0017) |
 | Deletion vectors (v3, Puffin) | Supported, as position deletes (ADR 0018); a vector replaces the position delete files of its data file, two vectors for one file are rejected (ADR 0030) | Yes |
 | Position and equality deletes in one table (Flink upsert repeating a key in one checkpoint) | Supported when the commit changes the deleted positions of its own new data files only | Yes (ADR 0028) |
-| Position deletes changing rows of existing data files in a table with equality deletes; added data files with explicit sequence numbers there | Rejected | Rejected (ADR 0028) |
+| In a commit that adds equality deletes: position deletes changing rows of existing data files, data files with explicit sequence numbers | Rejected | Rejected (ADR 0028) |
+| Any other commit to a table with equality deletes: compaction (inherited or starting sequence numbers), copy-on-write and merge-on-read changes | Supported; rows are read with the equality deletes applied as readers apply them, their keys held within `limits.scan_memory` | Yes (ADR 0031) |
+| A data file whose explicit sequence number is above its snapshot's | Rejected | Rejected (ADR 0031) |
 | A position delete file from an earlier snapshot naming a data file the commit adds; a file whose data sequence number changes | Rejected | Rejected (ADR 0028) |
-| Removing equality delete files; removing data files while equality delete files exist | Rejected | Rejected (ADR 0008) |
+| Removing an equality delete file that applies to no live data file (dangling) | Supported | Yes (ADR 0031) |
+| Removing an equality delete file that still applies to a live data file | Rejected | Rejected (ADR 0031) |
 | Schema change touching a constrained field | Rejected unless `int→long`, decimal precision widening (and `float→double` for NOT NULL columns) | Phase 6 |
 | Schema/property changes not touching constrained fields | Pass-through | Phase 6 |
 | `remove-snapshots`, properties, sort order, partition spec | Pass-through | Phase 6 |
@@ -121,7 +124,7 @@ built from the checkout; `compat/engines/`), with the Plane as their REST catalo
 | Client | Version | Result |
 |---|---|---|
 | Trino (Iceberg connector, REST catalog, native S3) | 470 | `INSERT`, merge-on-read `UPDATE` / `DELETE` / `MERGE`, `optimize`, `expire_snapshots` accepted; INT-003 (against the table, within a statement, `INSERT … SELECT`, `UPDATE` of a key, `MERGE`), INT-007, INT-005, INT-006 rejected after one attempt; every snapshot certified; `verify` OK |
-| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028); INT-003 (also in `INSERT OVERWRITE`), INT-007, INT-005 rejected after one attempt; `verify` OK on tables without equality deletes, which it reports `UNVERIFIABLE` |
+| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028); INT-003 (also in `INSERT OVERWRITE`), INT-007, INT-005 rejected after one attempt; `verify` OK on tables without equality deletes; on upsert tables it reports the checkpoints (snapshots adding equality deletes) `UNVERIFIABLE` |
 
 Both engines report a rejection as `BadRequestException: Malformed request: INT-… ` (their wording
 for HTTP 400); the integrity code and message follow. Trino commits table statistics in a second
