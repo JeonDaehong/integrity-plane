@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**Security:**
+- Request paths with an encoded `/` or `\` (`%2F`, `%5C`, any case) or with a percent escape the
+  Plane cannot decode (`%zz`, a trailing `%`) are refused (400, `UNSUPPORTED_COMMIT_OPERATION`),
+  alongside the dot segments refused in 0.1.1. `route()` percent-decodes the namespace and table
+  segments, so such a path routed as a commit to a table named literally `x/../orders` — which has
+  no constraints — and was forwarded as is, leaving it to the catalog and the HTTP stack in front
+  of it whether it then resolved to another table (#6). `%1F`, the namespace separator, is
+  unaffected.
+
 ## 0.1.1 — 2026-10-25
 
 Fourth pre-release. **Pre-alpha, not production-ready.** Integrity and security fixes from an

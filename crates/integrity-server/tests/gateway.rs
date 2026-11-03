@@ -518,6 +518,11 @@ async fn dot_segments_cannot_route_around_validation() {
         format!("{TABLE_PATH}\\..\\orders"),
         "/v1/namespaces/db/tables/x/../orders".to_owned(),
         "/v1/transactions/commit/x/..".to_owned(),
+        "/v1/namespaces/db/tables/x%2F..%2Forders".to_owned(),
+        "/v1/namespaces/db/tables/x%5C..%5Corders".to_owned(),
+        "/v1/namespaces/db%2Forders/tables/x".to_owned(),
+        "/v1/namespaces/db/tables/orders%zz".to_owned(),
+        "/v1/namespaces/db/tables/orders%".to_owned(),
     ] {
         let status = h.post_raw(&path, &bad).await;
         assert_eq!(status, 400, "{path}");
