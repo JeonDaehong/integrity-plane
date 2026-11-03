@@ -150,11 +150,19 @@ pub enum Route {
 }
 
 /// True if forwarding `path` could reach another resource than the one it routes as: the upstream
-/// URL is parsed per WHATWG, which resolves `.`/`..` segments (also as `%2e`) and reads `\` as `/`.
+/// URL is parsed per WHATWG, which resolves `.`/`..` segments (also as `%2e`) and reads `\` as `/`;
+/// an encoded separator (`%2F`, `%5C`) is part of a name to `route()` but one the catalog and the
+/// stack in front of it may decode; and an escape `decode()` cannot read is a name the Plane cannot
+/// match against its constraints. `%1F`, which separates the levels of a namespace, stays allowed:
+/// `encode()` escapes `%` itself, so a legitimate path never carries the sequences refused here.
 pub fn ambiguous_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
     path.contains('\\')
-        || path.split('/').any(|seg| {
-            let seg = seg.to_ascii_lowercase().replace("%2e", ".");
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || decode(path).is_none()
+        || lower.split('/').any(|seg| {
+            let seg = seg.replace("%2e", ".");
             seg == "." || seg == ".."
         })
 }
@@ -824,7 +832,8 @@ impl Gateway {
         if ambiguous_path(path) {
             return ApiError::new(
                 ErrorCode::UnsupportedCommitOperation,
-                "request path with `.` or `..` segments or `\\`",
+                "request path with `.` or `..` segments, `\\`, an encoded `/` or `\\`, \
+                 or a percent escape that cannot be decoded",
             )
             .into_response();
         }
@@ -2116,6 +2125,14 @@ mod tests {
             "/v1/namespaces/db/tables/orders/.",
             "/v1/./namespaces/db/tables/orders",
             "/v1/namespaces/db/tables/x\\..\\orders",
+            "/v1/namespaces/db/tables/x%2F..%2Forders",
+            "/v1/namespaces/db/tables/x%2forders",
+            "/v1/namespaces/db%2Fx/tables/orders",
+            "/v1/namespaces/db/tables/x%5Corders",
+            "/v1/namespaces/db/tables/x%5corders",
+            "/v1/namespaces/db/tables/%zz",
+            "/v1/namespaces/db/tables/orders%",
+            "/v1/namespaces/db/tables/orders%2",
         ] {
             assert!(ambiguous_path(p), "{p}");
         }
@@ -2125,6 +2142,11 @@ mod tests {
             "/v1/namespaces/db/tables/...",
             "/v1/namespaces/db/tables/%2e%2e%2e",
             "/v1/namespaces/db/tables/orders/",
+            // `%1F` separates the levels of a namespace, and `%25` a `%` in a name: both stay.
+            "/v1/namespaces/a%1Fb/tables/t",
+            "/v1/namespaces/a%1fb/tables/t",
+            "/v1/namespaces/db/tables/a%20b",
+            "/v1/namespaces/db/tables/x%252Forders",
         ] {
             assert!(!ambiguous_path(p), "{p}");
         }
