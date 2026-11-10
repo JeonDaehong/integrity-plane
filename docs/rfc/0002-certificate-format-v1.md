@@ -74,7 +74,8 @@ change           = len:u32 ‖ encoded_key ‖ delta:i64
 
 Entries are sorted by constraint id; changes by encoded key bytes (RFC 0001 order); zero changes are
 omitted. `delta` is the net count change (added − removed) of that key in that constraint. It can be
-recomputed from the snapshot's added and removed data files alone.
+recomputed from the snapshot's added and removed data files alone, or, for a snapshot that adds
+equality deletes, from them and the keys live in its parent snapshot (ADR 0033).
 
 ### Snapshot summary fields
 

@@ -19,6 +19,11 @@
   live file. Partitioned equality deletes are applied per partition when reading (compaction,
   onboarding). Domains onboarded before this change need a rebuild before their first partitioned
   equality delete; the registry's table anchors gain `partitions_checked`.
+- `verify` recomputes snapshots that add equality deletes (Flink checkpoints), which it reported
+  `UNVERIFIABLE` (ADR 0033): it scans the table once at the snapshot before the first of them into a
+  scratch index of its keys, then validates every later snapshot against it in order, as the
+  gateway did, moving it with what the data changes. A forged, swapped or stale certificate on a
+  checkpoint is now reported `MISMATCH`, a checkpoint written around the Plane `MISSING`.
 
 **Changed:**
 - A data file whose explicit sequence number is above its snapshot's is refused: later equality

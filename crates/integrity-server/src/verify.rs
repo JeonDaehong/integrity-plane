@@ -14,15 +14,19 @@ use integrity_core::{
     CertificateInput, Digest, SUMMARY_CONSTRAINT_SET_VERSION, certificate, constraint_set_digest,
     parse_table_uuid,
 };
+use integrity_iceberg::metadata::{MAIN, SnapshotRef};
 use integrity_iceberg::snapshot_certificate;
-use integrity_iceberg::{Budgeted, FileIo, Operation, TableMetadata, diff_snapshots_with};
-use integrity_types::{ConstraintSetVersion, SnapshotId};
-use integrity_validator::Validator;
+use integrity_iceberg::{
+    Budgeted, FileChanges, FileIo, Operation, TableMetadata, commit_rows, diff_snapshots_with,
+};
+use integrity_index::{IndexEpoch, KeyIndex, Overlay, PersistentIndex, PersistentStore};
+use integrity_types::{ConstraintId, ConstraintSetVersion, SnapshotId};
+use integrity_validator::{Decision, Validator};
 use serde::Serialize;
 
 use crate::config::ConstraintConfig;
 use crate::pipeline::Streamed;
-use crate::registry;
+use crate::{onboard, registry};
 
 /// The verdict on one snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,7 +42,7 @@ pub enum LinkStatus {
     Mismatch,
     /// A certificate field that cannot be parsed, or a constraint set version the Plane never had.
     Malformed,
-    /// Valid Iceberg the verifier cannot recompute in 0.1 (e.g. equality deletes).
+    /// Valid Iceberg the verifier cannot recompute (an expired parent, an unreadable file).
     Unverifiable,
 }
 
@@ -196,9 +200,222 @@ fn resolve_version(input: &Input, v: u64) -> Result<Version, String> {
     })
 }
 
+/// The replay index of ADR 0033: the table's own PK/UNIQUE indexes, in a scratch index store
+/// deleted when dropped, as of snapshot `at`, built by an onboarding scan of one snapshot and
+/// moved by validating each later snapshot against it.
+struct Replay {
+    path: PathBuf,
+    store: Option<PersistentStore>,
+    indexes: BTreeMap<ConstraintId, PersistentIndex>,
+    validator: Validator,
+    /// The constraint set version it was built for.
+    version: u64,
+    /// The snapshot whose keys it holds (`None`: before the first snapshot).
+    at: Option<i64>,
+}
+
+impl Drop for Replay {
+    fn drop(&mut self) {
+        self.indexes.clear();
+        if let Some(store) = self.store.take() {
+            let scratch = store.scratch_dir().to_path_buf();
+            drop(store);
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl Replay {
+    /// Scans the table at snapshot `at` into a new replay index for constraint set version `v`.
+    /// Only the table's own constraints are replayed: equality deletes are accepted on tables
+    /// without a foreign key (ADR 0009), and FKs referencing the table only decide commits.
+    fn build(
+        io: &(dyn FileIo + Send + Sync),
+        input: &Input,
+        v: u64,
+        at: Option<i64>,
+    ) -> Result<Self, String> {
+        let configs = input
+            .history
+            .get(&v)
+            .ok_or_else(|| format!("constraint set version {v} is unknown"))?;
+        let own: Vec<ConstraintConfig> = configs
+            .iter()
+            .filter(|c| c.table == input.identifier)
+            .cloned()
+            .collect();
+        if own.iter().any(|c| c.references.is_some()) {
+            return Err(
+                "equality deletes on a table with a foreign key cannot be replayed (ADR 0009)"
+                    .into(),
+            );
+        }
+        // The table as of `at`.
+        let mut meta = input.meta.clone();
+        meta.current_snapshot_id = at;
+        match at {
+            Some(id) => {
+                meta.refs.insert(
+                    MAIN.to_owned(),
+                    SnapshotRef {
+                        snapshot_id: id,
+                        ref_type: "branch".into(),
+                    },
+                );
+            }
+            None => {
+                meta.refs.remove(MAIN);
+            }
+        }
+        std::fs::create_dir_all(&input.scratch).map_err(|e| e.to_string())?;
+        let path = input.scratch.join(format!(
+            "verify-replay-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let store = PersistentStore::open(&path).map_err(|e| format!("replay index: {e}"))?;
+        let mut replay = Self {
+            path,
+            store: None,
+            indexes: BTreeMap::new(),
+            validator: Validator::new(Vec::new()),
+            version: v,
+            at,
+        };
+        let members = [onboard::Member {
+            identifier: input.identifier.clone(),
+            meta: meta.clone(),
+        }];
+        let scanned = onboard::scan(io, &store, input.memory, &own, &members, true);
+        replay.store = Some(store);
+        let store = replay.store.as_ref().ok_or("replay index")?;
+        match scanned.map_err(|e| format!("replay index: {}", e.message))? {
+            onboard::ScanOutcome::Clean(builds) => {
+                store
+                    .install(builds, &[])
+                    .map_err(|e| format!("replay index: {e}"))?;
+            }
+            onboard::ScanOutcome::Violations(_) => {
+                return Err(format!(
+                    "snapshot {} violates the constraint set, which certified snapshots follow",
+                    at.map_or_else(|| "(none)".to_owned(), |a| a.to_string())
+                ));
+            }
+        }
+        let binding = registry::bind(&own, &input.identifier, &meta).map_err(|e| e.message)?;
+        let bindings = BTreeMap::from([(input.identifier.clone(), binding)]);
+        let resolved = registry::resolve(&own, &bindings).map_err(|e| e.message)?;
+        let mut indexes = BTreeMap::new();
+        for rc in &resolved {
+            if let Some(kind) = rc.index_kind() {
+                let index = store
+                    .index(rc.constraint.id, kind)
+                    .map_err(|e| format!("replay index: {e}"))?;
+                indexes.insert(rc.constraint.id, index);
+            }
+        }
+        replay.indexes = indexes;
+        replay.validator = Validator::new(resolved);
+        Ok(replay)
+    }
+
+    /// Validates the snapshot's changes against the replay index as the gateway validated them,
+    /// moves the index past it, and returns its key delta digest. A rejection means a certified
+    /// snapshot whose data violates the constraints: `MISMATCH`.
+    fn step(
+        &mut self,
+        io: &impl FileIo,
+        changes: &FileChanges,
+        version: &Version,
+        snapshot: SnapshotId,
+        input: &Input,
+    ) -> Result<Digest, (LinkStatus, String)> {
+        let unverifiable = |e: String| (LinkStatus::Unverifiable, e);
+        let overlays: BTreeMap<ConstraintId, Overlay> = self
+            .indexes
+            .iter()
+            .map(|(id, index)| (*id, Overlay::new(index as &dyn KeyIndex)))
+            .collect();
+        let decided = if changes.equality_deletes.is_empty() {
+            let streamed = Streamed {
+                validator: &self.validator,
+                table: &version.table,
+                snapshot,
+                operation: Operation::Overwrite,
+                columns: &version.columns,
+                scratch: &input.scratch,
+                memory: input.memory,
+            };
+            streamed
+                .validate(io, changes, &overlays)
+                .map_err(|e| unverifiable(e.message))?
+                .0
+        } else {
+            let rows = commit_rows(
+                io,
+                version.table.clone(),
+                snapshot,
+                changes,
+                &version.columns,
+            )
+            .map_err(|e| unverifiable(e.to_string()))?;
+            self.validator
+                .validate_with_details(&rows, &overlays)
+                .map_err(|e| unverifiable(e.to_string()))?
+        };
+        let validated = match decided {
+            (Decision::Accepted(validated), _) => validated,
+            (Decision::Rejected(violations), _) => {
+                let codes: Vec<String> = violations.iter().map(|v| format!("{v:?}")).collect();
+                return Err((
+                    LinkStatus::Mismatch,
+                    format!(
+                        "the data of this certified snapshot violates the constraints: {}",
+                        codes.join(", ")
+                    ),
+                ));
+            }
+        };
+        let digest = validated
+            .key_delta_digest()
+            .map_err(|e| unverifiable(e.to_string()))?;
+        for (id, staged) in validated
+            .stage(&overlays)
+            .map_err(|e| unverifiable(e.to_string()))?
+        {
+            overlays[&id]
+                .apply(staged, IndexEpoch(0))
+                .map_err(|e| unverifiable(e.to_string()))?;
+        }
+        let mut writes = Vec::new();
+        for (id, overlay) in overlays {
+            writes.push((
+                id,
+                overlay
+                    .into_staged()
+                    .map_err(|e| unverifiable(e.to_string()))?,
+            ));
+        }
+        for (id, staged) in writes {
+            let index = &self.indexes[&id];
+            let next = index.epoch().map_err(|e| unverifiable(e.to_string()))?.0 + 1;
+            index
+                .apply(staged, IndexEpoch(next))
+                .map_err(|e| unverifiable(e.to_string()))?;
+        }
+        Ok(digest)
+    }
+}
+
 /// Verifies the chain of `main`.
 pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
+    let raw = io;
     let io = Budgeted::new(io, u64::MAX);
+    // Key counts of the table's unique keys as of the last snapshot replayed (ADR 0033).
+    let mut replay: Option<Replay> = None;
     let meta = &input.meta;
     let head = meta.main_snapshot_id().map(|s| s.0);
 
@@ -306,31 +523,60 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
             .parent_snapshot_id
             .and_then(|p| meta.snapshot(SnapshotId(p)))
             .and_then(|p| p.manifest_list.clone());
-        let recomputed = (|| -> Result<Digest, String> {
+        let recomputed = (|| -> Result<Digest, (LinkStatus, String)> {
+            let unverifiable = |e: String| (LinkStatus::Unverifiable, e);
             let list = snap
                 .manifest_list
                 .as_deref()
-                .ok_or("snapshot without manifest list")?;
+                .ok_or_else(|| unverifiable("snapshot without manifest list".into()))?;
             let changes =
                 diff_snapshots_with(&io, parent_list.as_deref(), list, &meta.partitioning(true))
-                    .map_err(|e| e.to_string())?;
-            if !changes.equality_deletes.is_empty() {
-                return Err("key deltas of equality deletes depend on index state".into());
+                    .map_err(|e| unverifiable(e.to_string()))?;
+            // The replay index follows the chain from where it was built (ADR 0033): it is used
+            // for every later snapshot of the same constraint set version, and built at the first
+            // snapshot adding equality deletes it cannot follow to.
+            let follows = replay
+                .as_ref()
+                .is_some_and(|r| r.version == v && r.at == snap.parent_snapshot_id);
+            if !follows {
+                replay = None;
             }
-            let streamed = Streamed {
-                validator: &version.validator,
-                table: &version.table,
-                snapshot: SnapshotId(id),
-                operation: Operation::Overwrite,
-                columns: &version.columns,
-                scratch: &input.scratch,
-                memory: input.memory,
+            if !follows && !changes.equality_deletes.is_empty() {
+                replay = Some(
+                    Replay::build(raw, input, v, snap.parent_snapshot_id).map_err(unverifiable)?,
+                );
+            }
+            let key_delta = match replay.as_mut() {
+                Some(r) => {
+                    let stepped = r.step(&io, &changes, version, SnapshotId(id), input);
+                    match stepped {
+                        Ok(delta) => {
+                            r.at = Some(id);
+                            delta
+                        }
+                        Err(e) => {
+                            replay = None;
+                            return Err(e);
+                        }
+                    }
+                }
+                None => {
+                    let streamed = Streamed {
+                        validator: &version.validator,
+                        table: &version.table,
+                        snapshot: SnapshotId(id),
+                        operation: Operation::Overwrite,
+                        columns: &version.columns,
+                        scratch: &input.scratch,
+                        memory: input.memory,
+                    };
+                    streamed
+                        .key_delta_digest(&io, &changes)
+                        .map_err(|e| unverifiable(e.message))?
+                        .map_err(|e| unverifiable(e.to_string()))?
+                }
             };
-            let key_delta = streamed
-                .key_delta_digest(&io, &changes)
-                .map_err(|e| e.message)?
-                .map_err(|e| e.to_string())?;
-            let uuid = uuid.map_err(|e| e.to_string())?;
+            let uuid = uuid.map_err(|e| unverifiable(e.to_string()))?;
             Ok(certificate(&CertificateInput {
                 table_uuid: uuid,
                 snapshot: SnapshotId(id),
@@ -348,7 +594,7 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                     "certificate does not match the data, the constraint set or the parent".into(),
                 ),
             ),
-            Err(e) => link(LinkStatus::Unverifiable, Some(e)),
+            Err((status, e)) => link(status, Some(e)),
         };
         let sig = signature_status(input, SnapshotId(id), &cert);
         l.signature = Some(sig);
