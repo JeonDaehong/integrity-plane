@@ -22,7 +22,8 @@ use integrity_core::{
 };
 use integrity_iceberg::{
     Budgeted, CommitDeletes, FileChanges, FileIo, InspectError, MainChange, NewSnapshot, Operation,
-    TableMetadata, check_operation, check_sides, commit_rows, diff_snapshots, for_each_side_batch,
+    TableMetadata, check_operation, check_sides, commit_rows, diff_snapshots_with,
+    for_each_side_batch,
 };
 use integrity_index::{
     IndexEpoch, IndexError, KeyIndex, KeySorter, Overlay, PersistentIndex, PersistentStore, Run,
@@ -117,6 +118,8 @@ pub struct Job {
     pub memory: usize,
     /// Locations readable besides the table's own (RFC 0013).
     pub allowed: Vec<String>,
+    /// The table's anchor says every live data file lies in its partition (ADR 0032).
+    pub partitions_checked: bool,
 }
 
 /// What a validation read (metrics `integrity_bytes_read_total`, `integrity_keys_validated_total`).
@@ -229,8 +232,14 @@ fn run_with<'a>(
         } else {
             previous_list.clone()
         };
-        let changes = diff_snapshots(io, parent_list.as_deref(), &step.manifest_list)
-            .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+        let partitioning = job.meta.partitioning(job.partitions_checked);
+        let changes = diff_snapshots_with(
+            io,
+            parent_list.as_deref(),
+            &step.manifest_list,
+            &partitioning,
+        )
+        .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
         let streamed = Streamed {
             validator: &job.validator,
             table: &job.table,

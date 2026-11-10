@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use integrity_core::{EncodedKey, LogicalType, Violation};
 use integrity_iceberg::{
-    Budgeted, FileChanges, FileIo, InspectError, TableMetadata, commit_rows, diff_snapshots,
+    Budgeted, FileChanges, FileIo, InspectError, TableMetadata, commit_rows, diff_snapshots_with,
     for_each_live_batch,
 };
 use integrity_index::{
@@ -150,7 +150,8 @@ impl<'m> Prepared<'m> {
             .snapshot(head)
             .and_then(|s| s.manifest_list.clone())
             .ok_or_else(|| unsupported(format!("{ident}: snapshot without manifest list")))?;
-        let changes = diff_snapshots(io, None, &list)
+        // A whole table: every live data file is checked against its partition (ADR 0032).
+        let changes = diff_snapshots_with(io, None, &list, &member.meta.partitioning(true))
             .map_err(|e| ApiError::new(e.code(), format!("{ident}: {e}")))?;
         let binding = &self.bindings[ident];
         let columns = validator

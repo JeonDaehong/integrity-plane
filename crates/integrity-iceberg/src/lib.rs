@@ -6,6 +6,7 @@
 //! - [`manifest`] / [`changes`]: manifest diff of a new `main` snapshot and the rows it adds and
 //!   removes (§15 data-level rows).
 //! - [`extract_rows`]: key-column extraction from Parquet data files.
+//! - [`partition`]: partition specs and transforms (ADR 0032).
 //! - [`certify`]: certificates in snapshot summaries (RFC 0002).
 //! - [`io`]: file access with the inline validation budget.
 
@@ -18,12 +19,14 @@ pub mod manifest;
 pub mod metadata;
 mod parquet_keys;
 pub mod parquet_pages;
+pub mod partition;
 pub mod request;
 
 pub use certify::{inject_certificate, inject_signature, snapshot_certificate, snapshot_signature};
 pub use changes::{
     CommitDeletes, FileChanges, InspectError, PositionDeletes, check_operation, check_sides,
-    commit_rows, diff_snapshots, for_each_commit_batch, for_each_live_batch, for_each_side_batch,
+    commit_rows, diff_snapshots, diff_snapshots_with, for_each_commit_batch, for_each_live_batch,
+    for_each_side_batch,
 };
 pub use classify::{
     Classification, MainChange, NewSnapshot, Operation, Rejection, check_requirements, classify,
@@ -36,4 +39,5 @@ pub use parquet_keys::{
     ExtractError, extract_rows, extract_rows_from, for_each_batch_from, for_each_batch_where,
     for_each_selected,
 };
+pub use partition::{PartValue, PartitionField, Partitioning, Transform};
 pub use request::{CommitRequest, MalformedRequest, Requirement, Update};

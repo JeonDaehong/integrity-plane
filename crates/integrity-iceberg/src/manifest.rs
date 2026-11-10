@@ -8,6 +8,8 @@ use std::fmt;
 use apache_avro::types::Value;
 use bytes::Bytes;
 
+use crate::partition::PartValue;
+
 /// What a manifest tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestContent {
@@ -83,6 +85,8 @@ pub struct DataFile {
     /// The partition tuple, as a canonical string for equality checks (delete scope, ADR 0030);
     /// `None` when unpartitioned (no fields) or absent.
     pub partition: Option<String>,
+    /// The same tuple as values, in spec field order, for the partition check (ADR 0032).
+    pub partition_values: Option<Vec<PartValue>>,
 }
 
 /// A manifest entry.
@@ -236,6 +240,15 @@ pub fn read_manifest(bytes: &Bytes) -> Result<Vec<ManifestEntry>, ManifestError>
                         Some(Value::Record(fields)) if fields.is_empty() => None,
                         Some(Value::Record(fields)) => Some(format!("{fields:?}")),
                         Some(other) => return Err(err(format!("partition {other:?}"))),
+                    },
+                    partition_values: match get(df, "partition") {
+                        Some(Value::Record(fields)) if !fields.is_empty() => Some(
+                            fields
+                                .iter()
+                                .map(|(_, v)| PartValue::from_avro(v))
+                                .collect(),
+                        ),
+                        _ => None,
                     },
                 },
             })

@@ -89,6 +89,32 @@ def main():
     assert rows[0::2] == ["1", "2", "3"] and rows[3] == "b2", rows
     print("ok   optimize of the upsert table, then another upsert", flush=True)
 
+    # Partitioned upsert table (ADR 0032): partitioned by a key column, so every key's rows lie in
+    # the partition of its equality deletes, which the Plane checks row by row.
+    expect_ok(run, "CREATE TABLE pcust (id BIGINT, region STRING, name STRING, "
+                   "PRIMARY KEY (id, region) NOT ENFORCED) PARTITIONED BY (region) "
+                   "WITH ('format-version' = '2', 'write.upsert.enabled' = 'true')")
+    integrity("constraints", "add", "--table", f"{NS}.pcust", "--name", "pk_pcust",
+              "--type", "primary_key", "--columns", "id,region")
+    expect_ok(run, "INSERT INTO pcust VALUES (1, 'eu', 'a'), (2, 'us', 'b'), (3, 'eu', 'c')")
+    expect_ok(run, "INSERT INTO pcust VALUES (1, 'eu', 'a2'), (2, 'us', 'b2'), (2, 'us', 'b3')")
+    rows = trino("SELECT id, region, name FROM pcust ORDER BY id")
+    assert rows == ["1", "eu", "a2", "2", "us", "b3", "3", "eu", "c"], rows
+    eq = trino("SELECT count(*) FROM \"pcust$files\" WHERE content = 2")
+    assert int(eq[0]) > 0, "expected equality delete files"
+    # Another engine writing an existing key is refused; compaction keeps the rows.
+    code, out = sh("docker", "exec", "trino", "trino", "--catalog", "gw", "--schema", NS,
+                   "--execute", "INSERT INTO pcust VALUES (3, 'eu', 'dup')")
+    assert code != 0 and "INT-003" in out, out
+    code, out = sh("docker", "exec", "trino", "trino", "--catalog", "gw", "--schema", NS,
+                   "--execute", "ALTER TABLE pcust EXECUTE optimize")
+    assert code == 0, out
+    assert trino("SELECT id, region, name FROM pcust ORDER BY id") == rows
+    expect_ok(run, "INSERT INTO pcust VALUES (3, 'eu', 'c2')")
+    assert trino("SELECT name FROM pcust WHERE id = 3") == ["c2"]
+    print("ok   partitioned upsert table: upserts, a duplicate refused, optimize, upsert",
+          flush=True)
+
     integrity("verify", f"{NS}.customer")
     integrity("verify", f"{NS}.orders")
     print("ok   verify", flush=True)

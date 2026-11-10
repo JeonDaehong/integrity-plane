@@ -48,6 +48,9 @@ pub struct TableMetadata {
     /// Default partition spec id.
     #[serde(default)]
     pub default_spec_id: Option<i64>,
+    /// Partition specs (v2+; v1 tables with a single `partition-spec` have none here).
+    #[serde(default)]
+    pub partition_specs: Vec<PartitionSpec>,
     /// Default sort order id.
     #[serde(default)]
     pub default_sort_order_id: Option<i64>,
@@ -86,6 +89,28 @@ pub struct NestedField {
     /// v3 default for rows written before the field existed.
     #[serde(default)]
     pub initial_default: Option<Value>,
+}
+
+/// A partition spec.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartitionSpec {
+    /// Spec id.
+    pub spec_id: i64,
+    /// Partition fields, in tuple order.
+    #[serde(default)]
+    pub fields: Vec<PartitionSpecField>,
+}
+
+/// A partition field.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartitionSpecField {
+    /// The source column (v3 `source-ids` with several sources is not supported).
+    #[serde(default)]
+    pub source_id: Option<i32>,
+    /// Transform name.
+    pub transform: String,
 }
 
 /// A snapshot.
@@ -139,6 +164,30 @@ impl TableMetadata {
     /// A snapshot by id.
     pub fn snapshot(&self, id: SnapshotId) -> Option<&Snapshot> {
         self.snapshots.iter().find(|s| s.snapshot_id == id.0)
+    }
+
+    /// The partition specs as the partition check reads them (ADR 0032), with `checked`
+    /// from the table's anchor. A field without exactly one source, or with a transform the Plane
+    /// does not compute, has no transform.
+    pub fn partitioning(&self, checked: bool) -> crate::Partitioning {
+        let specs = self
+            .partition_specs
+            .iter()
+            .map(|s| {
+                let fields = s
+                    .fields
+                    .iter()
+                    .map(|f| crate::PartitionField {
+                        source: FieldId(f.source_id.unwrap_or(-1)),
+                        transform: f
+                            .source_id
+                            .and_then(|_| crate::Transform::parse(&f.transform)),
+                    })
+                    .collect();
+                (s.spec_id, fields)
+            })
+            .collect();
+        crate::Partitioning { specs, checked }
     }
 
     /// The current schema.

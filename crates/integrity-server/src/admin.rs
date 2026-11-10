@@ -353,6 +353,8 @@ impl Gateway {
                     table_uuid: uuid.clone(),
                     snapshot: *snapshot,
                     version: d.version(ident),
+                    // The scan checked every live data file (ADR 0032).
+                    partitions_checked: true,
                 };
                 d.set_anchor(ident, anchor);
                 d.degraded.remove(ident);
@@ -452,6 +454,8 @@ impl Gateway {
                     table_uuid: uuid.clone(),
                     snapshot: *snapshot,
                     version: d.version(ident),
+                    // The scan checked every live data file (ADR 0032).
+                    partitions_checked: true,
                 };
                 d.set_anchor(ident, anchor);
                 d.degraded.remove(ident);

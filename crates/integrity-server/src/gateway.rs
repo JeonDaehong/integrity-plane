@@ -1269,6 +1269,8 @@ impl Gateway {
                             table_uuid: uuid.clone(),
                             snapshot: None,
                             version: d.version(identifier),
+                            // No data file yet (ADR 0032).
+                            partitions_checked: true,
                         };
                         d.set_anchor(identifier, anchor);
                         Ok::<_, StoreError>(d.clone())
@@ -1529,6 +1531,10 @@ impl Gateway {
         let binding_columns = bindings[&identifier].columns.clone();
         let version = ConstraintSetVersion(doc.version(&identifier));
         let anchor = doc.anchors.get(&identifier).and_then(|a| a.snapshot);
+        let partitions_checked = doc
+            .anchors
+            .get(&identifier)
+            .is_some_and(|a| a.partitions_checked);
 
         let constrained = validator.projection(&table_id).into_iter().collect();
         let change = match classify(&meta, &request, &constrained).map_err(rejection)? {
@@ -1663,6 +1669,7 @@ impl Gateway {
             scratch: self.store.scratch_dir().to_path_buf(),
             memory: self.scan_memory,
             allowed: self.allowed_locations.clone(),
+            partitions_checked,
         };
         let stats = Arc::clone(&job.stats);
         let validating = Instant::now();

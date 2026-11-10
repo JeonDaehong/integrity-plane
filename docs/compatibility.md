@@ -12,8 +12,9 @@
 | `replace` (compaction, manifest rewrite) | Supported only if projected rows are unchanged | Phase 6 |
 | `delete` dropping whole files | Supported | Phase 6 |
 | Several new snapshots on `main` in one commit | Supported; each validated in order | Phase 6 (classification, diff) |
-| Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) and the delete file is unpartitioned (global, ADR 0030) | Phase 6 |
-| Equality deletes on other fields, with explicit sequence numbers, partitioned, or in a commit that also removes data files or equality delete files | Rejected | Phase 6, ADR 0030 |
+| Equality deletes on exactly a PK/UNIQUE key | Supported when no other constraint needs the deleted rows (ADR 0009) and the delete file is unpartitioned (global, ADR 0030), or partitioned by a spec computed from the key that every live data file shares, every row and delete tuple checked against its partition (ADR 0032) | Phase 6 |
+| Equality deletes on other fields, with explicit sequence numbers, partitioned by a spec not computed from the key or next to data files of another spec, or in a commit that also removes data files or equality delete files | Rejected | Phase 6, ADR 0030, ADR 0032 |
+| Data files whose rows lie outside the partition their manifest entry names (for a spec the Plane computes from constrained columns) | Rejected | ADR 0032 |
 | Position deletes (merge-on-read `DELETE` / `UPDATE` / `MERGE`) | Supported; rows removed = live rows the deletes newly hide (ADR 0017), applied as readers apply them: same partition spec and tuple, sequence number, `referenced_data_file` (ADR 0030) | Yes |
 | Compaction of a merge-on-read table (applying, rewriting or dropping position delete files) | Supported if live rows are unchanged | Yes (ADR 0017) |
 | Deletion vectors (v3, Puffin) | Supported, as position deletes (ADR 0018); a vector replaces the position delete files of its data file, two vectors for one file are rejected (ADR 0030) | Yes |

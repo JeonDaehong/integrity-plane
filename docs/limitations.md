@@ -17,8 +17,13 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   `UNSUPPORTED_COMMIT_OPERATION`, including removing equality delete files that still apply, rollbacks of `main` to an existing snapshot,
   non-Parquet data files and key columns nested in structs.
 - Flink upsert tables (ADR 0009, ADR 0028, ADR 0030): the upsert key must be the table's only
-  PK/UNIQUE constraint, no FK may be declared on the table, and the table must be unpartitioned
-  (partitioned equality deletes are refused). Commits that rewrite or delete from them
+  PK/UNIQUE constraint and no FK may be declared on the table. A partitioned table's checkpoints
+  are accepted only when its partition spec is computed from the key (`identity`, `bucket`,
+  `truncate`, `year`/`month`/`day`/`hour` of key columns; not `bucket` of `timestamp_ns`) and every
+  live data file has that spec (ADR 0032): after partition evolution, checkpoints are refused until
+  the files of the old spec are rewritten. The Plane checks that every row of every added data
+  file lies in the partition its manifest entry names; domains onboarded before ADR 0032 need a
+  rebuild before their first partitioned equality delete. Commits that rewrite or delete from them
   (compaction, copy-on-write and merge-on-read deletes, removing dangling equality deletes) read
   the keys of every live equality delete file newer than the oldest data file they touch and hold
   them in memory within `limits.scan_memory` (ADR 0031); beyond it they are refused with
