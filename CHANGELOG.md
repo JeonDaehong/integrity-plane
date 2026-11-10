@@ -11,10 +11,21 @@
   rows. Removing an equality delete file that still applies to a live data file is refused. The
   keys of the deletes that apply are held within `limits.scan_memory`
   (`VALIDATION_BUDGET_EXCEEDED` beyond it). Onboarding and rebuild read such tables the same way.
+- Partitioned Flink upsert tables (ADR 0032): checkpoints with partitioned equality deletes are
+  accepted when the partition spec is computed from the upsert key (`identity`, `bucket`,
+  `truncate` and time transforms of key columns, computed by the Plane as the Iceberg spec defines
+  them) and every live data file has that spec. Every row of an added data file, and every delete
+  tuple, must lie in the partition its manifest entry names; onboarding and rebuild check every
+  live file. Partitioned equality deletes are applied per partition when reading (compaction,
+  onboarding). Domains onboarded before this change need a rebuild before their first partitioned
+  equality delete; the registry's table anchors gain `partitions_checked`.
 
 **Changed:**
 - A data file whose explicit sequence number is above its snapshot's is refused: later equality
   deletes would not reach its rows, which the index would no longer hold.
+- A data file of a partitioned table whose rows do not lie in the partition its manifest entry
+  names is refused, when the spec's source columns are constrained columns and its transforms are
+  ones the Plane computes (ADR 0032).
 
 **Security:**
 - Request paths with an encoded `/` or `\` (`%2F`, `%5C`, any case) or with a percent escape the

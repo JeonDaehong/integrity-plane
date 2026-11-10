@@ -72,6 +72,8 @@ impl Gateway {
                         table_uuid: b.meta.table_uuid.to_lowercase(),
                         snapshot: None,
                         version: d.version(&b.identifier),
+                        // Its whole history was followed, every added file checked (ADR 0032).
+                        partitions_checked: true,
                     };
                     d.set_anchor(&b.identifier, anchor);
                     Ok::<_, crate::store::StoreError>(d.clone())
@@ -423,6 +425,12 @@ impl Gateway {
             scratch: self.store.scratch_dir().to_path_buf(),
             memory: self.scan_memory,
             allowed: self.allowed_locations.clone(),
+            // A table first seen here is followed from its first snapshot (ADR 0032).
+            partitions_checked: b.fresh
+                || doc
+                    .anchors
+                    .get(&b.identifier)
+                    .is_some_and(|a| a.partitions_checked),
         };
         let outcome = tokio::task::spawn_blocking(move || pipeline::run(&job))
             .await

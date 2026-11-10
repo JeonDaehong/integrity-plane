@@ -26,6 +26,12 @@ pub struct Anchor {
     pub snapshot: Option<i64>,
     /// Constraint set version at that moment.
     pub version: u64,
+    /// Every live data file of the table lies in the partition its manifest entry names, as far
+    /// as the Plane computes its spec's transforms (ADR 0032): true for anchors set by onboarding,
+    /// rebuild or on an empty table, kept by every validated commit; false in anchors written
+    /// before ADR 0032.
+    #[serde(default)]
+    pub partitions_checked: bool,
 }
 
 /// The registry document.
@@ -515,5 +521,18 @@ mod tests {
         bytes[last] ^= 1;
         assert!(decode(&bytes).is_err());
         assert!(decode(&bytes[..10]).is_err());
+    }
+
+    #[test]
+    fn anchors_written_before_adr_0032_have_unchecked_partitions() {
+        let old: Anchor =
+            serde_json::from_str(r#"{"table_uuid": "u", "snapshot": 7, "version": 2}"#).unwrap();
+        assert!(!old.partitions_checked);
+        let new = Anchor {
+            partitions_checked: true,
+            ..old
+        };
+        let back: Anchor = serde_json::from_slice(&serde_json::to_vec(&new).unwrap()).unwrap();
+        assert!(back.partitions_checked);
     }
 }

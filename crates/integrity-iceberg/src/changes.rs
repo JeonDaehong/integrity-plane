@@ -22,6 +22,7 @@ use crate::manifest::{
     read_manifest, read_manifest_list,
 };
 use crate::parquet_keys::{ExtractError, extract_rows_from};
+use crate::partition::{Partitioning, Transform, check_row};
 
 /// Why a main change could not be turned into rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +107,13 @@ pub struct FileChanges {
     pub equality_deletes: Vec<DataFile>,
     /// Position deletes, when either snapshot has any (ADR 0017).
     pub positions: Option<PositionDeletes>,
+    /// The table's partition specs (ADR 0032); unknown for [`diff_snapshots`].
+    pub partitioning: Partitioning,
+    /// Partition spec ids of the added data files and equality delete files, by path: their rows
+    /// are checked against their partition tuples (ADR 0032).
+    pub specs: BTreeMap<String, Option<i64>>,
+    /// The snapshot was diffed against no parent (a whole table).
+    pub whole_table: bool,
 }
 
 /// The position delete files of both snapshots and the data files they may refer to (ADR 0017).
@@ -248,6 +256,21 @@ pub fn diff_snapshots(
     parent_list: Option<&str>,
     new_list: &str,
 ) -> Result<FileChanges, InspectError> {
+    diff_snapshots_with(io, parent_list, new_list, &Partitioning::unknown())
+}
+
+/// [`diff_snapshots`] knowing the table's partition specs (ADR 0032): partitioned equality deletes
+/// are applied when reading, and accepted in a commit that adds them when the table's anchor says
+/// every live data file was checked, every live data file of the parent and every added equality
+/// delete share one key-determined spec, and every delete tuple lies in its file's partition
+/// ([`commit_rows`] checks the last two with the column types). Rows of added data files of a spec
+/// the Plane computes are checked against their partition tuples when read.
+pub fn diff_snapshots_with(
+    io: &impl FileIo,
+    parent_list: Option<&str>,
+    new_list: &str,
+    partitioning: &Partitioning,
+) -> Result<FileChanges, InspectError> {
     let mut lists = concurrently(&[parent_list, Some(new_list)], |l| manifests(io, *l))?;
     let new = lists.pop().unwrap_or_default();
     let parent = lists.pop().unwrap_or_default();
@@ -293,7 +316,11 @@ pub fn diff_snapshots(
         other.get(path).is_some_and(|l| l.file == *file)
     };
 
-    let mut changes = FileChanges::default();
+    let mut changes = FileChanges {
+        partitioning: partitioning.clone(),
+        whole_table: parent_list.is_none(),
+        ..FileChanges::default()
+    };
     let mut position_changed = BTreeSet::new();
     let mut explicit_data = None;
     let mut removed_equality = Vec::new();
@@ -307,6 +334,7 @@ pub fn diff_snapshots(
                 if live.explicit.is_some() && explicit_data.is_none() {
                     explicit_data = Some(path.clone());
                 }
+                changes.specs.insert(path.clone(), live.spec);
                 changes.added.push(file.clone());
             }
             FileContent::EqualityDeletes => {
@@ -317,6 +345,7 @@ pub fn diff_snapshots(
                         "equality delete file with an explicit sequence number",
                     ));
                 }
+                changes.specs.insert(path.clone(), live.spec);
                 changes.equality_deletes.push(file.clone());
             }
             FileContent::PositionDeletes => {
@@ -338,6 +367,19 @@ pub fn diff_snapshots(
         }
     }
 
+    // A file of a spec the metadata lacks could not be checked against its partition, and would
+    // count as checked once the spec is known (ADR 0032).
+    if !partitioning.specs.is_empty()
+        && let Some((path, spec)) = changes
+            .specs
+            .iter()
+            .find(|(_, s)| s.is_some_and(|s| !partitioning.specs.contains_key(&s)))
+    {
+        return Err(unsupported(format!(
+            "{path} has partition spec {}, which the table metadata does not define",
+            spec.unwrap_or_default()
+        )));
+    }
     let (parent_all, new_all) = if any_deletes {
         (
             live_files(&read, &parent.iter().collect::<Vec<_>>())?,
@@ -427,14 +469,18 @@ pub fn diff_snapshots(
     // add any, and for a whole table (no parent).
     let apply_equality = equality_live && (!adds_equality || parent_list.is_none());
     if apply_equality {
-        // Only global deletes on one field set are applied (ADR 0030, 0031).
+        // Deletes on one field set are applied, global ones and those of a known partitioned
+        // spec (ADR 0030, 0031, 0032).
+        let spec_of = |live: &Live, f: &DataFile| live.get(&f.path).and_then(|l| l.spec);
         if let Some(f) = equality_before
             .iter()
-            .chain(&equality_after)
-            .find(|f| f.partition.is_some())
+            .map(|f| (f, spec_of(&parent_all, f)))
+            .chain(equality_after.iter().map(|f| (f, spec_of(&new_all, f))))
+            .find(|(f, spec)| f.partition.is_some() && !partitioning.partitioned(*spec))
+            .map(|(f, _)| f)
         {
             return Err(unsupported(format!(
-                "partitioned equality delete file {}",
+                "partitioned equality delete file {} of an unknown or void partition spec",
                 f.path
             )));
         }
@@ -498,17 +544,43 @@ pub fn diff_snapshots(
         });
     }
     // A partitioned equality delete reaches only data files of its partition; the Plane removes
-    // keys from the index as if it reached every file, which it can prove only for a global one
-    // (an unpartitioned spec) (ADR 0030).
-    if let Some(f) = changes
-        .equality_deletes
-        .iter()
-        .find(|f| f.partition.is_some())
+    // keys from the index as if it reached every row of the key, which holds when every live row
+    // lies in the partition its key determines (ADR 0030, 0032).
+    if parent_list.is_some()
+        && let Some(f) = changes
+            .equality_deletes
+            .iter()
+            .find(|f| f.partition.is_some())
     {
-        return Err(unsupported(format!(
-            "partitioned equality delete file {}",
-            f.path
-        )));
+        if !partitioning.checked {
+            return Err(unsupported(format!(
+                "partitioned equality delete file {}: the Plane has not checked the partitions of \
+                 this table's existing data files; rebuild its domain (ADR 0032)",
+                f.path
+            )));
+        }
+        let specs: BTreeSet<Option<i64>> = changes
+            .equality_deletes
+            .iter()
+            .map(|f| changes.specs.get(&f.path).copied().flatten())
+            .collect();
+        let spec = match specs.iter().collect::<Vec<_>>().as_slice() {
+            [Some(spec)] if partitioning.partitioned(Some(*spec)) => *spec,
+            _ => {
+                return Err(unsupported(
+                    "equality delete files of several, unknown or void partition specs",
+                ));
+            }
+        };
+        if let Some((path, _)) = parent_all
+            .iter()
+            .find(|(_, l)| l.file.content == FileContent::Data && l.spec != Some(spec))
+        {
+            return Err(unsupported(format!(
+                "partitioned equality deletes of spec {spec} next to data file {path} of another \
+                 spec, which they do not reach (ADR 0032)"
+            )));
+        }
     }
     let mut field_sets = changes.equality_deletes.iter().map(|f| {
         let mut ids = f.equality_ids.clone().unwrap_or_default();
@@ -542,6 +614,46 @@ pub fn diff_snapshots(
     Ok(changes)
 }
 
+impl FileChanges {
+    /// The partition fields to check the rows of `file` against, when the commit adds it and the
+    /// Plane computes its spec from `columns` (ADR 0032).
+    fn partition_check(
+        &self,
+        file: &DataFile,
+        columns: &[(FieldId, LogicalType)],
+    ) -> Option<Vec<(usize, Transform, LogicalType)>> {
+        let spec = self.specs.get(&file.path)?;
+        self.partitioning.computable(*spec, columns)
+    }
+}
+
+/// Refuses a file holding a row outside the partition its manifest entry names (ADR 0032).
+fn check_partitions(
+    fields: &[(usize, Transform, LogicalType)],
+    file: &DataFile,
+    rows: &[Vec<Datum>],
+) -> Result<(), InspectError> {
+    let expected = file.partition_values.as_deref().unwrap_or_default();
+    for row in rows {
+        match check_row(fields, row, expected) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(unsupported(format!(
+                    "{} holds a row outside the partition its manifest entry names",
+                    file.path
+                )));
+            }
+            Err(e) => {
+                return Err(unsupported(format!(
+                    "{}: cannot check the partition of a row: {e}",
+                    file.path
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads the projected rows of every added and removed data file.
 ///
 /// `columns` are the constrained columns with their current table types
@@ -564,6 +676,9 @@ pub fn commit_rows(
                 rows.len(),
                 file.record_count
             )));
+        }
+        if let Some(fields) = changes.partition_check(file, columns) {
+            check_partitions(&fields, file, rows.rows())?;
         }
         Ok(rows)
     };
@@ -611,6 +726,24 @@ pub fn commit_rows(
                         rows.len(),
                         file.record_count
                     )));
+                }
+                // A partitioned delete going to the index: its spec is determined by the deleted
+                // key, and each tuple lies in the file's partition (ADR 0032).
+                if file.partition.is_some() && !changes.whole_table {
+                    let spec = changes.specs.get(&file.path).copied().flatten();
+                    let checked = changes
+                        .partitioning
+                        .key_determined(spec, &typed)
+                        .then(|| changes.partitioning.computable(spec, &typed))
+                        .flatten();
+                    let Some(fields) = checked else {
+                        return Err(unsupported(format!(
+                            "partitioned equality delete file {}: its partition spec is not \
+                             determined by the deleted key (ADR 0032)",
+                            file.path
+                        )));
+                    };
+                    check_partitions(&fields, file, rows.rows())?;
                 }
                 for row in rows.rows() {
                     batch
@@ -850,7 +983,14 @@ impl CommitDeletes {
         };
         for file in files {
             let gone = gone.get(&file.path).unwrap_or(&empty);
+            let partition = match side {
+                Side::Added => changes.partition_check(file, columns),
+                Side::Removed => None,
+            };
             stream_file(io, file, columns, &[gone], &mut |batch, start| {
+                if let Some(fields) = &partition {
+                    check_partitions(fields, file, batch.rows())?;
+                }
                 let live = without(batch, start, gone, columns)?;
                 let live = self.visible(live, side, &file.path, columns)?;
                 if live.is_empty() {
@@ -1153,18 +1293,37 @@ const EQUALITY_FILES_AT_ONCE: usize = 16;
 /// with data sequence number `s` is hidden when its values on the delete's fields equal (NULL
 /// equals NULL) a row of a live equality delete file with a greater one. Only the delete files
 /// that can apply to a data file read are read; per key, the greatest sequence number deleting it
-/// in each snapshot is kept.
+/// in each snapshot is kept, for global deletes and per partition (spec id and tuple) for
+/// partitioned ones, which reach only data files of their partition (ADR 0032).
 #[derive(Debug)]
 struct Hidden {
     /// Positions of the delete's fields among the projected columns.
     at: Vec<usize>,
-    /// Per key, the greatest data sequence number of a delete holding it: in the parent snapshot,
-    /// in the new one.
-    keys: HashMap<Vec<Datum>, (Option<i64>, Option<i64>)>,
-    /// Data sequence numbers of the data files read: removed and kept ones, as in the parent.
-    before: HashMap<String, i64>,
+    /// Per key, the greatest data sequence number of a global delete holding it: in the parent
+    /// snapshot, in the new one.
+    keys: SequenceMap,
+    /// The same for partitioned deletes, per partition.
+    partitioned: HashMap<PartitionScope, SequenceMap>,
+    /// Data sequence numbers and partitions of the data files read: removed and kept ones, as in
+    /// the parent.
+    before: HashMap<String, (i64, Option<PartitionScope>)>,
     /// The same for added and kept data files, as in the new snapshot.
-    after: HashMap<String, i64>,
+    after: HashMap<String, (i64, Option<PartitionScope>)>,
+}
+
+type SequenceMap = HashMap<Vec<Datum>, (Option<i64>, Option<i64>)>;
+
+/// A partition: spec id and tuple.
+type PartitionScope = (i64, String);
+
+/// An equality delete file that can apply to a data file read: its data sequence number, its
+/// partition (`None`: global) and whether it is live before and after the commit.
+type Applying<'f> = (&'f DataFile, i64, Option<PartitionScope>, bool, bool);
+
+/// The partition of a file, when it has one.
+fn partition_scope(scope: Option<&Scope>) -> Option<PartitionScope> {
+    let scope = scope?;
+    Some((scope.spec?, scope.partition.clone()?))
 }
 
 impl Hidden {
@@ -1185,6 +1344,9 @@ impl Hidden {
                 .and_then(|s| s.sequence)
                 .ok_or_else(|| unsupported(format!("{path} has no data sequence number")))
         };
+        let placed = |scope: &BTreeMap<String, Scope>, path: &str| {
+            Ok::<_, InspectError>((sequence(scope, path)?, partition_scope(scope.get(path))))
+        };
         // The data files whose rows are read on each side.
         let kept: Vec<&str> = pd
             .kept
@@ -1199,7 +1361,7 @@ impl Hidden {
             .map(|f| f.path.as_str())
             .chain(kept.iter().copied())
         {
-            before.insert(path.to_owned(), sequence(&pd.scope_before, path)?);
+            before.insert(path.to_owned(), placed(&pd.scope_before, path)?);
         }
         let mut after = HashMap::new();
         for path in changes
@@ -1208,23 +1370,41 @@ impl Hidden {
             .map(|f| f.path.as_str())
             .chain(kept.iter().copied())
         {
-            after.insert(path.to_owned(), sequence(&pd.scope_after, path)?);
+            after.insert(path.to_owned(), placed(&pd.scope_after, path)?);
         }
         // The delete files that can apply to one of them: newer than the oldest.
-        let oldest_before = before.values().min().copied();
-        let oldest_after = after.values().min().copied();
-        let mut files: BTreeMap<&str, (&DataFile, i64, bool, bool)> = BTreeMap::new();
+        let oldest_before = before.values().map(|(s, _)| *s).min();
+        let oldest_after = after.values().map(|(s, _)| *s).min();
+        let mut files: BTreeMap<&str, Applying> = BTreeMap::new();
         for f in &pd.equality_before {
             let s = sequence(&pd.scope_before, &f.path)?;
             if oldest_before.is_some_and(|o| s > o) {
-                files.entry(&f.path).or_insert((f, s, false, false)).2 = true;
+                let scope = partition_scope(pd.scope_before.get(&f.path));
+                files
+                    .entry(&f.path)
+                    .or_insert((f, s, scope, false, false))
+                    .3 = true;
             }
         }
         for f in &pd.equality_after {
             let s = sequence(&pd.scope_after, &f.path)?;
             if oldest_after.is_some_and(|o| s > o) {
-                files.entry(&f.path).or_insert((f, s, false, false)).3 = true;
+                let scope = partition_scope(pd.scope_after.get(&f.path));
+                files
+                    .entry(&f.path)
+                    .or_insert((f, s, scope, false, false))
+                    .4 = true;
             }
+        }
+        // A delete with a partition tuple but no spec id cannot be placed.
+        if let Some((f, ..)) = files
+            .values()
+            .find(|(f, _, scope, ..)| f.partition.is_some() && scope.is_none())
+        {
+            return Err(unsupported(format!(
+                "partitioned equality delete file {} without a partition spec id",
+                f.path
+            )));
         }
         let Some((first, ..)) = files.values().next() else {
             return Ok(None);
@@ -1245,7 +1425,8 @@ impl Hidden {
             .collect::<Result<_, _>>()?;
         // Read with the data files' projection and types, so keys compare as data rows do.
         let typed: Vec<(FieldId, LogicalType)> = at.iter().map(|&i| columns[i].clone()).collect();
-        let mut keys: HashMap<Vec<Datum>, (Option<i64>, Option<i64>)> = HashMap::new();
+        let mut keys = SequenceMap::new();
+        let mut partitioned: HashMap<PartitionScope, SequenceMap> = HashMap::new();
         let mut used = 0usize;
         let files: Vec<_> = files.into_values().collect();
         for chunk in files.chunks(EQUALITY_FILES_AT_ONCE) {
@@ -1261,7 +1442,17 @@ impl Hidden {
                 }
                 Ok(rows)
             })?;
-            for (&(_, s, in_before, in_after), rows) in chunk.iter().zip(read) {
+            for ((_, s, scope, in_before, in_after), rows) in chunk.iter().zip(read) {
+                let (s, in_before, in_after) = (*s, *in_before, *in_after);
+                let keys = match scope {
+                    None => &mut keys,
+                    Some(scope) => {
+                        if !partitioned.contains_key(scope) {
+                            used = used.saturating_add(scope.1.len() + 64);
+                        }
+                        partitioned.entry(scope.clone()).or_default()
+                    }
+                };
                 for row in rows.rows() {
                     if !keys.contains_key(row.as_slice()) {
                         used = used.saturating_add(key_bytes(row));
@@ -1289,6 +1480,7 @@ impl Hidden {
         Ok(Some(Self {
             at,
             keys,
+            partitioned,
             before,
             after,
         }))
@@ -1300,16 +1492,20 @@ impl Hidden {
             Side::Removed => &self.before,
             Side::Added => &self.after,
         };
-        let Some(&s) = sequences.get(path) else {
+        let Some((s, scope)) = sequences.get(path) else {
             return false;
         };
         let key: Vec<Datum> = self.at.iter().map(|&i| row[i].clone()).collect();
-        let newest = match (self.keys.get(key.as_slice()), side) {
+        let newest = |map: &SequenceMap| match (map.get(key.as_slice()), side) {
             (Some(&(b, _)), Side::Removed) => b,
             (Some(&(_, a)), Side::Added) => a,
             (None, _) => None,
         };
-        newest.is_some_and(|d| d > s)
+        let local = scope
+            .as_ref()
+            .and_then(|scope| self.partitioned.get(scope))
+            .and_then(newest);
+        newest(&self.keys).max(local).is_some_and(|d| d > *s)
     }
 }
 

@@ -41,7 +41,14 @@ Transforms" and Appendix B "32-bit Hash Requirements": Murmur3 x86 32-bit, seed 
 specified byte representation of each type), for the key types the Plane encodes. Values are taken
 from the key as read against the table's current schema (ADR 0006); for widened types the result
 is the same as for the original type (`int` and `long` hash and truncate alike, per the spec), and
-a widening whose transform result would differ is refused.
+a widening whose transform result would differ is refused. Time transforms count whole units since
+1970 rounding down, also before 1970 (as the reference implementation does). `bucket` of
+`timestamp_ns` is not computed. A spec whose fields are all `void` is not partitioned for this ADR:
+its equality deletes are refused.
+
+Files of a spec the Plane does not compute (a transform it does not know, a source column that is
+not constrained, so not read) are not checked; such a spec is never key-determined, so its deletes
+are refused anyway. Data files of a spec id that the table metadata lacks are refused.
 
 ### The partition invariant
 

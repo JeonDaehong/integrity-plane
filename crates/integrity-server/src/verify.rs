@@ -15,7 +15,7 @@ use integrity_core::{
     parse_table_uuid,
 };
 use integrity_iceberg::snapshot_certificate;
-use integrity_iceberg::{Budgeted, FileIo, Operation, TableMetadata, diff_snapshots};
+use integrity_iceberg::{Budgeted, FileIo, Operation, TableMetadata, diff_snapshots_with};
 use integrity_types::{ConstraintSetVersion, SnapshotId};
 use integrity_validator::Validator;
 use serde::Serialize;
@@ -312,7 +312,8 @@ pub fn verify(io: &(dyn FileIo + Send + Sync), input: &Input) -> Report {
                 .as_deref()
                 .ok_or("snapshot without manifest list")?;
             let changes =
-                diff_snapshots(&io, parent_list.as_deref(), list).map_err(|e| e.to_string())?;
+                diff_snapshots_with(&io, parent_list.as_deref(), list, &meta.partitioning(true))
+                    .map_err(|e| e.to_string())?;
             if !changes.equality_deletes.is_empty() {
                 return Err("key deltas of equality deletes depend on index state".into());
             }

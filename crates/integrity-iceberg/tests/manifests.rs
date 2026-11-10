@@ -14,8 +14,9 @@ use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use integrity_core::{Datum, KeyValue, LogicalType, Side};
 use integrity_iceberg::{
-    CommitDeletes, FileChanges, FileIo, InspectError, MemoryIo, Operation, check_operation,
-    commit_rows, diff_snapshots, for_each_commit_batch, for_each_live_batch, for_each_side_batch,
+    CommitDeletes, FileChanges, FileIo, InspectError, MemoryIo, Operation, PartitionField,
+    Partitioning, Transform, check_operation, commit_rows, diff_snapshots, diff_snapshots_with,
+    for_each_commit_batch, for_each_live_batch, for_each_side_batch,
 };
 use integrity_types::{ErrorCode, FieldId, SnapshotId, TableId};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -39,6 +40,26 @@ const PART_ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", 
         {"name": "file_format", "type": "string"},
         {"name": "partition", "type": {"type": "record", "name": "r102", "fields": [
             {"name": "region", "type": ["null", "string"]}
+        ]}},
+        {"name": "record_count", "type": "long"},
+        {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}]},
+        {"name": "referenced_data_file", "type": ["null", "string"], "default": null},
+        {"name": "content_offset", "type": ["null", "long"], "default": null},
+        {"name": "content_size_in_bytes", "type": ["null", "long"], "default": null}
+    ]}}
+]}"#;
+
+/// Manifest entries of a table partitioned by `bucket[4](id)` (ADR 0032).
+const BUCKET_ENTRY_SCHEMA: &str = r#"{"type": "record", "name": "manifest_entry", "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "snapshot_id", "type": ["null", "long"]},
+    {"name": "sequence_number", "type": ["null", "long"]},
+    {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
+        {"name": "content", "type": "int"},
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": [
+            {"name": "id_bucket", "type": ["null", "int"]}
         ]}},
         {"name": "record_count", "type": "long"},
         {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}]},
@@ -343,6 +364,59 @@ impl Table {
         self.io.insert(path, Self::avro(PART_ENTRY_SCHEMA, records));
     }
 
+    /// A manifest of a table partitioned by `bucket[4](id)`: `(entry, bucket)`; equality deletes
+    /// are on `id`.
+    fn bucket_manifest(&mut self, path: &str, entries: &[(Entry, i32)]) {
+        let records = entries
+            .iter()
+            .map(|&((status, content, file, format, count), bucket)| {
+                vec![
+                    ("status", Avro::Int(status)),
+                    ("snapshot_id", Avro::Union(1, Box::new(Avro::Long(1)))),
+                    ("sequence_number", Avro::Union(0, Box::new(Avro::Null))),
+                    (
+                        "data_file",
+                        Avro::Record(vec![
+                            ("content".into(), Avro::Int(content)),
+                            ("file_path".into(), Avro::String(file.into())),
+                            ("file_format".into(), Avro::String(format.into())),
+                            (
+                                "partition".into(),
+                                Avro::Record(vec![(
+                                    "id_bucket".into(),
+                                    Avro::Union(1, Box::new(Avro::Int(bucket))),
+                                )]),
+                            ),
+                            ("record_count".into(), Avro::Long(count)),
+                            (
+                                "equality_ids".into(),
+                                if content == 2 {
+                                    Avro::Union(1, Box::new(Avro::Array(vec![Avro::Int(1)])))
+                                } else {
+                                    Avro::Union(0, Box::new(Avro::Null))
+                                },
+                            ),
+                            (
+                                "referenced_data_file".into(),
+                                Avro::Union(0, Box::new(Avro::Null)),
+                            ),
+                            (
+                                "content_offset".into(),
+                                Avro::Union(0, Box::new(Avro::Null)),
+                            ),
+                            (
+                                "content_size_in_bytes".into(),
+                                Avro::Union(0, Box::new(Avro::Null)),
+                            ),
+                        ]),
+                    ),
+                ]
+            })
+            .collect();
+        self.io
+            .insert(path, Self::avro(BUCKET_ENTRY_SCHEMA, records));
+    }
+
     /// A v2 manifest list: `(manifest, content, sequence number its added entries inherit)`.
     fn list_seq(&mut self, path: &str, manifests: &[(&str, i32, i64)]) {
         let with_spec: Vec<_> = manifests
@@ -404,6 +478,15 @@ impl Table {
 
     fn diff(&self, parent: Option<&str>, new: &str) -> Result<FileChanges, InspectError> {
         diff_snapshots(&self.io, parent, new)
+    }
+
+    fn diff_with(
+        &self,
+        parent: Option<&str>,
+        new: &str,
+        partitioning: &Partitioning,
+    ) -> Result<FileChanges, InspectError> {
+        diff_snapshots_with(&self.io, parent, new, partitioning)
     }
 
     fn rows(&self, changes: &FileChanges) -> Result<integrity_core::CommitRows, InspectError> {
@@ -1226,6 +1309,300 @@ fn partitioned_equality_deletes_are_unsupported() {
     );
 }
 
+// ---------- partitioned equality deletes (ADR 0032) ----------
+
+/// Spec 1: `bucket[4](id)`; spec 2: `bucket[4](region)`; spec 0: unpartitioned.
+fn buckets(checked: bool) -> Partitioning {
+    let mut p = Partitioning {
+        checked,
+        ..Partitioning::default()
+    };
+    let field = |source, transform| PartitionField {
+        source: FieldId(source),
+        transform: Some(transform),
+    };
+    p.specs.insert(0, vec![]);
+    p.specs.insert(1, vec![field(1, Transform::Bucket(4))]);
+    p.specs.insert(2, vec![field(2, Transform::Bucket(4))]);
+    p
+}
+
+/// The bucket of `id` under `bucket[4]`.
+fn bucket(id: i64) -> i32 {
+    match integrity_iceberg::partition::apply(
+        Transform::Bucket(4),
+        &LogicalType::Long,
+        &Datum::Value(KeyValue::Integer(id)),
+    ) {
+        Ok(integrity_iceberg::PartValue::Int(b)) => b as i32,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Two ids in different buckets, and a third in the first one's.
+fn ids_in_buckets() -> (i64, i64, i64) {
+    let a = 1;
+    let b = (2..100).find(|&i| bucket(i) != bucket(a)).unwrap();
+    let c = (2..100)
+        .find(|&i| i != b && bucket(i) == bucket(a))
+        .unwrap();
+    (a, b, c)
+}
+
+/// A Flink-shaped table partitioned by `bucket[4](id)` (spec 1): one data file per bucket at
+/// sequence number 1 (list `bparent.avro`).
+fn bucketed_parent() -> (Table, (i64, i64, i64)) {
+    let (a, b, c) = ids_in_buckets();
+    let mut t = Table::new();
+    t.data("pa.parquet", &[(a, "eu"), (c, "eu")]);
+    t.data("pb.parquet", &[(b, "us")]);
+    t.bucket_manifest(
+        "bm1.avro",
+        &[
+            ((1, 0, "pa.parquet", "PARQUET", 2), bucket(a)),
+            ((1, 0, "pb.parquet", "PARQUET", 1), bucket(b)),
+        ],
+    );
+    t.list_spec("bparent.avro", &[("bm1.avro", 0, 1, 1)]);
+    (t, (a, b, c))
+}
+
+/// A checkpoint upserting `id` in its bucket: data file and equality delete, sequence number 2.
+fn upsert(t: &mut Table, list: &str, id: i64, delete_bucket: i32, spec: i32) {
+    t.data("up.parquet", &[(id, "new")]);
+    t.id_deletes("up-eq.parquet", &[id]);
+    t.bucket_manifest(
+        "bm2.avro",
+        &[((1, 0, "up.parquet", "PARQUET", 1), bucket(id))],
+    );
+    t.bucket_manifest(
+        "bd2.avro",
+        &[((1, 2, "up-eq.parquet", "PARQUET", 1), delete_bucket)],
+    );
+    t.list_spec(
+        list,
+        &[
+            ("bm1.avro", 0, 1, 1),
+            ("bm2.avro", 0, 2, 1),
+            ("bd2.avro", 1, 2, spec),
+        ],
+    );
+}
+
+#[test]
+fn partitioned_upserts_on_a_key_determined_spec() {
+    let (mut t, (a, ..)) = bucketed_parent();
+    upsert(&mut t, "up.avro", a, bucket(a), 1);
+    let changes = t
+        .diff_with(Some("bparent.avro"), "up.avro", &buckets(true))
+        .unwrap();
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(ids(&rows.added), [row(a, "new")]);
+    assert_eq!(ids(rows.equality_deletes.as_ref().unwrap()), [id(a)]);
+
+    // Without the specs (ADR 0030) or before the domain was rebuilt: refused.
+    assert!(
+        unsupported(t.diff(Some("bparent.avro"), "up.avro"))
+            .contains("partitioned equality delete")
+    );
+    assert!(
+        unsupported(t.diff_with(Some("bparent.avro"), "up.avro", &buckets(false)))
+            .contains("rebuild its domain")
+    );
+}
+
+#[test]
+fn a_delete_tuple_outside_its_partition_is_refused() {
+    // The delete for `a` is written into `b`'s bucket: it would not reach `a`'s row.
+    let (mut t, (a, b, _)) = bucketed_parent();
+    upsert(&mut t, "up.avro", a, bucket(b), 1);
+    let changes = t
+        .diff_with(Some("bparent.avro"), "up.avro", &buckets(true))
+        .unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("outside the partition"));
+}
+
+#[test]
+fn a_data_row_outside_its_partition_is_refused() {
+    // An append whose file claims `b`'s bucket for a row of `a`'s.
+    let (mut t, (a, b, _)) = bucketed_parent();
+    t.data("bad.parquet", &[(a + 1000, "x"), (a, "x")]);
+    let wrong = if bucket(a + 1000) == bucket(b) {
+        bucket(a)
+    } else {
+        bucket(b)
+    };
+    t.bucket_manifest("bm3.avro", &[((1, 0, "bad.parquet", "PARQUET", 2), wrong)]);
+    t.list_spec("bad.avro", &[("bm1.avro", 0, 1, 1), ("bm3.avro", 0, 2, 1)]);
+    let changes = t
+        .diff_with(Some("bparent.avro"), "bad.avro", &buckets(true))
+        .unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("outside the partition"));
+    let columns = [
+        (FieldId(1), LogicalType::Long),
+        (FieldId(2), LogicalType::String),
+    ];
+    let streamed =
+        for_each_commit_batch(&t.io, &changes, &columns, |_, _| Ok::<_, InspectError>(()));
+    assert!(unsupported(streamed).contains("outside the partition"));
+
+    // Onboarding reads every live file the same way.
+    let whole = t.diff_with(None, "bad.avro", &buckets(true)).unwrap();
+    let scanned = for_each_live_batch(&t.io, &whole, &columns, usize::MAX, |_| {
+        Ok::<_, InspectError>(())
+    });
+    assert!(unsupported(scanned).contains("outside the partition"));
+
+    // Files of a spec the Plane does not compute from the read columns are not checked.
+    let unchecked = t.diff(Some("bparent.avro"), "bad.avro").unwrap();
+    assert!(t.rows(&unchecked).is_ok());
+}
+
+#[test]
+fn partitioned_deletes_need_one_key_determined_spec_for_every_live_file() {
+    // A data file of the unpartitioned spec 0 is out of the deletes' reach.
+    let (mut t, (a, ..)) = bucketed_parent();
+    t.data("old.parquet", &[(500, "old")]);
+    t.manifest("m0.avro", &[(1, 0, "old.parquet", "PARQUET", 1)]);
+    t.list_spec(
+        "mixed-parent.avro",
+        &[("bm1.avro", 0, 1, 1), ("m0.avro", 0, 1, 0)],
+    );
+    upsert(&mut t, "up.avro", a, bucket(a), 1);
+    t.list_spec(
+        "mixed.avro",
+        &[
+            ("bm1.avro", 0, 1, 1),
+            ("m0.avro", 0, 1, 0),
+            ("bm2.avro", 0, 2, 1),
+            ("bd2.avro", 1, 2, 1),
+        ],
+    );
+    assert!(
+        unsupported(t.diff_with(Some("mixed-parent.avro"), "mixed.avro", &buckets(true)))
+            .contains("of another spec")
+    );
+
+    // Spec 2 buckets `region`, not the deleted key.
+    let (mut t, (a, ..)) = bucketed_parent();
+    t.list_spec("p2.avro", &[("bm1.avro", 0, 1, 2)]);
+    t.data("up.parquet", &[(a, "new")]);
+    t.id_deletes("up-eq.parquet", &[a]);
+    t.bucket_manifest("bm2.avro", &[((1, 0, "up.parquet", "PARQUET", 1), 0)]);
+    t.bucket_manifest("bd2.avro", &[((1, 2, "up-eq.parquet", "PARQUET", 1), 0)]);
+    t.list_spec(
+        "up2.avro",
+        &[
+            ("bm1.avro", 0, 1, 2),
+            ("bm2.avro", 0, 2, 2),
+            ("bd2.avro", 1, 2, 2),
+        ],
+    );
+    let changes = t
+        .diff_with(Some("p2.avro"), "up2.avro", &buckets(true))
+        .unwrap();
+    assert!(unsupported(t.rows(&changes)).contains("not determined by the deleted key"));
+
+    // An unknown spec id.
+    let (mut t, (a, ..)) = bucketed_parent();
+    upsert(&mut t, "up9.avro", a, bucket(a), 9);
+    assert!(
+        unsupported(t.diff_with(Some("bparent.avro"), "up9.avro", &buckets(true)))
+            .contains("partition spec")
+    );
+}
+
+#[test]
+fn partitioned_deletes_reach_only_their_partition_when_read() {
+    // After the checkpoint, a compaction rewrites `a`'s bucket: the delete hides `a`'s old row
+    // there and nowhere else.
+    let (mut t, (a, b, c)) = bucketed_parent();
+    upsert(&mut t, "up.avro", a, bucket(a), 1);
+    t.data("pa2.parquet", &[(c, "eu")]);
+    t.bucket_manifest(
+        "bm4.avro",
+        &[((1, 0, "pa2.parquet", "PARQUET", 1), bucket(a))],
+    );
+    // pb.parquet stays, listed alone at its own sequence number.
+    t.bucket_manifest(
+        "bm5.avro",
+        &[((1, 0, "pb.parquet", "PARQUET", 1), bucket(b))],
+    );
+    t.list_spec(
+        "compacted.avro",
+        &[
+            ("bm4.avro", 0, 3, 1),
+            ("bm5.avro", 0, 1, 1),
+            ("bm2.avro", 0, 2, 1),
+            ("bd2.avro", 1, 2, 1),
+        ],
+    );
+    let changes = t
+        .diff_with(Some("up.avro"), "compacted.avro", &buckets(true))
+        .unwrap();
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(sorted(&rows.removed), sorted_rows(&[row(c, "eu")]));
+    assert_eq!(sorted(&rows.added), sorted_rows(&[row(c, "eu")]));
+    let (s, c2) = streamed_sides_with(&t, "up.avro", "compacted.avro", &buckets(true));
+    assert_eq!(s, c2);
+
+    // The same delete written into `b`'s bucket hides nothing (as readers read it): the
+    // compaction that drops `a`'s old row loses a row.
+    let (mut t, (a, b, c)) = bucketed_parent();
+    t.data("up.parquet", &[(b + 1000, "new")]);
+    t.id_deletes("up-eq.parquet", &[a]);
+    t.bucket_manifest(
+        "bm2.avro",
+        &[((1, 0, "up.parquet", "PARQUET", 1), bucket(b + 1000))],
+    );
+    t.bucket_manifest(
+        "bd2.avro",
+        &[((1, 2, "up-eq.parquet", "PARQUET", 1), bucket(b))],
+    );
+    t.list_spec(
+        "up.avro",
+        &[
+            ("bm1.avro", 0, 1, 1),
+            ("bm2.avro", 0, 2, 1),
+            ("bd2.avro", 1, 2, 1),
+        ],
+    );
+    t.data("pa2.parquet", &[(c, "eu")]);
+    t.bucket_manifest(
+        "bm4.avro",
+        &[((1, 0, "pa2.parquet", "PARQUET", 1), bucket(a))],
+    );
+    t.bucket_manifest(
+        "bm5.avro",
+        &[((1, 0, "pb.parquet", "PARQUET", 1), bucket(b))],
+    );
+    t.list_spec(
+        "compacted.avro",
+        &[
+            ("bm4.avro", 0, 3, 1),
+            ("bm5.avro", 0, 1, 1),
+            ("bm2.avro", 0, 2, 1),
+            ("bd2.avro", 1, 2, 1),
+        ],
+    );
+    let changes = t
+        .diff_with(Some("up.avro"), "compacted.avro", &buckets(true))
+        .unwrap();
+    let rows = t.rows(&changes).unwrap();
+    assert_eq!(
+        sorted(&rows.removed),
+        sorted_rows(&[row(a, "eu"), row(c, "eu")])
+    );
+    assert_eq!(sorted(&rows.added), sorted_rows(&[row(c, "eu")]));
+    assert!(check_operation(Operation::Replace, &rows).is_err());
+}
+
+fn sorted_rows(rows: &[Vec<Datum>]) -> Vec<Vec<Datum>> {
+    let mut rows = rows.to_vec();
+    rows.sort_by_key(|r| format!("{r:?}"));
+    rows
+}
+
 #[test]
 fn malformed_listings_are_rejected() {
     let mut t = parent();
@@ -1448,7 +1825,16 @@ fn streaming_refuses_a_diff_against_a_parent() {
 
 /// Both sides of the commit `parent` → `new`, streamed; and what `commit_rows` reads.
 fn streamed_sides(t: &Table, parent: &str, new: &str) -> (String, String) {
-    let changes = t.diff(Some(parent), new).unwrap();
+    streamed_sides_with(t, parent, new, &Partitioning::unknown())
+}
+
+fn streamed_sides_with(
+    t: &Table,
+    parent: &str,
+    new: &str,
+    partitioning: &Partitioning,
+) -> (String, String) {
+    let changes = t.diff_with(Some(parent), new, partitioning).unwrap();
     let columns = [
         (FieldId(1), LogicalType::Long),
         (FieldId(2), LogicalType::String),
