@@ -86,9 +86,11 @@ Everything here is either out of scope for 0.1 (spec §27) or a gap found while 
   one whose certificate was computed correctly for valid data: catching up accepts it, as a commit
   through the Plane would have been. With `[signing] require = true` only snapshots signed with
   this Plane's keys are followed.
-- `verify` cannot recompute snapshots that add equality deletes (Flink checkpoints; reported
-  `UNVERIFIABLE`: their key deltas depend on the index at the time) or chains whose
-  snapshots have expired, and only verifies back to the latest anchor.
+- `verify` recomputes snapshots that add equality deletes (Flink checkpoints) by replaying the
+  table's keys from one scan of the snapshot before the first of them (ADR 0033): it needs scratch
+  disk about the size of the table's unique key index, and on a table with a foreign key such
+  snapshots stay `UNVERIFIABLE`. It cannot recompute chains whose snapshots have expired, and only
+  verifies back to the latest anchor.
 
 ## Operations
 

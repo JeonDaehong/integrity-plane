@@ -10,7 +10,7 @@ Items that change what the Plane accepts, or a stored format, get an RFC first
 - Compacting tables with equality delete files through the Plane: a rewrite is accepted when the
   rows readers see in the removed files, after deletes, have the same keys as the added files.
 - Flink upsert tables with partitions, where each key determines its partition (ADR 0032).
-- `verify` recomputes snapshots with equality deletes (now `UNVERIFIABLE`).
+- `verify` recomputes snapshots with equality deletes (ADR 0033).
 - Trino and Flink compatibility tests in CI (#9).
 
 ## 0.3: Operating several Planes

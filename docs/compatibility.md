@@ -125,7 +125,7 @@ built from the checkout; `compat/engines/`), with the Plane as their REST catalo
 | Client | Version | Result |
 |---|---|---|
 | Trino (Iceberg connector, REST catalog, native S3) | 470 | `INSERT`, merge-on-read `UPDATE` / `DELETE` / `MERGE`, `optimize`, `expire_snapshots` accepted; INT-003 (against the table, within a statement, `INSERT … SELECT`, `UPDATE` of a key, `MERGE`), INT-007, INT-005, INT-006 rejected after one attempt; every snapshot certified; `verify` OK |
-| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028); INT-003 (also in `INSERT OVERWRITE`), INT-007, INT-005 rejected after one attempt; `verify` OK on tables without equality deletes; on upsert tables it reports the checkpoints (snapshots adding equality deletes) `UNVERIFIABLE` |
+| Flink SQL (batch, `iceberg-flink-runtime-1.20`) | Flink 1.20.3, Iceberg 1.10.0 | `INSERT`, `INSERT OVERWRITE`, upsert tables (equality deletes on the key) accepted, including an upsert batch that writes the same key twice (position and equality deletes in one commit, ADR 0028); INT-003 (also in `INSERT OVERWRITE`), INT-007, INT-005 rejected after one attempt; upsert tables partitioned by a key column (ADR 0032) and compacted with Trino `optimize`; `verify` OK on every table, upsert checkpoints included (ADR 0033) |
 
 Both engines report a rejection as `BadRequestException: Malformed request: INT-… ` (their wording
 for HTTP 400); the integrity code and message follow. Trino commits table statistics in a second

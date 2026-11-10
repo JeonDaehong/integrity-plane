@@ -117,7 +117,11 @@ def main():
 
     integrity("verify", f"{NS}.customer")
     integrity("verify", f"{NS}.orders")
-    print("ok   verify", flush=True)
+    # Flink checkpoints are recomputed too (ADR 0033), compactions included.
+    for table in ("ucust", "pcust"):
+        out = integrity("verify", f"{NS}.{table}")
+        assert "UNVERIFIABLE" not in out and "MISMATCH" not in out, out
+    print("ok   verify, including the upsert tables", flush=True)
 
 
 if __name__ == "__main__":

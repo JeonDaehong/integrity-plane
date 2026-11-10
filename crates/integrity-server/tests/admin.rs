@@ -2032,3 +2032,248 @@ async fn requiring_signatures_flags_snapshots_from_before_signing() {
         .await;
     assert_eq!(report["first_broken"], head_of(&unsigned), "{report}");
 }
+
+// ---------- verifying Flink checkpoints (ADR 0033) ----------
+
+/// A Flink-shaped writer: v2 manifests with sequence numbers, data files and equality deletes on
+/// `id`.
+struct Flink {
+    /// Live manifests: (location, content 0 data / 1 deletes, sequence number).
+    manifests: Vec<(String, i32, i64)>,
+    seq: i64,
+}
+
+impl Flink {
+    fn new() -> Self {
+        Self {
+            manifests: Vec::new(),
+            seq: 0,
+        }
+    }
+
+    /// A Parquet file of `ids` (field 1) and, for data, `ref` (field 2).
+    fn parquet(e: &Env, name: &str, rows: &[Row], data: bool) -> String {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field};
+        use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+        let meta = |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.into())]);
+        let mut fields = vec![Field::new("id", DataType::Int64, false).with_metadata(meta("1"))];
+        let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        ))];
+        if data {
+            fields.push(Field::new("ref", DataType::Int64, true).with_metadata(meta("2")));
+            columns.push(Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            )));
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let path = e.files.location(name);
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// A manifest of one file: content 0 data, 2 equality deletes on `id`.
+    fn manifest(e: &Env, name: &str, file: &str, content: i32, count: usize) -> String {
+        let bytes = support::avro(
+            r#"{"type": "record", "name": "manifest_entry", "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "sequence_number", "type": ["null", "long"]},
+                {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
+                    {"name": "content", "type": "int"}, {"name": "file_path", "type": "string"},
+                    {"name": "file_format", "type": "string"}, {"name": "record_count", "type": "long"},
+                    {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}]}]}}]}"#,
+            vec![vec![
+                ("status", apache_avro::types::Value::Int(1)),
+                (
+                    "sequence_number",
+                    apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+                ),
+                (
+                    "data_file",
+                    apache_avro::types::Value::Record(vec![
+                        ("content".into(), apache_avro::types::Value::Int(content)),
+                        (
+                            "file_path".into(),
+                            apache_avro::types::Value::String(file.into()),
+                        ),
+                        (
+                            "file_format".into(),
+                            apache_avro::types::Value::String("PARQUET".into()),
+                        ),
+                        (
+                            "record_count".into(),
+                            apache_avro::types::Value::Long(count as i64),
+                        ),
+                        (
+                            "equality_ids".into(),
+                            if content == 2 {
+                                apache_avro::types::Value::Union(
+                                    1,
+                                    Box::new(apache_avro::types::Value::Array(vec![
+                                        apache_avro::types::Value::Int(1),
+                                    ])),
+                                )
+                            } else {
+                                apache_avro::types::Value::Union(
+                                    0,
+                                    Box::new(apache_avro::types::Value::Null),
+                                )
+                            },
+                        ),
+                    ]),
+                ),
+            ]],
+        );
+        let path = e.files.location(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Commits `rows` to `db.customer` through `base`: with `upsert`, also an equality delete of
+    /// their ids (a Flink checkpoint). Returns the status and the new snapshot id.
+    async fn commit(&mut self, e: &Env, base: &str, rows: &[Row], upsert: bool) -> (u16, i64) {
+        use std::sync::atomic::Ordering;
+        let url = format!("{base}/v1/namespaces/db/tables/customer");
+        let meta: Value = e.http.get(&url).send().await.unwrap().json().await.unwrap();
+        let head = meta["metadata"]["refs"]["main"]["snapshot-id"].as_i64();
+        let n = e.files.next.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq + 1;
+        let mut manifests = self.manifests.clone();
+        let data = Self::parquet(e, &format!("fd{n}.parquet"), rows, true);
+        let m = Self::manifest(e, &format!("fm{n}.avro"), &data, 0, rows.len());
+        manifests.push((m, 0, seq));
+        if upsert {
+            let mut ids: Vec<Row> = rows.iter().map(|r| (r.0, None)).collect();
+            ids.sort();
+            ids.dedup();
+            let eq = Self::parquet(e, &format!("fe{n}.parquet"), &ids, false);
+            let m = Self::manifest(e, &format!("fq{n}.avro"), &eq, 2, ids.len());
+            manifests.push((m, 1, seq));
+        }
+        let list = support::avro(
+            r#"{"type": "record", "name": "manifest_file", "fields": [
+                {"name": "manifest_path", "type": "string"}, {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"}, {"name": "content", "type": "int"},
+                {"name": "sequence_number", "type": "long"}, {"name": "added_snapshot_id", "type": "long"}]}"#,
+            manifests
+                .iter()
+                .map(|(m, content, s)| {
+                    vec![
+                        (
+                            "manifest_path",
+                            apache_avro::types::Value::String(m.clone()),
+                        ),
+                        ("manifest_length", apache_avro::types::Value::Long(1)),
+                        ("partition_spec_id", apache_avro::types::Value::Int(0)),
+                        ("content", apache_avro::types::Value::Int(*content)),
+                        ("sequence_number", apache_avro::types::Value::Long(*s)),
+                        ("added_snapshot_id", apache_avro::types::Value::Long(n)),
+                    ]
+                })
+                .collect(),
+        );
+        let list_path = e.files.location(&format!("fl{n}.avro"));
+        std::fs::write(&list_path, list).unwrap();
+        let body = json!({
+            "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": head}],
+            "updates": [
+                {"action": "add-snapshot", "snapshot": {"snapshot-id": n, "parent-snapshot-id": head,
+                    "sequence-number": seq, "timestamp-ms": n, "manifest-list": list_path,
+                    "summary": {"operation": "overwrite"}}},
+                {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": n, "type": "branch"}
+            ]
+        });
+        let r = e.http.post(&url).json(&body).send().await.unwrap();
+        let status = r.status().as_u16();
+        if status == 200 {
+            self.manifests = manifests;
+            self.seq = seq;
+        }
+        (status, n)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flink_checkpoints_verify_and_a_forged_one_is_caught() {
+    let e = env(None).await;
+    let (status, out) = e
+        .register(
+            json!({"table": "db.customer", "name": "pk", "type": "PRIMARY_KEY", "columns": ["id"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{out}");
+    let gw = e.gateway.clone();
+    let mut f = Flink::new();
+    // A first load, then checkpoints upserting existing and new keys, a key twice across them.
+    assert_eq!(
+        f.commit(&e, &gw, &[(1, None), (2, None)], false).await.0,
+        200
+    );
+    let (s, first) = f.commit(&e, &gw, &[(1, Some(10)), (3, None)], true).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        f.commit(&e, &gw, &[(3, Some(30)), (4, None)], true).await.0,
+        200
+    );
+    let (s, last) = f.commit(&e, &gw, &[(1, Some(11)), (5, None)], true).await;
+    assert_eq!(s, 200);
+    // A duplicate of a key that exists is still refused.
+    assert_eq!(f.commit(&e, &gw, &[(2, None)], false).await.0, 400);
+
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(statuses(&report), ["OK", "OK", "OK", "OK"], "{report}");
+    assert_eq!(report["ok"], true);
+
+    // A checkpoint's certificate replaced by another's: caught there, not before.
+    {
+        let mut up = e._shared.lock().unwrap();
+        let meta = up
+            .tables
+            .get_mut("/v1/namespaces/db/tables/customer")
+            .unwrap();
+        let snaps = meta["snapshots"].as_array_mut().unwrap();
+        let cert_of = |snaps: &Vec<Value>, id: i64| {
+            snaps.iter().find(|s| s["snapshot-id"] == id).unwrap()["summary"]["integrity.cert"]
+                .clone()
+        };
+        let forged = cert_of(snaps, first);
+        let target = snaps.iter_mut().find(|s| s["snapshot-id"] == last).unwrap();
+        target["summary"]["integrity.cert"] = forged;
+    }
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(
+        statuses(&report),
+        ["OK", "OK", "OK", "MISMATCH"],
+        "{report}"
+    );
+    assert_eq!(report["first_broken"], last);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_around_the_plane_is_missing_and_later_ones_still_verify() {
+    let e = env(None).await;
+    let (status, out) = e
+        .register(
+            json!({"table": "db.customer", "name": "pk", "type": "PRIMARY_KEY", "columns": ["id"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{out}");
+    let gw = e.gateway.clone();
+    let up = e.upstream.clone();
+    let mut f = Flink::new();
+    assert_eq!(
+        f.commit(&e, &gw, &[(1, None), (2, None)], false).await.0,
+        200
+    );
+    assert_eq!(f.commit(&e, &gw, &[(1, Some(10))], true).await.0, 200);
+    // A checkpoint straight to the catalog.
+    assert_eq!(f.commit(&e, &up, &[(2, Some(20))], true).await.0, 200);
+    let (_, report) = e.api("GET", "verify?table=db.customer", None).await;
+    assert_eq!(statuses(&report), ["OK", "OK", "MISSING"], "{report}");
+}
