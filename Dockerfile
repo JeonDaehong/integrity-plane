@@ -1,7 +1,7 @@
 # integrity-server and the integrity CLI (spec §27 DoD 1; deploy/docker-compose.yml).
 # Reproducible: locked dependencies, base images pinned by digest, fixed build path; CI builds it
 # twice and compares the binaries (release-hygiene.yml). Bump the digests deliberately.
-FROM rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS build
+FROM rust:1.99-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 WORKDIR /src
 ENV CARGO_INCREMENTAL=0
 COPY . .
